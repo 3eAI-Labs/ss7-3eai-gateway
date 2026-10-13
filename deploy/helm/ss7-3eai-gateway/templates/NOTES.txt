@@ -1,0 +1,32 @@
+ss7-3eai-gateway {{ .Chart.AppVersion }} (chart {{ .Chart.Version }}) installed as
+release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Replicas:        {{ .Values.replicaCount }}
+Service level:   {{ .Values.serviceLevelPreset }}
+Host network:    {{ .Values.hostNetwork }} {{- if not .Values.hostNetwork }}  (SCTP peering disabled — set hostNetwork=true for live SS7){{- end }}
+NATS:            {{ if .Values.nats.deploy }}bundled (in-chart, smoke only){{ else }}external → {{ .Values.nats.url }}{{ end }}
+Secrets:         {{ if .Values.secrets.existingSecret }}existingSecret={{ .Values.secrets.existingSecret }}{{ else if .Values.secrets.create }}chart-created {{ include "ss7-3eai-gateway.secretName" . }} (SMOKE/DEV ONLY){{ else }}none — provide secrets.existingSecret{{ end }}
+
+Check health:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ss7-3eai-gateway.fullname" . }} {{ .Values.service.api.port }}:{{ .Values.service.api.port }}
+  curl -s localhost:{{ .Values.service.api.port }}/api/v1/health | jq .
+
+{{- if .Values.nats.deploy }}
+
+WARNING: nats.deploy=true bundles a single-replica NATS for smoke/dev. For
+production set nats.deploy=false and nats.url to the platform NATS cluster.
+{{- end }}
+{{- if and .Values.secrets.create (not .Values.secrets.existingSecret) }}
+
+WARNING: chart-created secrets are generated at install and live only in
+this release's Secret; uninstalling the release deletes them, and TDRs
+encrypted with the generated tdr-hmac-secret cannot be read afterwards.
+In production set secrets.create=false and secrets.existingSecret to a
+platform-provisioned Secret (Arinna packaging contract §2.1, ADR-036 secretRef).
+
+Bootstrap admin password:
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "ss7-3eai-gateway.secretName" . }} -o jsonpath='{.data.admin-password}' | base64 -d
+{{- end }}
+
+Arinna onboarding: this chart is chart-only intake and runs smoke-INSTALL
+(no CRDs). See deploy/helm/ss7-3eai-gateway/README.md for the conformance map.

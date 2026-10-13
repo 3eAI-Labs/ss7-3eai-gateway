@@ -1,0 +1,283 @@
+# SS7 3EAI Gateway Configuration
+
+# Node Identity
+node_id: "node-1"
+node_id_numeric: 1  # Used for TID generation (0-255)
+cluster_name: "ss7-cluster"
+
+# M3UA Configuration — RFC 4666. Gateway acts as an ASP connecting to a
+# remote SGW. Multi-homing requires at least two local IPs; failover target
+# is 2s per BR-M3UA-003.
+m3ua:
+  sgw_address: "10.0.0.10"            # Remote SGW IP (operator-provided)
+  sgw_port: 2905                       # SCTP port; 2905 is the IANA M3UA default
+  asp_id: 1
+  routing_context: 1
+  network_appearance: 0
+  # MTP3 network indicator written in every routing label (Q.704 §14.2.2):
+  # 0 = international, 2 = national. Required — the SG/STP discards traffic
+  # whose NI does not match the network, so there is no default.
+  network_indicator: 2
+  # traffic_mode (RFC 4666 §1.4.4):
+  #   1 = Override  — SG → one ASP at a time. Active-Passive. Single-node
+  #                   deployments OR AP-style clusters.
+  #   2 = Loadshare — SG distributes across all ASPs in the routing
+  #                   context. Active-Active. REQUIRED when
+  #                   sccp.cluster_global_title is set (ADR-006);
+  #                   otherwise the cluster GT pins to one node and the
+  #                   loadshare benefit is lost. Boot-time WARN logs the
+  #                   drift; operators with intentional override accept it.
+  traffic_mode: 2                      # default: AA-loadshare per ADR-006
+  multi_homing_enabled: false
+  local_ips:
+    - "0.0.0.0"
+  heartbeat_interval: 30s
+  path_max_retrans: 5
+  rto_initial: 3s
+  rto_min: 1s
+  rto_max: 60s
+  assoc_max_retrans: 10
+  aspup_ack_timeout: 5s
+  aspac_ack_timeout: 5s
+  reconnect_interval: 5s
+  reconnect_max_attempts: 0            # 0 = retry forever
+
+# SCCP Configuration — ITU-T Q.713. local_subsystems lists every SSN this
+# node terminates locally (HLR=6, VLR=7, MSC=8, gsmSCF=146, etc.).
+#
+# network_variant selects the SS7 variant which dictates SCCP point-code
+# field width on the wire (Q.713 §3.4.1):
+#   - itu  : 14-bit PC, 2 octets — Europe, Asia, Middle East, Africa
+#   - ansi : 24-bit PC, 3 octets — United States, Canada, parts of LATAM
+# MUST match the connected peer; mismatch silently corrupts addresses.
+# When variant=itu, local_point_code MUST fit 14 bits (≤ 0x3FFF).
+sccp:
+  network_variant: ansi                # this example uses ANSI 24-bit PCs
+  local_point_code: 0x010101           # 1-1-1 (ANSI 24-bit)
+  local_subsystems: [6, 8, 146]        # HLR, MSC, gsmSCF
+  # local_global_title: this NODE's per-node sticky GT used as CgPA on
+  # outbound traffic. Each cluster node configures its OWN distinct GT
+  # (e.g. node1 → 905300000001, node2 → 905300000002). Peers pin this
+  # in their CdPA on responses, so the SG routes responses back to ONLY
+  # this node — sticky-CgPA dialogue affinity (ADR-006).
+  # Empty disables (PC+SSN routing — fine for in-network short-circuits,
+  # NOT fine for ANSI/MENA carriers that route on GT).
+  local_global_title:
+    address: "905300000001"            # per-node E.164 digits; UNIQUE per node
+    # gti: 4                           # default GTI0100 (TT+NP+ES+NAI)
+    # translation_type: 0              # ANSI carriers may need non-zero
+    # numbering_plan: 1                # default ISDN/E.164
+    # nature_of_address: 4             # default International
+  # cluster_global_title: cluster-SHARED inbound GT for new dialogues from
+  # foreign peers (MO-Forward from a roaming SMSC, SRI from a foreign
+  # HLR). All cluster nodes share this digit string; the SG loadshares
+  # inbound UDTs across the cluster (M3UA traffic_mode=2). Receiving
+  # node owns the dialogue from BEGIN to END.
+  # MUST differ from local_global_title.address — same digits in both
+  # roles defeats sticky response routing (validateConfig rejects).
+  # Empty disables (single-node mode — only local_global_title used).
+  cluster_global_title:
+    address: "905300000000"            # E.164 digits; SAME on all cluster nodes
+    # gti: 4
+    # translation_type: 0
+    # numbering_plan: 1
+    # nature_of_address: 4
+  gtt_enabled: true
+  # gtt_rules: where GT-routed messages this node originates are sent
+  # (MT-Forward-SM to the VMSC GT; SRI-for-SM when map.hlr_pc is 0). The
+  # highest-priority rule whose pattern matches the called GT gives the DPC.
+  #   ssn: 0 (or absent) — intermediate translation: the called address
+  #       keeps routing on GT and point_code is the next relay, normally
+  #       the STP, which translates again (Q.714 §2.4);
+  #   ssn: N — final translation: route on point_code + SSN N.
+  # Without a matching rule a GT-routed message is not sent (logged as
+  # "no route to destination"). Incoming messages are never relayed.
+  gtt_rules:
+    - pattern: "*"                     # every GT
+      point_code: 0x010102             # the STP (1-1-2)
+      description: "default route via STP"
+  gtt_cache_enabled: true
+  gtt_cache_ttl: 600s
+  gtt_cache_max_size: 100000
+  max_hop_counter: 15                  # Q.713 default
+  segmentation_enabled: false
+  max_segment_size: 252
+  channel_buffer_size: 10000
+  worker_pool_size: 16
+
+# TCAP Configuration — ITU-T Q.773/Q.774. node_id (uint8) seeds the upper
+# byte of every transaction ID for cluster-wide TID uniqueness; falls back
+# to node_id_numeric above if unset.
+tcap:
+  node_id: 1
+  dialogue_timeout: 30s
+  invoke_timeout: 10s
+  idle_timeout: 60s
+  max_dialogues: 100000
+  max_components_per_message: 100
+  max_invokes_per_dialogue: 10
+  channel_buffer_size: 10000
+  worker_pool_size: 16
+  timer_resolution: 1s
+
+# MAP Configuration — 3GPP TS 29.002. v1 scope: log + metric for incoming
+# Invoke components (ASN.1 BER decode of parameters lands in TIER 1).
+# hlr_address and hlr_pc must be non-empty/non-zero; they identify the
+# upstream HLR for outbound Invoke addressing once TIER 1 ships.
+map:
+  hlr_address: "10.0.0.20"             # Upstream HLR address (operator-provided)
+  hlr_gt: ""
+  hlr_pc: 0x010102                     # 1-1-2
+  channel_buffer_size: 10000
+  worker_pool_size: 16
+  operation_timeout: 10s
+
+# CAP Configuration — 3GPP TS 29.078 (CAMEL). service_keys map gsmSCF
+# service-key IDs to human-readable names for log + metric labels.
+# gsmscf_address and gsmscf_pc identify the upstream gsmSCF.
+cap:
+  gsmscf_address: "10.0.0.30"          # Upstream gsmSCF address (operator-provided)
+  gsmscf_gt: ""
+  gsmscf_pc: 0x010103                  # 1-1-3
+  service_keys:
+    "1": "prepaid-voice"
+    "2": "prepaid-sms"
+  channel_buffer_size: 5000
+  worker_pool_size: 8
+  operation_timeout: 30s
+
+# INAP Configuration — INAP is not implemented. The block is accepted and its
+# values are ignored.
+inap:
+  worker_pool_size: 8
+  channel_buffer_size: 5000
+  operation_timeout: 30s
+
+# NATS Bridge Configuration
+nats:
+  url: "nats://localhost:4222"
+  max_reconnects: -1  # Infinite
+  reconnect_wait: 2s
+  ping_interval: 20s
+  max_pings_out: 3
+  worker_pool_size: 8
+
+# Firewall Configuration (GSMA FS.11)
+firewall:
+  enabled: true
+  mode: 1  # 0=Monitoring, 1=Enforcing, 2=Learning
+  default_action: 0  # 0=Allow, 1=Block
+  worker_pool_size: 8
+  inspection_timeout: 100ms
+  channel_buffer_size: 10000
+
+  # Anomaly Detection
+  anomaly_detection_enabled: true
+  anomaly_threshold: 3.0  # Standard deviations
+
+  # Threat Intelligence
+  threat_db_enabled: true
+  threat_db_update_interval: 3600s
+
+  # Logging & Alerting
+  log_blocked: true
+  log_allowed: false
+  alert_on_threat: true
+  alert_webhook_url: ""
+
+# TDR Generator Configuration
+tdr:
+  enabled: true
+
+  # AWS S3
+  s3_bucket: "ss7-tdrs"
+  s3_region: "us-east-1"
+  s3_prefix: "tdrs"
+  s3_storage_class: "INTELLIGENT_TIERING"  # STANDARD, INTELLIGENT_TIERING, GLACIER
+
+  # AWS KMS (for encryption)
+  kms_key_id: ""
+  kms_region: "us-east-1"
+
+  # Encryption (PII Protection - GDPR)
+  encryption_enabled: true
+  pii_encryption: true
+  searchable_encryption: true  # HMAC for GDPR DSAR compliance
+  hmac_secret: "CHANGE_THIS_SECRET_KEY_MIN_32_CHARS_REQUIRED"
+
+  # Buffering & Performance
+  buffer_size: 1000
+  flush_interval: 60s
+  worker_pool_size: 4
+  channel_buffer_size: 10000
+
+  # Compression
+  compression_enabled: true
+  compression_level: 6  # 1-9 (gzip)
+
+  # Retention & Lifecycle
+  retention_days: 365
+  archive_after_days: 90
+
+  # S3 Object Lock (WORM - Write Once Read Many)
+  object_lock_enabled: false
+  object_lock_mode: "GOVERNANCE"  # GOVERNANCE, COMPLIANCE
+  object_lock_days: 365
+
+# HA Configuration (NATS JetStream KV mode)
+# NOTE: Raft consensus is NO LONGER USED
+# Configuration is now stored in NATS JetStream KV
+# All nodes are equal - no leader election needed
+# Config sync happens automatically via NATS
+
+# REST API Gateway Configuration
+api:
+  bind_addr: "0.0.0.0:8080"
+
+  # TLS
+  tls_enabled: false
+  tls_cert_file: "/etc/ssl/certs/gateway.crt"
+  tls_key_file: "/etc/ssl/private/gateway.key"
+
+  # JWT Authentication
+  # MUST be rotated before any deploy with dev_mode=false. Validator
+  # rejects values starting with CHANGE_THIS / REPLACE_ME / PLACEHOLDER /
+  # EXAMPLE_ and any value shorter than 32 bytes when dev_mode=false.
+  jwt_secret: "CHANGE_THIS_JWT_SECRET_MIN_32_CHARS"
+  jwt_expiration: 24h
+
+  # CORS
+  # cors_origins MUST list explicit origins when cors_enabled=true and
+  # dev_mode=false. Wildcard "*" is rejected at startup in production
+  # mode because the CORS spec forbids "*" + Allow-Credentials: true,
+  # which browsers then refuse.
+  cors_enabled: true
+  cors_origins:
+    - "https://admin.example.com"
+    - "https://noc.example.com"
+
+  # Rate Limiting
+  rate_limit_enabled: true
+  rate_limit_rps: 100
+
+  # Timeouts
+  read_timeout: 15s
+  write_timeout: 15s
+  idle_timeout: 60s
+
+  # Security
+  enable_swagger: false
+  trusted_proxies:
+    - "127.0.0.1"
+    - "10.0.0.0/8"
+
+  # Default Admin User (for bootstrap)
+  # When dev_mode=false, both fields must be set (validator hard-fails
+  # otherwise — booting with zero users wedges the system because
+  # POST /users is not yet implemented).
+  default_admin_user: "admin"
+  default_admin_password: "CHANGE_THIS_PASSWORD"
+
+  # Dev-mode loosens secret/CORS/admin checks for local development.
+  # MUST be false in any non-local environment.
+  dev_mode: false

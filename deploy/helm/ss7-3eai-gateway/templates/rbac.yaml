@@ -1,0 +1,37 @@
+{{- if .Values.serviceAccount.create -}}
+# Namespaced Role: the gateway emits the fixed-schema K8s Event that reports
+# opsTrigger outcomes (contract §5 — Arinna reads it via k8s-mcp
+# list-k8s-events), and reads its own ConfigMap to observe opsTrigger tokens.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "ss7-3eai-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ss7-3eai-gateway.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames:
+      - {{ include "ss7-3eai-gateway.fullname" . }}-config
+    verbs: ["get", "watch", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "ss7-3eai-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ss7-3eai-gateway.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "ss7-3eai-gateway.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ss7-3eai-gateway.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

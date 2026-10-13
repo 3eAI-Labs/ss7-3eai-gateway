@@ -1,0 +1,1392 @@
+// Copyright 2026 3eAI Labs Ltd
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package tcap
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
+	gotcap "github.com/wmnsk/go-tcap"
+	"go.uber.org/zap"
+)
+
+var (
+	ErrInvalidMessage       = errors.New("TCAP: invalid message")
+	ErrDialogueNotFound     = errors.New("TCAP: dialogue not found")
+	ErrDialogueLimitReached = errors.New("TCAP: max dialogues reached")
+	ErrInvokeNotFound       = errors.New("TCAP: invoke not found")
+	ErrInvalidTID           = errors.New("TCAP: invalid transaction ID")
+	ErrDialogueExpired      = errors.New("TCAP: dialogue expired")
+	ErrShutdown             = errors.New("TCAP: handler is shutting down")
+)
+
+const (
+	ChannelBufferSize      = 100
+	DefaultWorkerPoolSize  = 4
+	DefaultTimerResolution = 1 * time.Second
+)
+
+// NewHandler creates a new TCAP handler instance.
+//
+// sccpIncoming and sccpOutgoing wire TCAP to the SCCP layer below; obtain
+// these from sccp.Handler.TcapIncomingChannel() and TcapOutgoingChannel().
+// dispatcher routes messages to application-context-specific handlers
+// (MAP, CAP, INAP). All four wired dependencies are required: nil values
+// fail fast per carrier-grade strict mode (GSMA FS.11).
+func NewHandler(
+	config *Config,
+	sccpIncoming <-chan *sccp.SccpMessage,
+	sccpOutgoing chan<- *sccp.SccpMessage,
+	dispatcher *Dispatcher,
+	logger *zap.Logger,
+) (*Handler, error) {
+	if config == nil {
+		return nil, fmt.Errorf("config cannot be nil")
+	}
+	if sccpIncoming == nil {
+		return nil, fmt.Errorf("sccpIncoming channel cannot be nil")
+	}
+	if sccpOutgoing == nil {
+		return nil, fmt.Errorf("sccpOutgoing channel cannot be nil")
+	}
+	if dispatcher == nil {
+		return nil, fmt.Errorf("dispatcher cannot be nil")
+	}
+	if err := validateConfig(config); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
+	handler := &Handler{
+		config:         config,
+		nodeID:         config.NodeID,
+		dialogues:      make(map[uint32]*Dialogue),
+		sccpIncomingCh: sccpIncoming,
+		sccpOutgoingCh: sccpOutgoing,
+		dispatcher:     dispatcher,
+		appOutgoingCh:  make(chan *Message, config.ChannelBufferSize),
+		errorCh:        make(chan error, 10),
+		shutdownCh:     make(chan struct{}),
+		metrics:        &Metrics{},
+		logger:         logger,
+	}
+
+	// Initialize timer manager
+	handler.timerManager = &TimerManager{
+		handler:    handler,
+		shutdownCh: make(chan struct{}),
+	}
+
+	return handler, nil
+}
+
+// SetFailureSink installs the callback fired when an originated dialogue
+// (one we opened via Originate) ends without a ReturnResult — i.e.
+// DialogueTimeout or inbound P/U-ABORT. nil disables; useful in tests
+// that exercise codecs without wiring NATS.
+//
+// The sink runs synchronously inside the timer-manager goroutine for
+// timeouts and inside the SCCP-incoming worker for inbound ABORTs.
+// Implementations must not block (publish to a queue if needed).
+func (h *Handler) SetFailureSink(sink FailureSink) {
+	h.failureSink = sink
+}
+
+// Start initializes TCAP handler and worker pool.
+func (h *Handler) Start(ctx context.Context) error {
+	h.logger.Info("Starting TCAP handler",
+		zap.Uint8("node_id", h.nodeID),
+		zap.Int("max_dialogues", h.config.MaxDialogues),
+		zap.Duration("dialogue_timeout", h.config.DialogueTimeout))
+
+	// Track workers + timer manager so Stop can wait for graceful drain.
+	h.wg.Add(h.config.WorkerPoolSize + 1)
+
+	for i := 0; i < h.config.WorkerPoolSize; i++ {
+		go h.worker(ctx, i)
+	}
+	go h.timerManager.run(ctx)
+
+	h.logger.Info("TCAP handler started successfully",
+		zap.Int("workers", h.config.WorkerPoolSize))
+
+	return nil
+}
+
+// Stop gracefully stops the TCAP handler. Waits for all workers and the timer
+// manager to return before closing log emission, preventing -race "Log in
+// goroutine after test completed" panics observed under TestTCAPConcurrentMessages.
+func (h *Handler) Stop(ctx context.Context) error {
+	h.logger.Info("Stopping TCAP handler")
+
+	close(h.shutdownCh)
+	close(h.timerManager.shutdownCh)
+
+	done := make(chan struct{})
+	go func() {
+		h.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		h.logger.Info("TCAP handler stopped gracefully")
+	case <-ctx.Done():
+		h.logger.Warn("TCAP handler stop timeout")
+	}
+
+	return nil
+}
+
+// ApplicationOutbound returns the write side of the application→TCAP channel.
+// MAP/CAP/INAP handlers push outgoing TCAP responses here; the TCAP worker
+// drains, encodes, and forwards via SCCP.
+func (h *Handler) ApplicationOutbound() chan<- *Message {
+	return h.appOutgoingCh
+}
+
+// Originate opens a new outbound TCAP dialogue with a BEGIN message carrying
+// a single Invoke component. Used by the NATS bridge to initiate MAP/CAP
+// transactions toward HLR/MSC/gsmSSF peers (e.g. SRI-for-SM, MtForwardSM).
+//
+// Wire effects:
+//   - Allocates a fresh local TID via the node-id-prefixed generator.
+//   - Registers a Dialogue in StateInitWait with addresses pinned, op code
+//     and NATS correlation ID stored for the eventual ReturnResult/Error path.
+//   - Pushes a *Message of MsgTypeBegin onto the outbound channel; the
+//     worker encodes it (including AC OID in the dialogue portion) and
+//     forwards via SCCP UDT to `called`.
+//
+// `called` is the destination peer (HLR GT for SRI-for-SM, VMSC for MT-Fwd-SM)
+// and `calling` is our own SCCP address (so the peer's response can come back).
+// Both must be non-nil — Q.713 §3.4 requires both addresses on connectionless
+// SCCP.
+//
+// Returns the registered Dialogue. Caller does not need to retain it; the
+// dispatcher's response path looks it up by DTID on the incoming END/CONTINUE.
+// On channel-full, returns ErrShutdown-shaped error and removes the dialogue.
+func (h *Handler) Originate(
+	ac *ApplicationContext,
+	called, calling *sccp.SccpAddress,
+	opCode int32,
+	parameter []byte,
+	natsCorrelationID string,
+) (*Dialogue, error) {
+	if ac == nil {
+		return nil, errors.New("Originate: application context required")
+	}
+	if called == nil || calling == nil {
+		return nil, errors.New("Originate: both SCCP addresses required (Q.713 §3.4)")
+	}
+
+	if h.getDialogueCount() >= h.config.MaxDialogues {
+		return nil, ErrDialogueLimitReached
+	}
+
+	localTID := h.allocateTID()
+	invokeID := int32(1)
+
+	dialogue := &Dialogue{
+		LocalTID:           localTID,
+		State:              StateInitWait,
+		ApplicationContext: ac,
+		LocalAddress:       calling,
+		RemoteAddress:      called,
+		NATSCorrelationID:  natsCorrelationID,
+		OriginatingOpCode:  opCode,
+		CreatedAt:          time.Now(),
+		LastActivity:       time.Now(),
+		ExpiresAt:          time.Now().Add(h.config.DialogueTimeout),
+		PendingInvokes: map[int32]*PendingInvoke{
+			invokeID: {
+				InvokeID:      invokeID,
+				OperationCode: opCode,
+				SentAt:        time.Now(),
+				ExpiresAt:     time.Now().Add(h.config.InvokeTimeout),
+				Parameter:     parameter,
+			},
+		},
+	}
+
+	h.dialoguesMu.Lock()
+	h.dialogues[localTID] = dialogue
+	h.dialoguesMu.Unlock()
+	h.metrics.ActiveDialogues.Add(1)
+	h.metrics.TotalDialogues.Add(1)
+
+	beginMsg := &Message{
+		MessageType:    MsgTypeBegin,
+		OriginatingTID: h.encodeTID(localTID),
+		DialoguePortion: &DialoguePortion{
+			ApplicationContext: ac,
+		},
+		Components: []*Component{{
+			Type:          CompTypeInvoke,
+			InvokeID:      &invokeID,
+			OperationCode: &opCode,
+			Parameter:     parameter,
+		}},
+		Dialogue: dialogue,
+	}
+
+	select {
+	case h.appOutgoingCh <- beginMsg:
+		h.logger.Info("TCAP dialogue originated",
+			zap.Uint32("local_tid", localTID),
+			zap.Int32("op_code", opCode),
+			zap.String("nats_correlation_id", natsCorrelationID),
+			zap.String("ac", ac.Name))
+		return dialogue, nil
+	default:
+		// Roll back the registration so we don't leak a dialogue for a BEGIN
+		// that never went out. The peer will never know it existed.
+		h.removeDialogue(localTID)
+		h.metrics.Errors.Add(1)
+		return nil, errors.New("TCAP outbound channel full")
+	}
+}
+
+// worker processes incoming SCCP-routed TCAP messages and outbound
+// application replies. Per-iteration select gives no priority — fairness is
+// the runtime's responsibility.
+func (h *Handler) worker(ctx context.Context, id int) {
+	defer h.wg.Done()
+	h.logger.Info("TCAP worker started", zap.Int("worker_id", id))
+	defer h.logger.Info("TCAP worker stopped", zap.Int("worker_id", id))
+
+	for {
+		select {
+		case <-h.shutdownCh:
+			return
+		case <-ctx.Done():
+			return
+		case sccpMsg := <-h.sccpIncomingCh:
+			h.handleIncomingMessage(sccpMsg)
+		case appMsg := <-h.appOutgoingCh:
+			h.handleOutgoingMessage(appMsg)
+		}
+	}
+}
+
+// handleIncomingMessage processes a TCAP-bearing SCCP UDT/XUDT delivered by
+// the SCCP layer. The SCCP wrapper carries the calling/called addresses
+// needed to pin dialogue context (Q.713 §3.4) and to construct outbound
+// replies in the same dialogue.
+func (h *Handler) handleIncomingMessage(sccpMsg *sccp.SccpMessage) {
+	if sccpMsg == nil {
+		h.metrics.Errors.Add(1)
+		return
+	}
+	h.metrics.MessagesReceived.Add(1)
+
+	tcapMsg, err := h.parseTCAPMessage(sccpMsg.Data)
+	if err != nil {
+		h.logger.Error("Failed to parse TCAP message", zap.Error(err))
+		h.metrics.ParseErrors.Add(1)
+		h.metrics.Errors.Add(1)
+		return
+	}
+
+	h.logger.Debug("Received TCAP message",
+		zap.String("type", tcapMsg.MessageType.String()),
+		zap.String("otid", hex.EncodeToString(tcapMsg.OriginatingTID)),
+		zap.Int("components", len(tcapMsg.Components)))
+
+	switch tcapMsg.MessageType {
+	case MsgTypeBegin:
+		h.handleBegin(sccpMsg, tcapMsg)
+	case MsgTypeContinue:
+		h.handleContinue(sccpMsg, tcapMsg)
+	case MsgTypeEnd:
+		h.handleEnd(sccpMsg, tcapMsg)
+	case MsgTypeAbort:
+		h.handleAbort(sccpMsg, tcapMsg)
+	case MsgTypeUnidirectional:
+		h.handleUnidirectional(sccpMsg, tcapMsg)
+	default:
+		h.logger.Warn("Unknown TCAP message type",
+			zap.Uint8("type", uint8(tcapMsg.MessageType)))
+		h.metrics.Errors.Add(1)
+	}
+}
+
+// handleBegin processes TCAP BEGIN message. sccpCtx supplies the addresses
+// needed for any P-Abort response and for pinning dialogue addresses.
+func (h *Handler) handleBegin(sccpCtx *sccp.SccpMessage, msg *Message) {
+	h.metrics.BeginReceived.Add(1)
+
+	if h.getDialogueCount() >= h.config.MaxDialogues {
+		h.logger.Error("Max dialogues reached, rejecting BEGIN")
+		h.sendAbort(sccpCtx, msg, AbortResourceLimitation, true)
+		return
+	}
+
+	localTID := h.allocateTID()
+
+	// AC may be absent if BEGIN lacks dialogue portion; dispatch will P-Abort.
+	var appCtx *ApplicationContext
+	if msg.DialoguePortion != nil {
+		appCtx = msg.DialoguePortion.ApplicationContext
+	}
+
+	dialogue := &Dialogue{
+		LocalTID:           localTID,
+		RemoteTID:          msg.OriginatingTID,
+		State:              StateActive,
+		ApplicationContext: appCtx,
+		LocalAddress:       sccpCtx.CalledAddress,
+		RemoteAddress:      sccpCtx.CallingAddress,
+		CreatedAt:          time.Now(),
+		LastActivity:       time.Now(),
+		ExpiresAt:          time.Now().Add(h.config.DialogueTimeout),
+		PendingInvokes:     make(map[int32]*PendingInvoke),
+	}
+
+	h.dialoguesMu.Lock()
+	h.dialogues[localTID] = dialogue
+	h.dialoguesMu.Unlock()
+
+	h.metrics.ActiveDialogues.Add(1)
+	h.metrics.TotalDialogues.Add(1)
+
+	h.logger.Info("Created new dialogue",
+		zap.Uint32("local_tid", localTID),
+		zap.String("remote_tid", hex.EncodeToString(msg.OriginatingTID)))
+
+	h.processComponents(dialogue, msg.Components)
+
+	if h.dispatchToApplication(sccpCtx, dialogue, msg) {
+		h.removeDialogue(localTID)
+	}
+}
+
+// handleContinue processes TCAP CONTINUE message.
+func (h *Handler) handleContinue(sccpCtx *sccp.SccpMessage, msg *Message) {
+	h.metrics.ContinueReceived.Add(1)
+
+	localTID := h.decodeTID(msg.DestinationTID)
+	if localTID == 0 {
+		h.logger.Warn("Invalid DTID in CONTINUE", zap.String("dtid", hex.EncodeToString(msg.DestinationTID)))
+		return
+	}
+
+	dialogue := h.getDialogue(localTID)
+	if dialogue == nil {
+		h.logger.Warn("Dialogue not found for CONTINUE", zap.Uint32("local_tid", localTID))
+		h.sendAbort(sccpCtx, msg, AbortUnrecognizedTransactionID, true)
+		return
+	}
+
+	dialogue.LastActivity = time.Now()
+	dialogue.ExpiresAt = time.Now().Add(h.config.DialogueTimeout)
+	dialogue.MessagesReceived.Add(1)
+
+	if len(msg.OriginatingTID) > 0 {
+		dialogue.RemoteTID = msg.OriginatingTID
+	}
+
+	h.logger.Debug("Updated dialogue",
+		zap.Uint32("local_tid", localTID),
+		zap.String("remote_tid", hex.EncodeToString(dialogue.RemoteTID)))
+
+	h.processComponents(dialogue, msg.Components)
+
+	if h.dispatchToApplication(sccpCtx, dialogue, msg) {
+		h.removeDialogue(localTID)
+	}
+}
+
+// handleEnd processes TCAP END message.
+func (h *Handler) handleEnd(sccpCtx *sccp.SccpMessage, msg *Message) {
+	h.metrics.EndReceived.Add(1)
+
+	localTID := h.decodeTID(msg.DestinationTID)
+	if localTID == 0 {
+		h.logger.Warn("Invalid DTID in END")
+		return
+	}
+
+	dialogue := h.getDialogue(localTID)
+	if dialogue == nil {
+		h.logger.Warn("Dialogue not found for END", zap.Uint32("local_tid", localTID))
+		return
+	}
+
+	dialogue.MessagesReceived.Add(1)
+
+	h.logger.Info("Dialogue ended",
+		zap.Uint32("local_tid", localTID),
+		zap.Duration("duration", time.Since(dialogue.CreatedAt)))
+
+	h.processComponents(dialogue, msg.Components)
+
+	// END is terminal regardless of dispatch outcome.
+	h.dispatchToApplication(sccpCtx, dialogue, msg)
+	h.removeDialogue(localTID)
+}
+
+// handleAbort processes TCAP ABORT message.
+func (h *Handler) handleAbort(sccpCtx *sccp.SccpMessage, msg *Message) {
+	h.metrics.AbortReceived.Add(1)
+
+	localTID := h.decodeTID(msg.DestinationTID)
+	if localTID == 0 {
+		h.logger.Warn("Invalid DTID in ABORT")
+		return
+	}
+
+	dialogue := h.getDialogue(localTID)
+	if dialogue == nil {
+		h.logger.Warn("Dialogue not found for ABORT", zap.Uint32("local_tid", localTID))
+		return
+	}
+
+	dialogue.MessagesReceived.Add(1)
+
+	abortType := "U-ABORT"
+	if msg.PAbort {
+		abortType = "P-ABORT"
+	}
+
+	h.logger.Info("Dialogue aborted",
+		zap.Uint32("local_tid", localTID),
+		zap.String("type", abortType),
+		zap.Uint8("cause", uint8(*msg.AbortCause)))
+
+	// Snapshot the originated-dialogue context before the dispatch / delete
+	// race below; sink fires post-removal so it can't observe stale state.
+	corrID := dialogue.NATSCorrelationID
+	opCode := dialogue.OriginatingOpCode
+	cause := uint8(*msg.AbortCause)
+
+	// ABORT is terminal regardless of dispatch outcome.
+	h.dispatchToApplication(sccpCtx, dialogue, msg)
+	h.removeDialogue(localTID)
+
+	if h.failureSink != nil && corrID != "" {
+		detail := fmt.Sprintf("%s cause=0x%02x", abortType, cause)
+		h.failureSink(corrID, opCode, FailureAbortReceived, detail)
+	}
+}
+
+// handleUnidirectional processes TCAP UNIDIRECTIONAL message.
+// UNI has no dialogue; abort flag is meaningless (nothing to tear down).
+func (h *Handler) handleUnidirectional(sccpCtx *sccp.SccpMessage, msg *Message) {
+	h.logger.Debug("Received UNIDIRECTIONAL message",
+		zap.Int("components", len(msg.Components)))
+	h.dispatchToApplication(sccpCtx, nil, msg)
+}
+
+// handleOutgoingMessage processes outgoing TCAP messages from application
+// handlers. SCCP addresses are sourced from msg.Dialogue when set (the
+// in-process back-reference applications use for END responses), otherwise
+// the legacy wire-TID lookup is attempted (correct only for BEGIN where
+// OTID = our LocalTID). Without either, addresses remain nil and the
+// receiver will treat the SCCP wrapper as malformed.
+// Address rules: CalledAddress=Remote (the peer), CallingAddress=Local (us).
+func (h *Handler) handleOutgoingMessage(msg *Message) {
+	h.metrics.MessagesSent.Add(1)
+
+	payload, err := h.encodeTCAPMessage(msg)
+	if err != nil {
+		h.logger.Error("Failed to encode TCAP message", zap.Error(err))
+		h.metrics.Errors.Add(1)
+		return
+	}
+
+	var called, calling *sccp.SccpAddress
+	switch {
+	case msg.Dialogue != nil:
+		called = msg.Dialogue.RemoteAddress
+		calling = msg.Dialogue.LocalAddress
+	default:
+		if dlg := h.lookupDialogueForOutgoing(msg); dlg != nil {
+			called = dlg.RemoteAddress
+			calling = dlg.LocalAddress
+		}
+	}
+
+	if err := h.sendOnSCCP(payload, called, calling); err != nil {
+		h.logger.Error("Failed to forward TCAP message to SCCP", zap.Error(err))
+		return
+	}
+	h.updateOutgoingMetrics(msg)
+}
+
+// lookupDialogueForOutgoing locates the dialogue an outbound TCAP message
+// belongs to. CONTINUE/END/ABORT carry DTID = our local TID; BEGIN carries
+// only OTID = our local TID for outgoing-initiated dialogues.
+func (h *Handler) lookupDialogueForOutgoing(msg *Message) *Dialogue {
+	var localTID uint32
+	switch msg.MessageType {
+	case MsgTypeContinue, MsgTypeEnd, MsgTypeAbort:
+		if len(msg.DestinationTID) >= 4 {
+			localTID = h.decodeTID(msg.DestinationTID)
+		}
+	case MsgTypeBegin:
+		if len(msg.OriginatingTID) >= 4 {
+			localTID = h.decodeTID(msg.OriginatingTID)
+		}
+	}
+	if localTID == 0 {
+		return nil
+	}
+	return h.getDialogue(localTID)
+}
+
+// sendOnSCCP wraps a TCAP payload in an SCCP UDT and pushes it to the
+// outgoing channel. ProtocolClass 0 (basic connectionless, Q.713 §2.2).
+func (h *Handler) sendOnSCCP(payload []byte, called, calling *sccp.SccpAddress) error {
+	out := &sccp.SccpMessage{
+		MessageType:    sccp.MsgTypeUDT,
+		ProtocolClass:  sccp.ClassBasicConnectionless,
+		CalledAddress:  called,
+		CallingAddress: calling,
+		Data:           payload,
+	}
+	select {
+	case h.sccpOutgoingCh <- out:
+		return nil
+	default:
+		h.metrics.Errors.Add(1)
+		return errors.New("SCCP channel full")
+	}
+}
+
+// processComponents processes TCAP components
+func (h *Handler) processComponents(dialogue *Dialogue, components []*Component) {
+	dialogue.ComponentsReceived.Add(uint64(len(components)))
+	h.metrics.ComponentsReceived.Add(uint64(len(components)))
+
+	dialogue.invokesMu.Lock()
+	defer dialogue.invokesMu.Unlock()
+
+	for _, comp := range components {
+		switch comp.Type {
+		case CompTypeInvoke:
+			h.metrics.InvokesReceived.Add(1)
+			// Store pending invoke
+			if comp.InvokeID != nil {
+				dialogue.PendingInvokes[*comp.InvokeID] = &PendingInvoke{
+					InvokeID:      *comp.InvokeID,
+					OperationCode: *comp.OperationCode,
+					SentAt:        time.Now(),
+					ExpiresAt:     time.Now().Add(h.config.InvokeTimeout),
+					Parameter:     comp.Parameter,
+				}
+			}
+
+		case CompTypeReturnResult:
+			h.metrics.ResultsReceived.Add(1)
+			// Remove pending invoke
+			if comp.LinkedID != nil {
+				delete(dialogue.PendingInvokes, *comp.LinkedID)
+			}
+
+		case CompTypeReturnError:
+			h.metrics.ErrorsReceived.Add(1)
+			// Remove pending invoke
+			if comp.InvokeID != nil {
+				delete(dialogue.PendingInvokes, *comp.InvokeID)
+			}
+
+		case CompTypeReject:
+			h.metrics.RejectsReceived.Add(1)
+			// Remove pending invoke
+			if comp.InvokeID != nil {
+				delete(dialogue.PendingInvokes, *comp.InvokeID)
+			}
+		}
+	}
+}
+
+// dispatchToApplication routes msg to its registered application-context handler.
+// Returns true if the dialogue must be torn down by the caller (P-Abort already
+// sent for BEGIN/CONTINUE per Q.773 §3.1.5).
+//
+// AC is dialogue-scoped: BEGIN's AARQ pins it, but CONTINUE/END/ABORT typically
+// arrive without a dialogue portion. We pin dialogue.ApplicationContext onto
+// msg before dispatching so the strict OID-router resolves correctly.
+//
+// sccpCtx is needed to construct any P-Abort response (addresses are reversed
+// from the original incoming message).
+func (h *Handler) dispatchToApplication(sccpCtx *sccp.SccpMessage, dialogue *Dialogue, msg *Message) (abort bool) {
+	pinApplicationContext(dialogue, msg)
+
+	err := h.dispatcher.Dispatch(dialogue, msg)
+	if err == nil {
+		return false
+	}
+
+	abortable := dialogue != nil && (msg.MessageType == MsgTypeBegin || msg.MessageType == MsgTypeContinue)
+
+	switch {
+	case errors.Is(err, ErrMissingAppContext):
+		// Q.773 §3.1.5: P-Abort, abnormal-dialogue
+		h.logger.Warn("TCAP message missing application context",
+			zap.Stringer("type", msg.MessageType),
+			zap.Error(err))
+		h.metrics.Errors.Add(1)
+		if abortable {
+			h.sendAbort(sccpCtx, msg, AbortAbnormalDialogue, true)
+			return true
+		}
+
+	case errors.Is(err, ErrUnknownAppContext):
+		// Q.773 §3.1.5: P-Abort, no-common-dialogue-portion
+		h.logger.Warn("No application handler for context",
+			zap.Stringer("type", msg.MessageType),
+			zap.Error(err))
+		h.metrics.Errors.Add(1)
+		if abortable {
+			h.sendAbort(sccpCtx, msg, AbortNoCommonDialoguePortion, true)
+			return true
+		}
+
+	default:
+		// Handler returned error; dispatcher already counted it. Leave dialogue
+		// intact — the application layer chose to fail this message, not abort
+		// the dialogue. Operators can wire HandlerErrors metric to their alerts.
+		h.logger.Error("Application handler failed",
+			zap.Stringer("type", msg.MessageType),
+			zap.Error(err))
+		h.metrics.Errors.Add(1)
+	}
+
+	return false
+}
+
+// pinApplicationContext copies the dialogue's stored AC onto msg if msg lacks
+// one. Q.773 §3.1.4: AC travels in BEGIN's AARQ; later messages in the same
+// dialogue do not re-carry it. The dispatcher routes by msg AC, so we must
+// surface the dialogue's pinned AC here.
+func pinApplicationContext(dialogue *Dialogue, msg *Message) {
+	if dialogue == nil || dialogue.ApplicationContext == nil {
+		return
+	}
+	if msg.DialoguePortion != nil && msg.DialoguePortion.ApplicationContext != nil {
+		return
+	}
+	if msg.DialoguePortion == nil {
+		msg.DialoguePortion = &DialoguePortion{}
+	}
+	msg.DialoguePortion.ApplicationContext = dialogue.ApplicationContext
+}
+
+// sendAbort sends a TCAP ABORT directly back to the originator. Uses the
+// incoming SCCP wrapper for addresses (CalledAddress=their CgPA,
+// CallingAddress=their CdPA) since a dialogue may not exist (BEGIN rejected,
+// unknown DTID). Encodes and pushes synchronously; falls through to error
+// metric if the SCCP channel is full.
+func (h *Handler) sendAbort(sccpCtx *sccp.SccpMessage, originalMsg *Message, cause AbortCause, pAbort bool) {
+	abortMsg := &Message{
+		MessageType:    MsgTypeAbort,
+		DestinationTID: originalMsg.OriginatingTID,
+		AbortCause:     &cause,
+		PAbort:         pAbort,
+	}
+
+	payload, err := h.encodeTCAPMessage(abortMsg)
+	if err != nil {
+		h.logger.Error("Failed to encode ABORT", zap.Error(err))
+		h.metrics.Errors.Add(1)
+		return
+	}
+
+	var called, calling *sccp.SccpAddress
+	if sccpCtx != nil {
+		called = sccpCtx.CallingAddress
+		calling = sccpCtx.CalledAddress
+	}
+
+	if err := h.sendOnSCCP(payload, called, calling); err != nil {
+		h.logger.Error("Failed to send ABORT", zap.Error(err))
+		return
+	}
+	h.metrics.MessagesSent.Add(1)
+	h.updateOutgoingMetrics(abortMsg)
+}
+
+// allocateTID allocates a new transaction ID (collision-resistant)
+func (h *Handler) allocateTID() uint32 {
+	// Upper 8 bits: Node ID (0-255)
+	// Lower 24 bits: Sequence counter
+	seq := h.tidCounter.Add(1) & 0x00FFFFFF
+	tid := (uint32(h.nodeID) << 24) | seq
+
+	return tid
+}
+
+// decodeTID decodes transaction ID from bytes
+func (h *Handler) decodeTID(tidBytes []byte) uint32 {
+	if len(tidBytes) == 0 {
+		return 0
+	}
+
+	// Simple 4-byte decoding (big-endian)
+	if len(tidBytes) >= 4 {
+		return uint32(tidBytes[0])<<24 |
+			uint32(tidBytes[1])<<16 |
+			uint32(tidBytes[2])<<8 |
+			uint32(tidBytes[3])
+	}
+
+	return 0
+}
+
+// encodeTID encodes transaction ID to bytes
+func (h *Handler) encodeTID(tid uint32) []byte {
+	return []byte{
+		byte(tid >> 24),
+		byte(tid >> 16),
+		byte(tid >> 8),
+		byte(tid),
+	}
+}
+
+// getDialogue retrieves dialogue by local TID
+func (h *Handler) getDialogue(localTID uint32) *Dialogue {
+	h.dialoguesMu.RLock()
+	defer h.dialoguesMu.RUnlock()
+	return h.dialogues[localTID]
+}
+
+// removeDialogue removes dialogue
+func (h *Handler) removeDialogue(localTID uint32) {
+	h.dialoguesMu.Lock()
+	defer h.dialoguesMu.Unlock()
+
+	if _, exists := h.dialogues[localTID]; exists {
+		delete(h.dialogues, localTID)
+		h.metrics.ActiveDialogues.Add(-1)
+	}
+}
+
+// getDialogueCount returns current dialogue count
+func (h *Handler) getDialogueCount() int {
+	h.dialoguesMu.RLock()
+	defer h.dialoguesMu.RUnlock()
+	return len(h.dialogues)
+}
+
+// parseTCAPMessage parses a raw TCAP payload (ITU-T Q.773) from the SCCP
+// data field. Returns ErrInvalidMessage on payloads too short to contain a
+// transaction tag and length octet.
+func (h *Handler) parseTCAPMessage(data []byte) (*Message, error) {
+	if len(data) < 2 {
+		return nil, ErrInvalidMessage
+	}
+
+	// Parse using go-tcap library
+	tcapMsg, err := gotcap.Parse(data)
+	if err != nil {
+		h.logger.Error("Failed to parse TCAP message", zap.Error(err))
+		return nil, fmt.Errorf("TCAP parse error: %w", err)
+	}
+
+	// Convert go-tcap.TCAP to our internal Message format
+	msg := &Message{}
+
+	// Parse Transaction Portion
+	if tx := tcapMsg.Transaction; tx != nil {
+		switch tx.Type.Code() {
+		case gotcap.Unidirectional:
+			msg.MessageType = MsgTypeUnidirectional
+		case gotcap.Begin:
+			msg.MessageType = MsgTypeBegin
+			if otid := tx.OrigTransactionID; otid != nil {
+				msg.OriginatingTID = otid.Value
+			}
+		case gotcap.End:
+			msg.MessageType = MsgTypeEnd
+			if dtid := tx.DestTransactionID; dtid != nil {
+				msg.DestinationTID = dtid.Value
+			}
+		case gotcap.Continue:
+			msg.MessageType = MsgTypeContinue
+			if otid := tx.OrigTransactionID; otid != nil {
+				msg.OriginatingTID = otid.Value
+			}
+			if dtid := tx.DestTransactionID; dtid != nil {
+				msg.DestinationTID = dtid.Value
+			}
+		case gotcap.Abort:
+			msg.MessageType = MsgTypeAbort
+			if dtid := tx.DestTransactionID; dtid != nil {
+				msg.DestinationTID = dtid.Value
+			}
+			if cause := tx.PAbortCause; cause != nil && len(cause.Value) > 0 {
+				abortCause := AbortCause(cause.Value[0])
+				msg.AbortCause = &abortCause
+				msg.PAbort = true
+			}
+		}
+	}
+
+	// Parse Dialogue Portion. ApplicationContextName.Value is the inner
+	// BER-encoded OBJECT IDENTIFIER (tag 0x06 + length + content) — strip
+	// the tag+length wrapper before handing the raw arc bytes to parseOID.
+	// go-tcap's NewApplicationContextName builds Value as
+	// [0x06, 0x07, 4, 0, 0, 1, 0, ctx, ver]; parseOID expects only the
+	// last 7 octets, otherwise it produces a phantom "0.6.7..." prefix
+	// that no registered AC will ever match (TIER 1 Item 4 catch).
+	if dlg := tcapMsg.Dialogue; dlg != nil {
+		msg.DialoguePortion = &DialoguePortion{}
+		if dlgPDU := dlg.DialoguePDU; dlgPDU != nil {
+			if acn := dlgPDU.ApplicationContextName; acn != nil && len(acn.Value) > 0 {
+				oidBytes := acn.Value
+				if len(oidBytes) >= 2 && oidBytes[0] == 0x06 {
+					// Skip OID tag + length octet.
+					oidBytes = oidBytes[2:]
+				}
+				msg.DialoguePortion.ApplicationContext = &ApplicationContext{
+					OID: parseOID(oidBytes),
+				}
+			}
+			if ui := dlgPDU.UserInformation; ui != nil {
+				msg.DialoguePortion.UserInformation = ui.Value
+			}
+		}
+	}
+
+	// Parse Components
+	if comps := tcapMsg.Components; comps != nil {
+		msg.Components = make([]*Component, 0, len(comps.Component))
+		for _, comp := range comps.Component {
+			c := &Component{}
+
+			// Component Type
+			switch comp.Type.Code() {
+			case gotcap.Invoke:
+				c.Type = CompTypeInvoke
+			case gotcap.ReturnResultLast, gotcap.ReturnResultNotLast:
+				c.Type = CompTypeReturnResult
+			case gotcap.ReturnError:
+				c.Type = CompTypeReturnError
+			case gotcap.Reject:
+				c.Type = CompTypeReject
+			}
+
+			// Invoke ID
+			if invID := comp.InvokeID; invID != nil && len(invID.Value) > 0 {
+				id := int32(invID.Value[0])
+				c.InvokeID = &id
+			}
+
+			// Linked ID
+			if linkID := comp.LinkedID; linkID != nil && len(linkID.Value) > 0 {
+				id := int32(linkID.Value[0])
+				c.LinkedID = &id
+			}
+
+			// Operation Code
+			if opCode := comp.OperationCode; opCode != nil && len(opCode.Value) > 0 {
+				code := int32(opCode.Value[0])
+				c.OperationCode = &code
+			}
+
+			// Error Code
+			if errCode := comp.ErrorCode; errCode != nil && len(errCode.Value) > 0 {
+				code := int32(errCode.Value[0])
+				c.ErrorCode = &code
+			}
+
+			// Parameter
+			if param := comp.Parameter; param != nil {
+				c.Parameter = param.Value
+			}
+
+			msg.Components = append(msg.Components, c)
+		}
+	}
+
+	return msg, nil
+}
+
+// encodeTCAPMessage encodes TCAP message to bytes (ITU-T Q.773)
+func (h *Handler) encodeTCAPMessage(msg *Message) ([]byte, error) {
+	if msg == nil {
+		return nil, ErrInvalidMessage
+	}
+
+	// Convert our internal Message to go-tcap.TCAP format
+	tcapMsg := &gotcap.TCAP{}
+
+	// Build Transaction Portion
+	switch msg.MessageType {
+	case MsgTypeUnidirectional:
+		tcapMsg.Transaction = gotcap.NewUnidirectional([]byte{})
+
+	case MsgTypeBegin:
+		if len(msg.OriginatingTID) < 4 {
+			return nil, fmt.Errorf("invalid OTID length: %d", len(msg.OriginatingTID))
+		}
+		otid := binary.BigEndian.Uint32(msg.OriginatingTID)
+		tcapMsg.Transaction = gotcap.NewBegin(otid, []byte{})
+
+	case MsgTypeEnd:
+		if len(msg.DestinationTID) < 4 {
+			return nil, fmt.Errorf("invalid DTID length: %d", len(msg.DestinationTID))
+		}
+		dtid := binary.BigEndian.Uint32(msg.DestinationTID)
+		tcapMsg.Transaction = gotcap.NewEnd(dtid, []byte{})
+
+	case MsgTypeContinue:
+		if len(msg.OriginatingTID) < 4 || len(msg.DestinationTID) < 4 {
+			return nil, fmt.Errorf("invalid TID length: OTID=%d, DTID=%d",
+				len(msg.OriginatingTID), len(msg.DestinationTID))
+		}
+		otid := binary.BigEndian.Uint32(msg.OriginatingTID)
+		dtid := binary.BigEndian.Uint32(msg.DestinationTID)
+		tcapMsg.Transaction = gotcap.NewContinue(otid, dtid, []byte{})
+
+	case MsgTypeAbort:
+		if len(msg.DestinationTID) < 4 {
+			return nil, fmt.Errorf("invalid DTID length: %d", len(msg.DestinationTID))
+		}
+		dtid := binary.BigEndian.Uint32(msg.DestinationTID)
+		cause := uint8(0)
+		if msg.AbortCause != nil {
+			cause = uint8(*msg.AbortCause)
+		}
+		tcapMsg.Transaction = gotcap.NewAbort(dtid, cause, []byte{})
+
+	default:
+		return nil, fmt.Errorf("unsupported message type: %v", msg.MessageType)
+	}
+
+	// Build Dialogue Portion (if present). go-tcap encodes ApplicationContext
+	// as the 9-byte template [0x06, 0x07, 4, 0, 0, 1, 0, ctx, ver]; ctx is
+	// the AC short ID (e.g. 1 = networkLocUp, 25 = shortMsgGateway), ver is
+	// the application-version. They're the LAST TWO arcs of the registered
+	// AC OID, so pull both — the previous code used OID[len-1] for ctx and
+	// hard 3 for ver, producing on-wire OID 0.4.0.0.1.0.{ver}.{3} that
+	// failed dispatcher lookup on inbound responses (TIER 1 Item 4 catch).
+	if dlg := msg.DialoguePortion; dlg != nil && dlg.ApplicationContext != nil {
+		ctx := uint8(0)
+		ctxver := uint8(3)
+		if oid := dlg.ApplicationContext.OID; len(oid) >= 2 {
+			ctx = uint8(oid[len(oid)-2])
+			ctxver = uint8(oid[len(oid)-1])
+		}
+		tcapMsg.Dialogue = gotcap.NewDialogue(1, 1, gotcap.NewAARQ(1, ctx, ctxver), dlg.UserInformation)
+	}
+
+	// Build Components
+	if len(msg.Components) > 0 {
+		comps := make([]*gotcap.Component, 0, len(msg.Components))
+		for _, c := range msg.Components {
+			var comp *gotcap.Component
+
+			switch c.Type {
+			case CompTypeInvoke:
+				invID := int(0)
+				if c.InvokeID != nil {
+					invID = int(*c.InvokeID)
+				}
+				linkID := int(-1)
+				if c.LinkedID != nil {
+					linkID = int(*c.LinkedID)
+				}
+				opCode := int(0)
+				if c.OperationCode != nil {
+					opCode = int(*c.OperationCode)
+				}
+				comp = gotcap.NewInvoke(invID, linkID, opCode, true, c.Parameter)
+
+			case CompTypeReturnResult:
+				invID := int(0)
+				if c.InvokeID != nil {
+					invID = int(*c.InvokeID)
+				}
+				opCode := int(0)
+				if c.OperationCode != nil {
+					opCode = int(*c.OperationCode)
+				}
+				// Assume Last for now
+				comp = gotcap.NewReturnResult(invID, opCode, true, true, c.Parameter)
+
+			case CompTypeReturnError:
+				invID := int(0)
+				if c.InvokeID != nil {
+					invID = int(*c.InvokeID)
+				}
+				errCode := int(0)
+				if c.ErrorCode != nil {
+					errCode = int(*c.ErrorCode)
+				}
+				comp = gotcap.NewReturnError(invID, errCode, true, c.Parameter)
+
+			case CompTypeReject:
+				invID := int(0)
+				if c.InvokeID != nil {
+					invID = int(*c.InvokeID)
+				}
+				problemType := gotcap.GeneralProblem
+				problemCode := uint8(0)
+				if c.ProblemCode != nil {
+					problemType = int(c.ProblemCode.Type)
+					problemCode = c.ProblemCode.Code
+				}
+				comp = gotcap.NewReject(invID, problemType, problemCode, c.Parameter)
+			}
+
+			if comp != nil {
+				comps = append(comps, comp)
+			}
+		}
+
+		tcapMsg.Components = gotcap.NewComponents(comps...)
+	}
+
+	// Set lengths
+	tcapMsg.SetLength()
+
+	// Marshal to bytes
+	data, err := tcapMsg.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal TCAP message: %w", err)
+	}
+
+	return data, nil
+}
+
+// parseOID parses ASN.1 OID bytes to integer slice
+func parseOID(data []byte) []int {
+	if len(data) < 2 {
+		return nil
+	}
+
+	oid := make([]int, 0, len(data))
+
+	// First byte encodes first two arcs: 40*X + Y
+	if data[0] >= 80 {
+		oid = append(oid, 2, int(data[0])-80)
+	} else if data[0] >= 40 {
+		oid = append(oid, 1, int(data[0])-40)
+	} else {
+		oid = append(oid, 0, int(data[0]))
+	}
+
+	// Remaining bytes
+	for i := 1; i < len(data); i++ {
+		oid = append(oid, int(data[i]))
+	}
+
+	return oid
+}
+
+// updateOutgoingMetrics updates metrics for outgoing messages
+func (h *Handler) updateOutgoingMetrics(msg *Message) {
+	switch msg.MessageType {
+	case MsgTypeBegin:
+		h.metrics.BeginSent.Add(1)
+	case MsgTypeContinue:
+		h.metrics.ContinueSent.Add(1)
+	case MsgTypeEnd:
+		h.metrics.EndSent.Add(1)
+	case MsgTypeAbort:
+		h.metrics.AbortSent.Add(1)
+	}
+
+	h.metrics.ComponentsSent.Add(uint64(len(msg.Components)))
+	for _, comp := range msg.Components {
+		switch comp.Type {
+		case CompTypeInvoke:
+			h.metrics.InvokesSent.Add(1)
+		case CompTypeReturnResult:
+			h.metrics.ResultsSent.Add(1)
+		case CompTypeReturnError:
+			h.metrics.ErrorsSent.Add(1)
+		case CompTypeReject:
+			h.metrics.RejectsSent.Add(1)
+		}
+	}
+}
+
+// GetMetrics returns current metrics
+func (h *Handler) GetMetrics() *Metrics {
+	return h.metrics
+}
+
+// GetHealthStatus returns health status
+func (h *Handler) GetHealthStatus() *HealthStatus {
+	return &HealthStatus{
+		ActiveDialogues:    h.metrics.ActiveDialogues.Load(),
+		TotalDialogues:     h.metrics.TotalDialogues.Load(),
+		MessagesReceived:   h.metrics.MessagesReceived.Load(),
+		MessagesSent:       h.metrics.MessagesSent.Load(),
+		ComponentsReceived: h.metrics.ComponentsReceived.Load(),
+		ComponentsSent:     h.metrics.ComponentsSent.Load(),
+		DialogueTimeouts:   h.metrics.DialogueTimeouts.Load(),
+		InvokeTimeouts:     h.metrics.InvokeTimeouts.Load(),
+		Errors:             h.metrics.Errors.Load(),
+		LastUpdate:         time.Now(),
+	}
+}
+
+// GetDialogues returns all active dialogues
+func (h *Handler) GetDialogues() []DialogueInfo {
+	h.dialoguesMu.RLock()
+	defer h.dialoguesMu.RUnlock()
+
+	dialogues := make([]DialogueInfo, 0, len(h.dialogues))
+	for _, d := range h.dialogues {
+		d.invokesMu.RLock()
+		pendingInvokes := len(d.PendingInvokes)
+		d.invokesMu.RUnlock()
+
+		acName := ""
+		if d.ApplicationContext != nil {
+			acName = d.ApplicationContext.Name
+		}
+
+		info := DialogueInfo{
+			LocalTID:           d.LocalTID,
+			RemoteTID:          hex.EncodeToString(d.RemoteTID),
+			State:              d.State.String(),
+			ApplicationContext: acName,
+			CreatedAt:          d.CreatedAt,
+			LastActivity:       d.LastActivity,
+			ExpiresAt:          d.ExpiresAt,
+			MessagesReceived:   d.MessagesReceived.Load(),
+			MessagesSent:       d.MessagesSent.Load(),
+			PendingInvokes:     pendingInvokes,
+		}
+		dialogues = append(dialogues, info)
+	}
+
+	return dialogues
+}
+
+// Errors returns channel for errors
+func (h *Handler) Errors() <-chan error {
+	return h.errorCh
+}
+
+// validateConfig validates TCAP configuration
+func validateConfig(cfg *Config) error {
+	if cfg.DialogueTimeout == 0 {
+		cfg.DialogueTimeout = 30 * time.Second
+	}
+	if cfg.InvokeTimeout == 0 {
+		cfg.InvokeTimeout = 10 * time.Second
+	}
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = 60 * time.Second
+	}
+	if cfg.MaxDialogues == 0 {
+		cfg.MaxDialogues = 10000
+	}
+	if cfg.MaxComponentsPerMessage == 0 {
+		cfg.MaxComponentsPerMessage = 100
+	}
+	if cfg.MaxInvokesPerDialogue == 0 {
+		cfg.MaxInvokesPerDialogue = 10
+	}
+	if cfg.ChannelBufferSize == 0 {
+		cfg.ChannelBufferSize = ChannelBufferSize
+	}
+	if cfg.WorkerPoolSize == 0 {
+		cfg.WorkerPoolSize = DefaultWorkerPoolSize
+	}
+	if cfg.TimerResolution == 0 {
+		cfg.TimerResolution = DefaultTimerResolution
+	}
+	return nil
+}
+
+// String methods for enums
+func (mt MessageType) String() string {
+	switch mt {
+	case MsgTypeUnidirectional:
+		return "UNIDIRECTIONAL"
+	case MsgTypeBegin:
+		return "BEGIN"
+	case MsgTypeEnd:
+		return "END"
+	case MsgTypeContinue:
+		return "CONTINUE"
+	case MsgTypeAbort:
+		return "ABORT"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func (ds DialogueState) String() string {
+	switch ds {
+	case StateIdle:
+		return "IDLE"
+	case StateInitWait:
+		return "INIT_WAIT"
+	case StateActive:
+		return "ACTIVE"
+	case StateTerminating:
+		return "TERMINATING"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// run manages dialogue and invoke timeouts. Owned by Handler.wg so Stop can
+// synchronously drain it before logger teardown.
+func (tm *TimerManager) run(ctx context.Context) {
+	defer tm.handler.wg.Done()
+	tm.handler.logger.Info("TCAP timer manager started")
+	defer tm.handler.logger.Info("TCAP timer manager stopped")
+
+	ticker := time.NewTicker(tm.handler.config.TimerResolution)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-tm.shutdownCh:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tm.checkTimeouts()
+		}
+	}
+}
+
+// checkTimeouts checks for expired dialogues and invokes
+func (tm *TimerManager) checkTimeouts() {
+	now := time.Now()
+	h := tm.handler
+
+	h.dialoguesMu.RLock()
+	expiredDialogues := make([]uint32, 0)
+	expiredInvokes := make(map[uint32][]int32)
+
+	for tid, dlg := range h.dialogues {
+		// Check dialogue timeout
+		if now.After(dlg.ExpiresAt) {
+			expiredDialogues = append(expiredDialogues, tid)
+			continue
+		}
+
+		// Check invoke timeouts
+		dlg.invokesMu.RLock()
+		for invID, inv := range dlg.PendingInvokes {
+			if now.After(inv.ExpiresAt) {
+				if expiredInvokes[tid] == nil {
+					expiredInvokes[tid] = make([]int32, 0)
+				}
+				expiredInvokes[tid] = append(expiredInvokes[tid], invID)
+			}
+		}
+		dlg.invokesMu.RUnlock()
+	}
+	h.dialoguesMu.RUnlock()
+
+	// Handle expired dialogues
+	for _, tid := range expiredDialogues {
+		h.logger.Warn("Dialogue timeout",
+			zap.Uint32("local_tid", tid))
+		h.metrics.DialogueTimeouts.Add(1)
+		h.handleDialogueTimeout(tid)
+	}
+
+	// Handle expired invokes
+	for tid, invIDs := range expiredInvokes {
+		for _, invID := range invIDs {
+			h.logger.Warn("Invoke timeout",
+				zap.Uint32("local_tid", tid),
+				zap.Int32("invoke_id", invID))
+			h.metrics.InvokeTimeouts.Add(1)
+			h.handleInvokeTimeout(tid, invID)
+		}
+	}
+}
+
+// handleDialogueTimeout sends a P-Abort upstream, removes the dialogue, and
+// updates metrics. Uses the dialogue's pinned addresses (CalledAddress=Remote,
+// CallingAddress=Local) since the dialogue is the only context source here.
+//
+// For dialogues we originated (NATSCorrelationID set), fires the failure
+// sink AFTER the wire ABORT is sent so the upstream NATS waiter unblocks.
+// Sink fires post-delete so it can't observe a stale dialogue.
+func (h *Handler) handleDialogueTimeout(localTID uint32) {
+	h.dialoguesMu.Lock()
+	dlg, exists := h.dialogues[localTID]
+	if !exists {
+		h.dialoguesMu.Unlock()
+		return
+	}
+
+	cause := AbortResourceLimitation
+	abortMsg := &Message{
+		MessageType:    MsgTypeAbort,
+		DestinationTID: dlg.RemoteTID,
+		AbortCause:     &cause,
+		PAbort:         true,
+	}
+
+	called := dlg.RemoteAddress
+	calling := dlg.LocalAddress
+	corrID := dlg.NATSCorrelationID
+	opCode := dlg.OriginatingOpCode
+
+	delete(h.dialogues, localTID)
+	h.metrics.ActiveDialogues.Add(-1)
+	h.dialoguesMu.Unlock()
+
+	if err := h.sendMessage(abortMsg, called, calling); err != nil {
+		h.logger.Error("Failed to send timeout Abort",
+			zap.Uint32("local_tid", localTID),
+			zap.Error(err))
+	}
+
+	if h.failureSink != nil && corrID != "" {
+		h.failureSink(corrID, opCode, FailureTimeout, "dialogue timeout")
+	}
+}
+
+// handleInvokeTimeout handles invoke timeout
+func (h *Handler) handleInvokeTimeout(localTID uint32, invokeID int32) {
+	h.dialoguesMu.RLock()
+	dlg, exists := h.dialogues[localTID]
+	h.dialoguesMu.RUnlock()
+
+	if !exists {
+		return
+	}
+
+	// Remove pending invoke
+	dlg.invokesMu.Lock()
+	delete(dlg.PendingInvokes, invokeID)
+	dlg.invokesMu.Unlock()
+
+	// Optionally send ReturnError or handle locally
+	// For now, just log and update metrics
+	h.logger.Debug("Invoke timed out, removed from pending",
+		zap.Uint32("local_tid", localTID),
+		zap.Int32("invoke_id", invokeID))
+}
+
+// sendMessage encodes a TCAP message and pushes it to SCCP with the given
+// addresses. Used by the timer manager (timeout aborts) where there is no
+// incoming SCCP wrapper to derive addresses from.
+func (h *Handler) sendMessage(msg *Message, called, calling *sccp.SccpAddress) error {
+	payload, err := h.encodeTCAPMessage(msg)
+	if err != nil {
+		return err
+	}
+
+	if err := h.sendOnSCCP(payload, called, calling); err != nil {
+		return err
+	}
+	h.metrics.MessagesSent.Add(1)
+	return nil
+}

@@ -1,0 +1,759 @@
+// Copyright 2026 3eAI Labs Ltd
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package natsbridge
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"time"
+
+	ss7client "github.com/3eAI-Labs/ss7-3eai-gateway-client"
+	"github.com/google/uuid"
+	"github.com/nats-io/nats.go"
+	"go.uber.org/zap"
+)
+
+var (
+	ErrNotConnected    = errors.New("NATS: not connected")
+	ErrInvalidMessage  = errors.New("NATS: invalid message")
+	ErrPublishTimeout  = errors.New("NATS: publish timeout")
+	ErrSubscribeFailed = errors.New("NATS: subscribe failed")
+	ErrShutdown        = errors.New("NATS: handler is shutting down")
+)
+
+const (
+	DefaultChannelBufferSize = 1000
+	DefaultWorkerPoolSize    = 10
+	DefaultMessageTimeout    = 30 * time.Second
+)
+
+// NewHandler creates a new NATS bridge handler
+func NewHandler(config *Config, logger *zap.Logger) (*Handler, error) {
+	if config == nil {
+		return nil, fmt.Errorf("config cannot be nil")
+	}
+	if err := validateConfig(config); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
+	handler := &Handler{
+		config:     config,
+		logger:     logger,
+		incomingCh: make(chan *NatsMessage, config.ChannelBufferSize),
+		outgoingCh: make(chan *NatsMessage, config.ChannelBufferSize),
+		errorCh:    make(chan error, 10),
+		shutdownCh: make(chan struct{}),
+		metrics:    &Metrics{},
+	}
+
+	return handler, nil
+}
+
+// Start connects to NATS and starts message processing
+func (h *Handler) Start(ctx context.Context) error {
+	h.logger.Info("Starting NATS bridge",
+		zap.String("server_url", h.config.ServerURL),
+		zap.String("node_id", h.config.NodeID))
+
+	// Connect to NATS
+	if err := h.connect(); err != nil {
+		return fmt.Errorf("failed to connect to NATS: %w", err)
+	}
+
+	// Subscribe to inbound subjects
+	if err := h.subscribeAll(); err != nil {
+		return fmt.Errorf("failed to subscribe to subjects: %w", err)
+	}
+
+	// Start worker pool for message processing
+	h.workerWg.Add(h.config.WorkerPoolSize + 1)
+	for i := 0; i < h.config.WorkerPoolSize; i++ {
+		go h.worker(ctx, i)
+	}
+
+	// Start publish worker
+	go h.publishWorker(ctx)
+
+	h.logger.Info("NATS bridge started successfully",
+		zap.Int("workers", h.config.WorkerPoolSize))
+
+	return nil
+}
+
+// Stop gracefully stops the NATS bridge
+func (h *Handler) Stop(ctx context.Context) error {
+	h.logger.Info("Stopping NATS bridge")
+
+	// Signal shutdown
+	close(h.shutdownCh)
+
+	// Unsubscribe from all subjects
+	for _, sub := range h.subscriptions {
+		if err := sub.Unsubscribe(); err != nil {
+			h.logger.Warn("Failed to unsubscribe", zap.Error(err))
+		}
+	}
+
+	// Drain connection (wait for pending messages)
+	if h.nc != nil {
+		if err := h.nc.Drain(); err != nil {
+			h.logger.Warn("Failed to drain NATS connection", zap.Error(err))
+		}
+	}
+
+	// Wait for workers to drain. Caller-supplied ctx caps the wait.
+	done := make(chan struct{})
+	go func() {
+		h.workerWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		h.logger.Info("NATS bridge stopped gracefully")
+	case <-ctx.Done():
+		h.logger.Warn("NATS bridge stop timeout — workers still running",
+			zap.Error(ctx.Err()))
+	}
+
+	// Close connection
+	if h.nc != nil {
+		h.nc.Close()
+	}
+
+	return nil
+}
+
+// connect establishes connection to NATS server
+func (h *Handler) connect() error {
+	opts := []nats.Option{
+		nats.Name(fmt.Sprintf("ss7-3eai-gateway-%s", h.config.NodeID)),
+		nats.MaxReconnects(h.config.MaxReconnects),
+		nats.ReconnectWait(h.config.ReconnectWait),
+		nats.Timeout(h.config.ConnectionTimeout),
+		nats.PingInterval(h.config.PingInterval),
+		nats.ReconnectHandler(h.handleReconnect),
+		nats.DisconnectErrHandler(h.handleDisconnect),
+		nats.ErrorHandler(h.handleError),
+	}
+
+	// Add authentication if configured
+	if h.config.Username != "" && h.config.Password != "" {
+		opts = append(opts, nats.UserInfo(h.config.Username, h.config.Password))
+	} else if h.config.Token != "" {
+		opts = append(opts, nats.Token(h.config.Token))
+	} else if h.config.CredentialsFile != "" {
+		opts = append(opts, nats.UserCredentials(h.config.CredentialsFile))
+	}
+
+	// Add TLS if enabled
+	if h.config.TLSEnabled {
+		tlsConfig, err := h.loadTLSConfig()
+		if err != nil {
+			return fmt.Errorf("failed to load TLS config: %w", err)
+		}
+		opts = append(opts, nats.Secure(tlsConfig))
+		h.logger.Info("TLS enabled for NATS connection")
+	}
+
+	// Connect
+	nc, err := nats.Connect(h.config.ServerURL, opts...)
+	if err != nil {
+		return fmt.Errorf("NATS connection failed: %w", err)
+	}
+
+	h.nc = nc
+	h.metrics.ConnectionStatus.Store(1)
+
+	h.logger.Info("Connected to NATS successfully",
+		zap.String("server", h.nc.ConnectedUrl()))
+
+	return nil
+}
+
+// PauseIntake unsubscribes from all inbound request subjects so no NEW
+// externally-originated dialogues (MT-SMS, SRI, CAP/INAP InitialDP) start;
+// in-flight workers and the publish path continue. Backs the graceful-drain
+// leg of the opsTrigger `drain` action. Idempotent — a second call finds no
+// subscriptions and is a no-op.
+func (h *Handler) PauseIntake() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	var firstErr error
+	for _, sub := range h.subscriptions {
+		if sub == nil {
+			continue
+		}
+		if err := sub.Unsubscribe(); err != nil {
+			h.logger.Warn("PauseIntake: unsubscribe failed", zap.Error(err))
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	h.subscriptions = nil
+	h.logger.Warn("NATS intake paused — unsubscribed from inbound request subjects")
+	return firstErr
+}
+
+// subscribeAll subscribes to all inbound NATS subjects via a per-cluster
+// queue group so multi-node deployments load-balance each request to
+// exactly one node. Without the queue group, every node in the cluster
+// receives every NATS message and originates a duplicate SS7 dialogue —
+// a roamer would receive N copies of the same SMS in an N-node
+// deployment. Queue group name = config.ClusterName (validated non-empty
+// at construction time); single-node deployments still work because a
+// queue group of one behaves identically to a plain subscription.
+//
+// See nats.io docs: queue subscriptions deliver each message to exactly
+// one subscriber per group, hash-distributed by NATS.
+func (h *Handler) subscribeAll() error {
+	subscriptions := []struct {
+		subject string
+		handler nats.MsgHandler
+	}{
+		{SubjectMTSmsRequest, h.handleMTSmsRequest},
+		{SubjectSRIRequest, h.handleSRIRequest},
+		{SubjectCAPInitialDP, h.handleCAPInitialDP},
+		{SubjectINAPInitialDP, h.handleINAPInitialDP},
+	}
+
+	for _, sub := range subscriptions {
+		subscription, err := h.nc.QueueSubscribe(sub.subject, h.config.ClusterName, sub.handler)
+		if err != nil {
+			return fmt.Errorf("failed to queue-subscribe to %s: %w", sub.subject, err)
+		}
+		h.subscriptions = append(h.subscriptions, subscription)
+		h.logger.Info("Queue-subscribed to subject",
+			zap.String("subject", sub.subject),
+			zap.String("queue_group", h.config.ClusterName))
+	}
+
+	// QueueSubscribe only queues the SUB on the client side. Flushing waits for the server's
+	// PONG, so once Start returns the server routes to this node: a request published right after
+	// start-up is not left to the other members of the queue group (or dropped, with no member).
+	timeout := h.config.ConnectionTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	if err := h.nc.FlushTimeout(timeout); err != nil {
+		return fmt.Errorf("NATS server did not confirm the subscriptions: %w", err)
+	}
+
+	return nil
+}
+
+// Message handlers for inbound subjects
+
+func (h *Handler) handleMTSmsRequest(msg *nats.Msg) {
+	h.metrics.MTSmsRequestCount.Add(1)
+	h.processIncomingMessage(msg, h.onMTSmsRequest)
+}
+
+func (h *Handler) handleSRIRequest(msg *nats.Msg) {
+	h.metrics.SRIRequestCount.Add(1)
+	h.processIncomingMessage(msg, h.onSRIRequest)
+}
+
+func (h *Handler) handleCAPInitialDP(msg *nats.Msg) {
+	h.metrics.CAPInitialDPCount.Add(1)
+	h.processIncomingMessage(msg, h.onCAPInitialDP)
+}
+
+func (h *Handler) handleINAPInitialDP(msg *nats.Msg) {
+	h.metrics.INAPInitialDPCount.Add(1)
+	h.processIncomingMessage(msg, h.onINAPInitialDP)
+}
+
+// processIncomingMessage deserializes and forwards message to handler
+func (h *Handler) processIncomingMessage(msg *nats.Msg, handler func(*NatsMessage) error) {
+	h.metrics.MessagesReceived.Add(1)
+	h.metrics.BytesReceived.Add(uint64(len(msg.Data)))
+
+	// Deserialize message
+	var natsMsg NatsMessage
+	if err := json.Unmarshal(msg.Data, &natsMsg); err != nil {
+		h.logger.Error("Failed to deserialize NATS message",
+			zap.Error(err),
+			zap.String("subject", msg.Subject))
+		h.metrics.ProcessingErrors.Add(1)
+		return
+	}
+
+	h.logger.Debug("Received NATS message",
+		zap.String("message_id", natsMsg.MessageID),
+		zap.String("type", string(natsMsg.MessageType)),
+		zap.String("subject", msg.Subject))
+
+	// Call handler if registered
+	if handler != nil {
+		if err := handler(&natsMsg); err != nil {
+			h.logger.Error("Handler failed to process message",
+				zap.Error(err),
+				zap.String("message_id", natsMsg.MessageID))
+			h.metrics.ProcessingErrors.Add(1)
+		}
+	} else {
+		// No handler registered, queue for application
+		select {
+		case h.incomingCh <- &natsMsg:
+			// Message queued
+		default:
+			h.logger.Error("Incoming channel full, dropping message",
+				zap.String("message_id", natsMsg.MessageID))
+			h.metrics.ProcessingErrors.Add(1)
+		}
+	}
+}
+
+// worker processes messages from channels
+func (h *Handler) worker(ctx context.Context, id int) {
+	defer h.workerWg.Done()
+	h.logger.Debug("NATS worker started", zap.Int("worker_id", id))
+	defer h.logger.Debug("NATS worker stopped", zap.Int("worker_id", id))
+
+	for {
+		select {
+		case <-h.shutdownCh:
+			return
+		case <-ctx.Done():
+			return
+		case msg := <-h.incomingCh:
+			// Process message from incoming queue
+			h.logger.Debug("Worker processing message",
+				zap.Int("worker_id", id),
+				zap.String("message_id", msg.MessageID))
+		}
+	}
+}
+
+// publishWorker handles outgoing message publishing
+func (h *Handler) publishWorker(ctx context.Context) {
+	defer h.workerWg.Done()
+	h.logger.Debug("NATS publish worker started")
+	defer h.logger.Debug("NATS publish worker stopped")
+
+	for {
+		select {
+		case <-h.shutdownCh:
+			return
+		case <-ctx.Done():
+			return
+		case msg := <-h.outgoingCh:
+			if err := h.publishMessage(msg); err != nil {
+				h.logger.Error("Failed to publish message",
+					zap.Error(err),
+					zap.String("message_id", msg.MessageID))
+			}
+		}
+	}
+}
+
+// publishMessage publishes a message to NATS
+func (h *Handler) publishMessage(msg *NatsMessage) error {
+	if h.nc == nil || !h.nc.IsConnected() {
+		return ErrNotConnected
+	}
+
+	// Determine subject based on message type
+	subject := h.getSubjectForMessage(msg)
+	if subject == "" {
+		return fmt.Errorf("unknown message type: %s", msg.MessageType)
+	}
+
+	// Serialize message
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to serialize message: %w", err)
+	}
+
+	// Track latency
+	startTime := time.Now()
+
+	// Publish to NATS
+	if err := h.nc.Publish(subject, data); err != nil {
+		h.metrics.PublishErrors.Add(1)
+		return fmt.Errorf("NATS publish failed: %w", err)
+	}
+
+	// Update metrics
+	latency := time.Since(startTime)
+	h.metrics.MessagesPublished.Add(1)
+	h.metrics.BytesPublished.Add(uint64(len(data)))
+	h.metrics.PublishLatencySum.Add(uint64(latency.Nanoseconds()))
+	h.metrics.PublishLatencyCount.Add(1)
+
+	h.logger.Debug("Published message to NATS",
+		zap.String("message_id", msg.MessageID),
+		zap.String("subject", subject),
+		zap.Duration("latency", latency))
+
+	return nil
+}
+
+// getSubjectForMessage returns NATS subject for message type
+func (h *Handler) getSubjectForMessage(msg *NatsMessage) string {
+	switch msg.MessageType {
+	case MsgTypeMAPMOSms:
+		return SubjectMOSms
+	case MsgTypeMAPMTSms:
+		return SubjectMTSmsResponse
+	case MsgTypeMAPSRI:
+		return SubjectSRIResponse
+	case MsgTypeCAPEventReport:
+		return SubjectCAPEventReport
+	case MsgTypeINAPEventReport:
+		return SubjectINAPEventReport
+	default:
+		return ""
+	}
+}
+
+// Public API methods
+
+// PublishMOSms publishes MO SMS to NATS
+func (h *Handler) PublishMOSms(sender, recipient, content string) error {
+	msg := &NatsMessage{
+		MessageID:   uuid.New().String(),
+		MessageType: MsgTypeMAPMOSms,
+		Direction:   DirectionOutbound,
+		Timestamp:   time.Now(),
+		Sender:      sender,
+		Recipient:   recipient,
+		Content:     content,
+		NodeID:      h.config.NodeID,
+	}
+
+	select {
+	case h.outgoingCh <- msg:
+		h.metrics.MOSmsPublishCount.Add(1)
+		return nil
+	default:
+		return fmt.Errorf("outgoing channel full")
+	}
+}
+
+// PublishMOForwardSM publishes an inbound MAP MO-Forward-SM (op 46) to
+// NATS. Driven by the gateway-side `MoForwardSMHandler` wired in
+// `cmd/gateway/nats_bridge.go`. Direction follows the codebase
+// convention (Outbound = "from SS7, going out to NATS"; Inbound =
+// "from NATS, going in to SS7") — see `internal/nats/types.go`.
+// NodeID is the cluster-member
+// identifier (h.config.NodeID), critical for cluster-distribution
+// attribution in tests AND for SMSC-side per-source-node billing /
+// auditing in production.
+//
+// Field mapping per 3GPP TS 29.002 §17.7.4:
+//
+//   - Sender    = SM-RP-OA digits (originating MSC GT in MO-Fwd-SM Arg).
+//     Foreign network's MSC asserts itself here.
+//   - Recipient = SM-RP-DA digits (destination SMSC GT). In v1 cluster
+//     deployments this equals our cluster_global_title.address
+//     — the foreign network sees one SMSC GT regardless of
+//     which cluster node loadshare picked.
+//   - IMSI      = optional originator IMSI (post-Rel-99 IMSI extension);
+//     may be empty when the originating network omits it.
+//   - PayloadData = TPDU bytes (SM-RP-UI), opaque per TS 23.040 — the
+//     SMSC consumer parses TP-User-Data, TP-VP, etc.
+//
+// Returns "outgoing channel full" when the NATS publish-worker queue is
+// saturated; caller (MAP handler) treats as transient and reports
+// systemFailure to the foreign MSC, which will retry per its own T-R.
+func (h *Handler) PublishMOForwardSM(correlationID, mscGT, smscGT, imsi string, tpdu []byte) error {
+	msg := &NatsMessage{
+		MessageID:     uuid.New().String(),
+		CorrelationID: correlationID,
+		MessageType:   MsgTypeMAPMOSms,
+		Direction:     DirectionOutbound, // SS7 → NATS per codebase convention
+		Timestamp:     time.Now(),
+		Sender:        mscGT,
+		Recipient:     smscGT,
+		IMSI:          imsi,
+		PayloadData:   tpdu,
+		NodeID:        h.config.NodeID,
+	}
+
+	select {
+	case h.outgoingCh <- msg:
+		h.metrics.MOSmsPublishCount.Add(1)
+		return nil
+	default:
+		return fmt.Errorf("outgoing channel full")
+	}
+}
+
+// PublishMTSmsResponse publishes MT SMS response to NATS
+func (h *Handler) PublishMTSmsResponse(correlationID, status string, errorCode int32) error {
+	msg := &NatsMessage{
+		MessageID:     uuid.New().String(),
+		CorrelationID: correlationID,
+		MessageType:   MsgTypeMAPMTSms,
+		Direction:     DirectionOutbound,
+		Timestamp:     time.Now(),
+		Status:        status,
+		ErrorCode:     errorCode,
+		NodeID:        h.config.NodeID,
+	}
+
+	select {
+	case h.outgoingCh <- msg:
+		return nil
+	default:
+		return fmt.Errorf("outgoing channel full")
+	}
+}
+
+// PublishMTSmsFailure publishes an MT-Forward-SM failure with its
+// human-readable reason. Same subject and wire shape as PublishMTSmsResponse
+// plus ErrorMessage; see nats_bridge.publishMAPFailure / publishMAPError.
+func (h *Handler) PublishMTSmsFailure(correlationID, status string, errorCode int32, errMsg string) error {
+	msg := &NatsMessage{
+		MessageID:     uuid.New().String(),
+		CorrelationID: correlationID,
+		MessageType:   MsgTypeMAPMTSms,
+		Direction:     DirectionOutbound,
+		Timestamp:     time.Now(),
+		Status:        status,
+		ErrorCode:     errorCode,
+		ErrorMessage:  errMsg,
+		NodeID:        h.config.NodeID,
+	}
+
+	select {
+	case h.outgoingCh <- msg:
+		return nil
+	default:
+		return fmt.Errorf("outgoing channel full")
+	}
+}
+
+// PublishSRIResponse publishes SendRoutingInfo response to NATS
+func (h *Handler) PublishSRIResponse(correlationID, msisdn, imsi string, vmscAddress string) error {
+	msg := &NatsMessage{
+		MessageID:     uuid.New().String(),
+		CorrelationID: correlationID,
+		MessageType:   MsgTypeMAPSRI,
+		Direction:     DirectionOutbound,
+		Timestamp:     time.Now(),
+		MSISDN:        msisdn,
+		IMSI:          imsi,
+		NodeID:        h.config.NodeID,
+		Parameters: map[string]interface{}{
+			ss7client.ParamVMSCAddress: vmscAddress,
+		},
+	}
+
+	select {
+	case h.outgoingCh <- msg:
+		return nil
+	default:
+		return fmt.Errorf("outgoing channel full")
+	}
+}
+
+// PublishSRIFailure publishes a SendRoutingInfo failure to NATS. Used when
+// the originated dialogue ended without a ReturnResult (timeout / inbound
+// ABORT). status/errorCode are the gateway-private failure taxonomy; see
+// nats_bridge.publishMAPFailure for the wire contract.
+func (h *Handler) PublishSRIFailure(correlationID, status string, errorCode int32, errMsg string) error {
+	msg := &NatsMessage{
+		MessageID:     uuid.New().String(),
+		CorrelationID: correlationID,
+		MessageType:   MsgTypeMAPSRI,
+		Direction:     DirectionOutbound,
+		Timestamp:     time.Now(),
+		Status:        status,
+		ErrorCode:     errorCode,
+		ErrorMessage:  errMsg,
+		NodeID:        h.config.NodeID,
+	}
+
+	select {
+	case h.outgoingCh <- msg:
+		return nil
+	default:
+		return fmt.Errorf("outgoing channel full")
+	}
+}
+
+// Handler registration methods
+
+func (h *Handler) OnMTSmsRequest(handler func(*NatsMessage) error) {
+	h.onMTSmsRequest = handler
+}
+
+func (h *Handler) OnSRIRequest(handler func(*NatsMessage) error) {
+	h.onSRIRequest = handler
+}
+
+func (h *Handler) OnCAPInitialDP(handler func(*NatsMessage) error) {
+	h.onCAPInitialDP = handler
+}
+
+func (h *Handler) OnINAPInitialDP(handler func(*NatsMessage) error) {
+	h.onINAPInitialDP = handler
+}
+
+// Reconnect and error handlers
+
+func (h *Handler) handleReconnect(nc *nats.Conn) {
+	h.metrics.ReconnectCount.Add(1)
+	h.metrics.mu.Lock()
+	h.metrics.LastReconnect = time.Now()
+	h.metrics.mu.Unlock()
+
+	h.logger.Warn("NATS reconnected",
+		zap.String("server", nc.ConnectedUrl()),
+		zap.Uint64("reconnect_count", h.metrics.ReconnectCount.Load()))
+}
+
+func (h *Handler) handleDisconnect(nc *nats.Conn, err error) {
+	h.metrics.ConnectionStatus.Store(0)
+
+	if err != nil {
+		h.logger.Error("NATS disconnected",
+			zap.Error(err),
+			zap.String("server", nc.ConnectedUrl()))
+	} else {
+		h.logger.Warn("NATS disconnected gracefully")
+	}
+}
+
+func (h *Handler) handleError(nc *nats.Conn, sub *nats.Subscription, err error) {
+	h.logger.Error("NATS error",
+		zap.Error(err),
+		zap.String("subject", sub.Subject))
+}
+
+// Metrics and health
+
+func (h *Handler) GetMetrics() *Metrics {
+	return h.metrics
+}
+
+func (h *Handler) GetHealthStatus() *HealthStatus {
+	avgLatency := float64(0)
+	if count := h.metrics.PublishLatencyCount.Load(); count > 0 {
+		sum := h.metrics.PublishLatencySum.Load()
+		avgLatency = float64(sum) / float64(count) / 1e6 // Convert to ms
+	}
+
+	return &HealthStatus{
+		Connected:         h.nc != nil && h.nc.IsConnected(),
+		ServerURL:         h.config.ServerURL,
+		NodeID:            h.config.NodeID,
+		ReconnectCount:    h.metrics.ReconnectCount.Load(),
+		MessagesPublished: h.metrics.MessagesPublished.Load(),
+		MessagesReceived:  h.metrics.MessagesReceived.Load(),
+		PublishErrors:     h.metrics.PublishErrors.Load(),
+		AverageLatencyMs:  avgLatency,
+		LastUpdate:        time.Now(),
+	}
+}
+
+// IncomingMessages returns channel for incoming messages
+func (h *Handler) IncomingMessages() <-chan *NatsMessage {
+	return h.incomingCh
+}
+
+// Errors returns channel for errors
+func (h *Handler) Errors() <-chan error {
+	return h.errorCh
+}
+
+// validateConfig validates NATS bridge configuration
+func validateConfig(cfg *Config) error {
+	if cfg.ServerURL == "" {
+		return errors.New("server_url is required")
+	}
+	if cfg.NodeID == "" {
+		return errors.New("node_id is required")
+	}
+	if cfg.ClusterName == "" {
+		// Required because subscribeAll uses ClusterName as the NATS
+		// queue group. An empty queue group degrades to plain Subscribe,
+		// which causes every cluster node to receive every request and
+		// originate duplicate SS7 dialogues — operator gets billed N
+		// times per SMS. Fail-fast at construction so this can never
+		// silently happen in production.
+		return errors.New("cluster_name is required (used as NATS queue group for multi-node load-balancing)")
+	}
+	if cfg.ChannelBufferSize == 0 {
+		cfg.ChannelBufferSize = DefaultChannelBufferSize
+	}
+	if cfg.WorkerPoolSize == 0 {
+		cfg.WorkerPoolSize = DefaultWorkerPoolSize
+	}
+	if cfg.MessageTimeout == 0 {
+		cfg.MessageTimeout = DefaultMessageTimeout
+	}
+	if cfg.MaxReconnects == 0 {
+		cfg.MaxReconnects = -1 // Infinite reconnects
+	}
+	if cfg.ReconnectWait == 0 {
+		cfg.ReconnectWait = 1 * time.Second
+	}
+	if cfg.ConnectionTimeout == 0 {
+		cfg.ConnectionTimeout = 2 * time.Second
+	}
+	if cfg.PingInterval == 0 {
+		cfg.PingInterval = 2 * time.Minute
+	}
+	return nil
+}
+
+// Connection returns the underlying NATS connection
+// Used for JetStream KV access
+func (h *Handler) Connection() *nats.Conn {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.nc
+}
+
+// loadTLSConfig loads TLS certificates and returns configured tls.Config
+func (h *Handler) loadTLSConfig() (*tls.Config, error) {
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+
+	// Load client certificate if provided
+	if h.config.TLSCertFile != "" && h.config.TLSKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(h.config.TLSCertFile, h.config.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load client certificate: %w", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+		h.logger.Info("Loaded client TLS certificate",
+			zap.String("cert", h.config.TLSCertFile))
+	}
+
+	// Load CA certificate if provided
+	if h.config.TLSCACertFile != "" {
+		caCert, err := os.ReadFile(h.config.TLSCACertFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read CA certificate: %w", err)
+		}
+
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, fmt.Errorf("failed to parse CA certificate")
+		}
+
+		tlsConfig.RootCAs = caCertPool
+		h.logger.Info("Loaded CA certificate",
+			zap.String("ca_cert", h.config.TLSCACertFile))
+	}
+
+	return tlsConfig, nil
+}

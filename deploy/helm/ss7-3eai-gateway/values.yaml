@@ -1,0 +1,332 @@
+# =============================================================================
+# ss7-3eai-gateway — Helm values
+# Defaults are SMOKE-SAFE: `helm install` into an isolated namespace with these
+# values must reach ACTIVE within 180s (Arinna packaging contract §9.3).
+# Production overrides: hostNetwork=true, replicaCount>=3, nats.deploy=false,
+# secrets.existingSecret, real m3ua.sgw_address / network_indicator /
+# routing_context, sccp point code, GTs and gtt_rules.
+# The typed, Arinna-addressable surface + x-arinna metadata is values.schema.json.
+# =============================================================================
+
+# -- Number of gateway replicas (StatefulSet). Smoke: 1. Prod AA cluster: 3+.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/3eai-labs/ss7-3eai-gateway
+  # Empty ⇒ chart appVersion. Pin an immutable tag/digest in production.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# imagePullSecrets: platform-provisioned dockerconfigjson refs (contract §8.2).
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# GOLD | SILVER | BRONZE — sizing preset input. Arinna's preset engine sets the
+# serviceLevelPreset-tagged fields (replicaCount, resources, worker pools).
+serviceLevelPreset: SILVER
+
+podAnnotations: {}
+podLabels: {}
+
+# Pod Security `restricted` compliance is MANDATORY (packaging contract v2.1
+# §1.4): every Arinna-managed namespace enforces the `restricted` PSA level, so
+# each container must carry allowPrivilegeEscalation:false + capabilities.drop
+# [ALL] + seccompProfile RuntimeDefault, and the pod runAsNonRoot. A chart
+# missing these installs cleanly but produces ZERO pods (admission-rejected).
+podSecurityContext:
+  runAsNonRoot: true
+  fsGroup: 1000
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault
+
+# hostNetwork: SS7/M3UA runs over SCTP, which most CNIs do not carry — real
+# peering needs the host network. FALSE by default so the smoke sandbox installs
+# cleanly; set TRUE for any environment that terminates live SCTP.
+hostNetwork: false
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+# Persistent volume for the TDR spool + local working state.
+persistence:
+  enabled: false          # smoke: emptyDir. Prod: true.
+  size: 5Gi
+  storageClass: ""
+  accessModes: ["ReadWriteOnce"]
+
+nodeSelector: {}
+tolerations: []
+# Empty ⇒ chart applies soft podAntiAffinity (spread across nodes). Override to
+# pin SCTP-capable nodes or harden to required anti-affinity.
+affinity: {}
+
+# PodDisruptionBudget — keep quorum during voluntary disruptions.
+podDisruptionBudget:
+  enabled: false          # enabled automatically meaningful only at replicaCount>=2
+  minAvailable: 1
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+service:
+  api:
+    type: ClusterIP
+    port: 8080
+    annotations: {}
+  m3ua:
+    port: 2905            # SCTP; IANA M3UA default
+  metricsPort: 8080       # /api/v1/metrics (authenticated JSON)
+
+# Liveness/readiness hit the unauthenticated /api/v1/health endpoint.
+probes:
+  liveness:
+    initialDelaySeconds: 20
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# -----------------------------------------------------------------------------
+# Secrets — contract §2.1 / ADR-036. Injected into the pod as SS7_* / AWS_*
+# env (never written to the ConfigMap). In PRODUCTION set existingSecret (the
+# `secretRef`) to a platform-provisioned Secret and leave create=false; Arinna
+# never sees literals.
+# The value fields are `secretValue` and MUST stay empty in chart defaults
+# (ARIN-ONB-0024). With create=true and a field left empty, the chart generates
+# a random value on first install and reuses the live Secret's value on every
+# upgrade, so the smoke/dev install stays self-contained without shipping a
+# credential. Explicit values: jwt/hmac >= 32 bytes, not starting with
+# CHANGE_THIS/REPLACE_ME/PLACEHOLDER/EXAMPLE_.
+# -----------------------------------------------------------------------------
+secrets:
+  create: true
+  existingSecret: ""
+  jwtSecret: ""
+  tdrHmacSecret: ""
+  adminPassword: ""
+  awsAccessKeyId: ""
+  awsSecretAccessKey: ""
+
+# -----------------------------------------------------------------------------
+# Sticky per-node CgPA GT (ADR-006). When set, StatefulSet ordinal N receives
+# base+N as sccp.local_global_title.address (via SS7_SCCP_LOCAL_GLOBAL_TITLE_
+# ADDRESS), giving each node a distinct sticky GT so the SG routes responses
+# back to the owning node. Empty ⇒ every pod uses config.sccp default (fine for
+# single-node / smoke).
+# -----------------------------------------------------------------------------
+stickyGtBase: ""          # e.g. "905300000001"
+
+# -----------------------------------------------------------------------------
+# Bundled NATS JetStream. deploy=true ships a single-replica in-chart NATS so
+# the chart is self-contained for smoke-install. In production set deploy=false
+# and url to the platform NATS cluster.
+# -----------------------------------------------------------------------------
+nats:
+  deploy: true
+  image: docker.io/library/nats:2.10-alpine
+  url: ""                 # required when deploy=false
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+  jetstream:
+    storage: 1Gi
+
+# -----------------------------------------------------------------------------
+# opsTrigger — declarative day-2 actions (contract §5). Arinna writes a fresh
+# token; the gateway performs the action idempotently (same token ⇒ no-op) and
+# reports the outcome on a K8s Event (reason=OpsTriggerCompleted/Failed,
+# message="action=<a> token=<echo> result=success|failed"). CR-free surface.
+# -----------------------------------------------------------------------------
+opsTrigger:
+  reloadConfig: ""        # re-read + validate the mounted config (applied on restart)
+  resetPeer: ""           # tear down + re-establish the M3UA SCTP association
+  drain: ""               # graceful drain: stop new dialogues, let in-flight finish
+  flushTDR: ""            # flush the TDR buffer to S3 (no records are generated yet)
+
+# =============================================================================
+# config: rendered verbatim into /etc/ss7-gateway/config.yaml (ConfigMap).
+# Mirrors config.example.yaml. Secret-class fields (api.jwt_secret,
+# tdr.hmac_secret, api.default_admin_password) and per-pod identity are BLANK
+# here and injected via env — do not set them in this block.
+# =============================================================================
+config:
+  node_id: "node-1"           # env-overridden per pod (SS7_NODE_ID)
+  node_id_numeric: 1          # env-overridden per pod
+  cluster_name: "ss7-cluster"
+
+  m3ua:
+    sgw_address: "10.0.0.10"
+    sgw_port: 2905
+    asp_id: 1
+    routing_context: 1
+    network_appearance: 0
+    network_indicator: 2      # MTP3 NI: 0 international, 2 national; must match the SG/STP
+    traffic_mode: 2           # AA-loadshare (ADR-006); REQUIRED with cluster GT
+    multi_homing_enabled: false
+    local_ips: ["0.0.0.0"]
+    heartbeat_interval: 30s
+    path_max_retrans: 5
+    rto_initial: 3s
+    rto_min: 1s
+    rto_max: 60s
+    assoc_max_retrans: 10
+    aspup_ack_timeout: 5s
+    aspac_ack_timeout: 5s
+    reconnect_interval: 5s
+    reconnect_max_attempts: 0  # retry forever; boot does not wait for the SGW, /api/v1/ready does
+
+  sccp:
+    network_variant: itu       # itu (14-bit) | ansi (24-bit)
+    local_point_code: 0x0001
+    local_subsystems: [6, 8, 146]
+    local_global_title:
+      address: "905300000001"  # env-overridden per pod when stickyGtBase set
+    cluster_global_title:
+      address: "905300000000"  # cluster-shared inbound GT (same on all nodes)
+    gtt_enabled: true
+    # GT-routed messages (MT-Forward-SM to the VMSC GT) need a rule naming
+    # the DPC, normally the STP: [{pattern: "*", point_code: <STP PC>}].
+    # ssn > 0 makes it a final translation (route on point_code + ssn).
+    # Empty: GT-routed messages are not sent ("no route to destination").
+    gtt_rules: []
+    gtt_cache_enabled: true
+    gtt_cache_ttl: 600s
+    gtt_cache_max_size: 100000
+    max_hop_counter: 15
+    segmentation_enabled: false
+    max_segment_size: 252
+    channel_buffer_size: 10000
+    worker_pool_size: 16
+
+  tcap:
+    node_id: 1                 # env-overridden per pod
+    dialogue_timeout: 30s
+    invoke_timeout: 10s
+    idle_timeout: 60s
+    max_dialogues: 100000
+    max_components_per_message: 100
+    max_invokes_per_dialogue: 10
+    channel_buffer_size: 10000
+    worker_pool_size: 16
+    timer_resolution: 1s
+
+  map:
+    hlr_address: "10.0.0.20"
+    hlr_gt: ""
+    hlr_pc: 0x0002             # must fit sccp.network_variant (ITU: 14 bits)
+    channel_buffer_size: 10000
+    worker_pool_size: 16
+    operation_timeout: 10s
+
+  cap:
+    gsmscf_address: "10.0.0.30"
+    gsmscf_gt: ""
+    gsmscf_pc: 0x0003          # must fit sccp.network_variant (ITU: 14 bits)
+    service_keys:
+      "1": "prepaid-voice"
+      "2": "prepaid-sms"
+    channel_buffer_size: 5000
+    worker_pool_size: 8
+    operation_timeout: 30s
+
+  inap:
+    worker_pool_size: 8
+    channel_buffer_size: 5000
+    operation_timeout: 30s
+
+  nats:
+    url: "nats://localhost:4222"   # env-overridden (SS7_NATS_URL) to resolved NATS
+    max_reconnects: -1
+    reconnect_wait: 2s
+    ping_interval: 20s
+    max_pings_out: 3
+    worker_pool_size: 8
+
+  # firewall / tdr: the components start, but no traffic passes through them
+  # yet — see the project README, Known limitations.
+  firewall:
+    enabled: true
+    mode: 1                     # 0=Monitoring 1=Enforcing 2=Learning
+    default_action: 0           # 0=Allow 1=Block
+    worker_pool_size: 8
+    inspection_timeout: 100ms
+    channel_buffer_size: 10000
+    anomaly_detection_enabled: true
+    anomaly_threshold: 3.0
+    threat_db_enabled: true
+    threat_db_update_interval: 3600s
+    log_blocked: true
+    log_allowed: false
+    alert_on_threat: true
+    alert_webhook_url: ""
+
+  tdr:
+    enabled: false             # smoke-safe (no S3)
+    s3_bucket: "ss7-tdrs"
+    s3_region: "us-east-1"
+    s3_prefix: "tdrs"
+    s3_storage_class: "INTELLIGENT_TIERING"
+    kms_key_id: ""
+    kms_region: "us-east-1"
+    encryption_enabled: true
+    pii_encryption: true
+    searchable_encryption: true
+    # hmac_secret: injected via env (SS7_TDR_HMAC_SECRET) — do not set here
+    buffer_size: 1000
+    flush_interval: 60s
+    worker_pool_size: 4
+    channel_buffer_size: 10000
+    compression_enabled: true
+    compression_level: 6
+    retention_days: 365
+    archive_after_days: 90
+    object_lock_enabled: false
+    object_lock_mode: "GOVERNANCE"
+    object_lock_days: 365
+
+  api:
+    bind_addr: "0.0.0.0:8080"
+    tls_enabled: false
+    tls_cert_file: "/etc/ssl/certs/gateway.crt"
+    tls_key_file: "/etc/ssl/private/gateway.key"
+    # jwt_secret: injected via env (SS7_API_JWT_SECRET) — do not set here
+    jwt_expiration: 24h
+    cors_enabled: true
+    cors_origins: ["https://admin.example.com"]
+    rate_limit_enabled: true
+    rate_limit_rps: 100
+    read_timeout: 15s
+    write_timeout: 15s
+    idle_timeout: 60s
+    enable_swagger: false
+    trusted_proxies: ["127.0.0.1", "10.0.0.0/8"]
+    default_admin_user: "admin"
+    # default_admin_password: injected via env (SS7_API_DEFAULT_ADMIN_PASSWORD)
+    dev_mode: false

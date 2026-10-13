@@ -1,0 +1,89 @@
+name: CI
+
+# No untrusted event inputs are interpolated into shell commands. All
+# `run:` blocks invoke fixed commands or `make` targets — see review
+# guidance: https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests + vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install SCTP headers (cgo path of ishidawataru/sctp)
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build ./...
+      - name: go test (race)
+        run: go test -race -count=1 -timeout 5m ./...
+
+  licenses:
+    name: Licence headers + dependency licences
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install SCTP headers (same build environment as the unit job)
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
+      - name: Check licences
+        # SPDX header on every source file; third-party dependencies permissive or MPL-2.0
+        # (AGPL-compatible, and keeps a commercial licence possible); client module, when
+        # present, permissive-only and free of gateway imports.
+        run: scripts/check-licenses.sh
+
+  chart:
+    name: Helm chart package (Arinna contract §2.1 / §6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.4
+      - name: Install PyYAML (values.yaml secretValue check)
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
+      - name: Verify chart package
+        # Fails if the SHACL bundle drops out of the package, a secretValue
+        # default is populated (ARIN-ONB-0024), or existingSecret wiring breaks.
+        run: scripts/verify-chart-package.sh
+
+  e2e:
+    name: E2E SS7 round trip (M3UA + SCCP + TCAP + MAP)
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install SCTP support (loopback association requires kernel SCTP)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsctp-dev lksctp-tools
+          sudo modprobe sctp || echo "SCTP module already loaded or built-in"
+          ss --sctp || true
+      - name: Run E2E integration test
+        # Hard-fails on any regression in the SS7 wire path:
+        # NATS → MAP encode → TCAP BEGIN → SCCP UDT → M3UA → in-process
+        # HLR peer → END+ReturnResult → reverse path → NATS response.
+        # Build tag isolates from `go test ./...` so dev cycles stay fast.
+        run: make test-e2e
+        timeout-minutes: 4

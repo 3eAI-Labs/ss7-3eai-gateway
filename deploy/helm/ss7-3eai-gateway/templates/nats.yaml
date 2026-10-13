@@ -1,0 +1,116 @@
+{{- if .Values.nats.deploy -}}
+# Bundled single-replica NATS JetStream so the chart is self-contained for
+# smoke-install (NATS is a hard boot dependency — the gateway's ConfigStore is
+# JetStream-KV backed). NOT for production: set nats.deploy=false and point
+# nats.url at the platform NATS cluster.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ss7-3eai-gateway.fullname" . }}-nats-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ss7-3eai-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nats
+data:
+  nats.conf: |
+    port: 4222
+    http: 8222
+    jetstream {
+      store_dir: /data/jetstream
+      max_memory_store: 256MB
+      max_file_store: {{ .Values.nats.jetstream.storage }}
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ss7-3eai-gateway.fullname" . }}-nats
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ss7-3eai-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nats
+spec:
+  selector:
+    {{- include "ss7-3eai-gateway.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: nats
+  ports:
+    - name: client
+      port: 4222
+      targetPort: 4222
+    - name: monitor
+      port: 8222
+      targetPort: 8222
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "ss7-3eai-gateway.fullname" . }}-nats
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ss7-3eai-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nats
+spec:
+  serviceName: {{ include "ss7-3eai-gateway.fullname" . }}-nats
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "ss7-3eai-gateway.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: nats
+  template:
+    metadata:
+      labels:
+        {{- include "ss7-3eai-gateway.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: nats
+    spec:
+      # PSA `restricted` compliance (contract v2.1 §1.4) — pinned, not
+      # values-driven: the bundled NATS exists for the arinna-smoke sandbox,
+      # which enforces `restricted` and would otherwise admission-reject the
+      # pod. The nats image defaults to root, hence explicit runAsUser.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: nats
+          image: {{ .Values.nats.image | quote }}
+          args: ["-c", "/etc/nats/nats.conf"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: client
+              containerPort: 4222
+            - name: monitor
+              containerPort: 8222
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8222
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8222
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          {{- with .Values.nats.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: nats-config
+              mountPath: /etc/nats
+            - name: nats-data
+              mountPath: /data
+      volumes:
+        - name: nats-config
+          configMap:
+            name: {{ include "ss7-3eai-gateway.fullname" . }}-nats-config
+        - name: nats-data
+          emptyDir: {}
+{{- end }}

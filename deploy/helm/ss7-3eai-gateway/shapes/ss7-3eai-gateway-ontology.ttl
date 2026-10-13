@@ -1,0 +1,72 @@
+@prefix owl:   <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+@prefix ss7g:  <https://arinna.3eai-labs.com/ns/ss7-3eai-gateway#> .
+
+#
+# Ontology for the SS7 3eAI Gateway Arinna-addressable configuration surface.
+# Anchored to the chart's values.schema.json x-arinna set. Consumed by
+# core/reasoner per ADR-027 (per-product SHACL gate); paired with
+# ss7-3eai-gateway.shacl.ttl which carries the write-class safety shapes.
+#
+# Standards anchors for the modelled invariants:
+#   - ITU-T Q.713 §3.4.1   SCCP point-code field width (ITU 14-bit / ANSI 24-bit)
+#   - RFC 4666  §1.4.4      M3UA traffic-mode (1=Override / 2=Loadshare)
+#   - ADR-006               Active-Active loadshare + sticky-CgPA dialogue affinity
+#
+
+ss7g: a owl:Ontology ;
+    rdfs:label "SS7 3eAI Gateway configuration ontology" ;
+    owl:versionInfo "0.1.0" .
+
+### Classes -------------------------------------------------------------------
+
+ss7g:GatewayConfig a owl:Class ;
+    rdfs:label "SS7 gateway configuration" ;
+    rdfs:comment "One deployed configuration of the gateway (an Arinna ProductDefinition value set)." .
+
+### Datatype properties (mirror the x-arinna-exposed value paths) --------------
+
+ss7g:networkVariant a owl:DatatypeProperty ;
+    rdfs:domain ss7g:GatewayConfig ; rdfs:range xsd:string ;
+    rdfs:comment "sccp.network_variant — itu | ansi (Q.713 §3.4.1)." .
+
+ss7g:localPointCode a owl:DatatypeProperty ;
+    rdfs:domain ss7g:GatewayConfig ; rdfs:range xsd:integer ;
+    rdfs:comment "sccp.local_point_code." .
+
+ss7g:trafficMode a owl:DatatypeProperty ;
+    rdfs:domain ss7g:GatewayConfig ; rdfs:range xsd:integer ;
+    rdfs:comment "m3ua.traffic_mode — 1=Override, 2=Loadshare (RFC 4666 §1.4.4)." .
+
+ss7g:localGlobalTitle a owl:DatatypeProperty ;
+    rdfs:domain ss7g:GatewayConfig ; rdfs:range xsd:string ;
+    rdfs:comment "sccp.local_global_title.address — per-node sticky CgPA GT." .
+
+ss7g:clusterGlobalTitle a owl:DatatypeProperty ;
+    rdfs:domain ss7g:GatewayConfig ; rdfs:range xsd:string ;
+    rdfs:comment "sccp.cluster_global_title.address — cluster-shared inbound GT." .
+
+ss7g:maxHopCounter a owl:DatatypeProperty ;
+    rdfs:domain ss7g:GatewayConfig ; rdfs:range xsd:integer ;
+    rdfs:comment "sccp.max_hop_counter (Q.713)." .
+
+ss7g:firewallEnabled a owl:DatatypeProperty ;
+    rdfs:domain ss7g:GatewayConfig ; rdfs:range xsd:boolean ;
+    rdfs:comment "firewall.enabled (GSMA FS.11)." .
+
+ss7g:firewallMode a owl:DatatypeProperty ;
+    rdfs:domain ss7g:GatewayConfig ; rdfs:range xsd:integer ;
+    rdfs:comment "firewall.mode — 0=Monitoring, 1=Enforcing, 2=Learning." .
+
+ss7g:devMode a owl:DatatypeProperty ;
+    rdfs:domain ss7g:GatewayConfig ; rdfs:range xsd:boolean ;
+    rdfs:comment "api.dev_mode — MUST be false outside local dev." .
+
+ss7g:corsEnabled a owl:DatatypeProperty ;
+    rdfs:domain ss7g:GatewayConfig ; rdfs:range xsd:boolean .
+
+ss7g:corsOrigin a owl:DatatypeProperty ;
+    rdfs:domain ss7g:GatewayConfig ; rdfs:range xsd:string ;
+    rdfs:comment "api.cors_origins[] — explicit origins; '*' forbidden in production." .

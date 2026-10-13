@@ -1,0 +1,406 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ss7-3eai-gateway Helm values",
+  "description": "Typed, Arinna-addressable surface for the SS7 3eAI Gateway chart (Arinna Product Packaging Contract v2.1 §2). Fields carrying an x-arinna block are Arinna-tunable ProductDefinition properties; fields without it keep their chart defaults and are not surfaced.",
+  "type": "object",
+  "additionalProperties": false,
+  "arinna-capabilities": {
+    "provides": [
+      {
+        "capability": "ss7-map-mo-mt",
+        "subscribes": ["map.sri.request", "map.mt.sms.request"],
+        "responds": ["map.sri.response", "map.mt.sms.response", "map.mo.sms"]
+      }
+    ]
+  },
+  "definitions": {
+    "duration": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)$",
+      "description": "Go duration string, e.g. 30s, 100ms, 1h"
+    },
+    "resourceBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": { "type": "object", "additionalProperties": { "type": ["string", "integer"] } },
+        "limits": { "type": "object", "additionalProperties": { "type": ["string", "integer"] } }
+      }
+    },
+    "probeBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "globalTitle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "address": { "type": "string", "pattern": "^[0-9]*$" },
+        "gti": { "type": "integer" },
+        "translation_type": { "type": "integer" },
+        "numbering_plan": { "type": "integer" },
+        "nature_of_address": { "type": "integer" }
+      }
+    }
+  },
+  "properties": {
+    "replicaCount": {
+      "type": "integer", "minimum": 1, "maximum": 16,
+      "x-arinna": { "valueType": "integer", "userExposed": true, "mutableAtRuntime": true, "riskClass": "medium", "serviceLevelPreset": true }
+    },
+    "image": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": true, "riskClass": "medium" } },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      },
+      "required": ["repository"]
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": { "type": "object", "additionalProperties": false, "properties": { "name": { "type": "string" } }, "required": ["name"] }
+    },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "serviceAccount": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "serviceLevelPreset": {
+      "type": "string", "enum": ["GOLD", "SILVER", "BRONZE"],
+      "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": true, "riskClass": "medium", "serviceLevelPreset": true }
+    },
+    "podAnnotations": { "type": "object", "additionalProperties": { "type": "string" } },
+    "podLabels": { "type": "object", "additionalProperties": { "type": "string" } },
+    "podSecurityContext": { "type": "object" },
+    "securityContext": { "type": "object" },
+    "hostNetwork": {
+      "type": "boolean",
+      "x-arinna": { "userExposed": false, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+    },
+    "resources": {
+      "type": "object",
+      "allOf": [ { "$ref": "#/definitions/resourceBlock" } ],
+      "x-arinna": { "userExposed": false, "mutableAtRuntime": true, "riskClass": "low", "serviceLevelPreset": true }
+    },
+    "persistence": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "size": { "type": "string", "pattern": "^[0-9]+(Mi|Gi|Ti)$" },
+        "storageClass": { "type": "string" },
+        "accessModes": { "type": "array", "items": { "type": "string", "enum": ["ReadWriteOnce", "ReadWriteMany", "ReadOnlyMany", "ReadWriteOncePod"] } }
+      }
+    },
+    "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+    "tolerations": { "type": "array", "items": { "type": "object" } },
+    "affinity": { "type": "object" },
+    "podDisruptionBudget": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": { "type": ["integer", "string"] }
+      }
+    },
+    "autoscaling": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minReplicas": { "type": "integer", "minimum": 1 },
+        "maxReplicas": { "type": "integer", "minimum": 1 },
+        "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1, "maximum": 100 }
+      },
+      "x-arinna": { "valueType": "object", "userExposed": true, "mutableAtRuntime": true, "riskClass": "medium", "serviceLevelPreset": true }
+    },
+    "service": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "api": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "annotations": { "type": "object", "additionalProperties": { "type": "string" } }
+          }
+        },
+        "m3ua": {
+          "type": "object", "additionalProperties": false,
+          "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 65535 } }
+        },
+        "metricsPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "probes": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "liveness": { "$ref": "#/definitions/probeBlock" },
+        "readiness": { "$ref": "#/definitions/probeBlock" }
+      }
+    },
+    "secrets": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "existingSecret": { "type": "string", "description": "secretRef (ADR-036): name of a Secret in the release namespace carrying jwt-secret, admin-password, tdr-hmac-secret and optionally aws-access-key-id / aws-secret-access-key. Supplies every secretValue field below.", "x-arinna": { "userExposed": false, "secretRef": true, "requiresApproval": true, "riskClass": "high" } },
+        "jwtSecret": { "type": "string", "description": "secretValue (ADR-036): empty in chart defaults; supplied via existingSecret. Empty with create=true ⇒ generated at install.", "x-arinna": { "userExposed": false, "secretValue": true, "riskClass": "high" } },
+        "tdrHmacSecret": { "type": "string", "description": "secretValue (ADR-036): empty in chart defaults; supplied via existingSecret. Empty with create=true ⇒ generated at install.", "x-arinna": { "userExposed": false, "secretValue": true, "riskClass": "high" } },
+        "adminPassword": { "type": "string", "description": "secretValue (ADR-036): empty in chart defaults; supplied via existingSecret. Empty with create=true ⇒ generated at install.", "x-arinna": { "userExposed": false, "secretValue": true, "riskClass": "high" } },
+        "awsAccessKeyId": { "type": "string", "description": "secretValue (ADR-036): empty in chart defaults; supplied via existingSecret.", "x-arinna": { "userExposed": false, "secretValue": true, "riskClass": "high" } },
+        "awsSecretAccessKey": { "type": "string", "description": "secretValue (ADR-036): empty in chart defaults; supplied via existingSecret.", "x-arinna": { "userExposed": false, "secretValue": true, "riskClass": "high" } }
+      }
+    },
+    "stickyGtBase": {
+      "type": "string", "pattern": "^([0-9]{6,15})?$",
+      "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": false, "riskClass": "high" }
+    },
+    "nats": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "deploy": { "type": "boolean", "x-arinna": { "userExposed": false, "riskClass": "medium" } },
+        "image": { "type": "string" },
+        "url": { "type": "string", "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": false, "riskClass": "medium" } },
+        "resources": { "$ref": "#/definitions/resourceBlock" },
+        "jetstream": {
+          "type": "object", "additionalProperties": false,
+          "properties": { "storage": { "type": "string", "pattern": "^[0-9]+(Mi|Gi|Ti|MB|GB)$" } }
+        }
+      }
+    },
+    "opsTrigger": {
+      "type": "object", "additionalProperties": false,
+      "description": "Declarative day-2 triggers (contract §5). Arinna writes a fresh token; the gateway acts idempotently and reports via a K8s Event.",
+      "properties": {
+        "reloadConfig": { "type": "string", "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" } },
+        "resetPeer": { "type": "string", "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": true, "riskClass": "high", "requiresApproval": true } },
+        "drain": { "type": "string", "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": true, "riskClass": "high", "requiresApproval": true } },
+        "flushTDR": { "type": "string", "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" } }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Rendered verbatim to /etc/ss7-gateway/config.yaml. Secret-class fields and per-pod identity are injected via SS7_* env and are intentionally absent here. INLINED, not $ref'd: Arinna's x-arinna extractor (helm-mcp ExtractXArinna) does not resolve $ref, so a $ref-only config node would hide this whole tunable surface from ProductDefinition generation (v2.1 audit, 2026-07-13).",
+      "properties": {
+        "node_id": { "type": "string" },
+        "node_id_numeric": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "cluster_name": { "type": "string" },
+        "m3ua": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "sgw_address": { "type": "string", "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true } },
+            "sgw_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "asp_id": { "type": "integer", "minimum": 0 },
+            "routing_context": { "type": "integer", "minimum": 0 },
+            "network_appearance": { "type": "integer", "minimum": 0 },
+            "network_indicator": {
+              "type": "integer", "enum": [0, 1, 2, 3],
+              "description": "MTP3 network indicator on every routing label (Q.704 14.2.2): 0=international, 2=national. Must match the SG/STP.",
+              "x-arinna": { "valueType": "integer", "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+            },
+            "traffic_mode": {
+              "type": "integer", "enum": [1, 2],
+              "description": "1=Override (Active-Passive), 2=Loadshare (Active-Active, ADR-006)",
+              "x-arinna": { "valueType": "integer", "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+            },
+            "multi_homing_enabled": { "type": "boolean" },
+            "local_ips": { "type": "array", "items": { "type": "string" } },
+            "heartbeat_interval": { "$ref": "#/definitions/duration" },
+            "path_max_retrans": { "type": "integer", "minimum": 0 },
+            "rto_initial": { "$ref": "#/definitions/duration" },
+            "rto_min": { "$ref": "#/definitions/duration" },
+            "rto_max": { "$ref": "#/definitions/duration" },
+            "assoc_max_retrans": { "type": "integer", "minimum": 0 },
+            "aspup_ack_timeout": { "$ref": "#/definitions/duration" },
+            "aspac_ack_timeout": { "$ref": "#/definitions/duration" },
+            "reconnect_interval": { "$ref": "#/definitions/duration" },
+            "reconnect_max_attempts": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "sccp": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "network_variant": {
+              "type": "string", "enum": ["itu", "ansi"],
+              "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+            },
+            "local_point_code": { "type": "integer", "minimum": 0 },
+            "local_subsystems": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
+            "local_global_title": {
+              "type": "object",
+              "allOf": [ { "$ref": "#/definitions/globalTitle" } ],
+              "x-arinna": { "valueType": "object", "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "tenantScoped": false }
+            },
+            "cluster_global_title": {
+              "type": "object",
+              "allOf": [ { "$ref": "#/definitions/globalTitle" } ],
+              "x-arinna": { "valueType": "object", "userExposed": true, "mutableAtRuntime": false, "riskClass": "high" }
+            },
+            "gtt_enabled": { "type": "boolean" },
+            "gtt_rules": {
+              "type": "array",
+              "description": "Translations for GT-routed messages this node originates. ssn 0 = intermediate (route on GT to the next relay, normally the STP); ssn > 0 = final (route on point_code + ssn).",
+              "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["pattern", "point_code"],
+                "properties": {
+                  "pattern": { "type": "string", "pattern": "^([0-9]+\\*?|\\*)$" },
+                  "priority": { "type": "integer" },
+                  "point_code": { "type": "integer", "minimum": 1, "maximum": 16777215 },
+                  "ssn": { "type": "integer", "minimum": 0, "maximum": 255 },
+                  "description": { "type": "string" }
+                }
+              },
+              "x-arinna": { "valueType": "array", "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+            },
+            "gtt_cache_enabled": { "type": "boolean" },
+            "gtt_cache_ttl": { "$ref": "#/definitions/duration" },
+            "gtt_cache_max_size": { "type": "integer", "minimum": 0 },
+            "max_hop_counter": { "type": "integer", "minimum": 1, "maximum": 15 },
+            "segmentation_enabled": { "type": "boolean" },
+            "max_segment_size": { "type": "integer", "minimum": 1 },
+            "channel_buffer_size": { "type": "integer", "minimum": 1 },
+            "worker_pool_size": { "type": "integer", "minimum": 1, "x-arinna": { "userExposed": false, "riskClass": "low", "serviceLevelPreset": true } }
+          }
+        },
+        "tcap": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "node_id": { "type": "integer", "minimum": 0, "maximum": 255 },
+            "dialogue_timeout": { "$ref": "#/definitions/duration" },
+            "invoke_timeout": { "$ref": "#/definitions/duration" },
+            "idle_timeout": { "$ref": "#/definitions/duration" },
+            "max_dialogues": { "type": "integer", "minimum": 1 },
+            "max_components_per_message": { "type": "integer", "minimum": 1 },
+            "max_invokes_per_dialogue": { "type": "integer", "minimum": 1 },
+            "channel_buffer_size": { "type": "integer", "minimum": 1 },
+            "worker_pool_size": { "type": "integer", "minimum": 1, "x-arinna": { "userExposed": false, "riskClass": "low", "serviceLevelPreset": true } },
+            "timer_resolution": { "$ref": "#/definitions/duration" }
+          }
+        },
+        "map": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "hlr_address": { "type": "string" },
+            "hlr_gt": { "type": "string" },
+            "hlr_pc": { "type": "integer", "minimum": 0 },
+            "channel_buffer_size": { "type": "integer", "minimum": 1 },
+            "worker_pool_size": { "type": "integer", "minimum": 1, "x-arinna": { "userExposed": false, "riskClass": "low", "serviceLevelPreset": true } },
+            "operation_timeout": { "$ref": "#/definitions/duration" }
+          }
+        },
+        "cap": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "gsmscf_address": { "type": "string" },
+            "gsmscf_gt": { "type": "string" },
+            "gsmscf_pc": { "type": "integer", "minimum": 0 },
+            "service_keys": { "type": "object", "additionalProperties": { "type": "string" } },
+            "channel_buffer_size": { "type": "integer", "minimum": 1 },
+            "worker_pool_size": { "type": "integer", "minimum": 1, "x-arinna": { "userExposed": false, "riskClass": "low", "serviceLevelPreset": true } },
+            "operation_timeout": { "$ref": "#/definitions/duration" }
+          }
+        },
+        "inap": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "worker_pool_size": { "type": "integer", "minimum": 1 },
+            "channel_buffer_size": { "type": "integer", "minimum": 1 },
+            "operation_timeout": { "$ref": "#/definitions/duration" }
+          }
+        },
+        "nats": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "url": { "type": "string" },
+            "max_reconnects": { "type": "integer" },
+            "reconnect_wait": { "$ref": "#/definitions/duration" },
+            "ping_interval": { "$ref": "#/definitions/duration" },
+            "max_pings_out": { "type": "integer", "minimum": 0 },
+            "worker_pool_size": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "firewall": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "x-arinna": { "valueType": "boolean", "userExposed": true, "mutableAtRuntime": true, "riskClass": "high", "requiresApproval": true } },
+            "mode": {
+              "type": "integer", "enum": [0, 1, 2],
+              "description": "0=Monitoring, 1=Enforcing, 2=Learning",
+              "x-arinna": { "valueType": "integer", "userExposed": true, "mutableAtRuntime": true, "riskClass": "high", "requiresApproval": true }
+            },
+            "default_action": { "type": "integer", "enum": [0, 1], "description": "0=Allow, 1=Block" },
+            "worker_pool_size": { "type": "integer", "minimum": 1 },
+            "inspection_timeout": { "$ref": "#/definitions/duration" },
+            "channel_buffer_size": { "type": "integer", "minimum": 1 },
+            "anomaly_detection_enabled": { "type": "boolean" },
+            "anomaly_threshold": { "type": "number", "minimum": 0 },
+            "threat_db_enabled": { "type": "boolean" },
+            "threat_db_update_interval": { "$ref": "#/definitions/duration" },
+            "log_blocked": { "type": "boolean" },
+            "log_allowed": { "type": "boolean" },
+            "alert_on_threat": { "type": "boolean" },
+            "alert_webhook_url": { "type": "string" }
+          }
+        },
+        "tdr": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "x-arinna": { "valueType": "boolean", "userExposed": true, "mutableAtRuntime": true, "riskClass": "medium" } },
+            "s3_bucket": { "type": "string", "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": false, "riskClass": "medium" } },
+            "s3_region": { "type": "string", "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": false, "riskClass": "medium" } },
+            "s3_prefix": { "type": "string" },
+            "s3_storage_class": { "type": "string", "enum": ["STANDARD", "INTELLIGENT_TIERING", "GLACIER"] },
+            "kms_key_id": { "type": "string" },
+            "kms_region": { "type": "string" },
+            "encryption_enabled": { "type": "boolean" },
+            "pii_encryption": { "type": "boolean" },
+            "searchable_encryption": { "type": "boolean" },
+            "buffer_size": { "type": "integer", "minimum": 1 },
+            "flush_interval": { "$ref": "#/definitions/duration" },
+            "worker_pool_size": { "type": "integer", "minimum": 1 },
+            "channel_buffer_size": { "type": "integer", "minimum": 1 },
+            "compression_enabled": { "type": "boolean" },
+            "compression_level": { "type": "integer", "minimum": 1, "maximum": 9 },
+            "retention_days": { "type": "integer", "minimum": 0 },
+            "archive_after_days": { "type": "integer", "minimum": 0 },
+            "object_lock_enabled": { "type": "boolean" },
+            "object_lock_mode": { "type": "string", "enum": ["GOVERNANCE", "COMPLIANCE"] },
+            "object_lock_days": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "api": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "bind_addr": { "type": "string" },
+            "tls_enabled": { "type": "boolean", "x-arinna": { "valueType": "boolean", "userExposed": true, "mutableAtRuntime": false, "riskClass": "medium" } },
+            "tls_cert_file": { "type": "string" },
+            "tls_key_file": { "type": "string" },
+            "jwt_expiration": { "$ref": "#/definitions/duration" },
+            "cors_enabled": { "type": "boolean" },
+            "cors_origins": { "type": "array", "items": { "type": "string" }, "x-arinna": { "valueType": "array", "userExposed": true, "mutableAtRuntime": true, "riskClass": "medium" } },
+            "rate_limit_enabled": { "type": "boolean" },
+            "rate_limit_rps": { "type": "integer", "minimum": 1, "x-arinna": { "valueType": "integer", "userExposed": true, "mutableAtRuntime": true, "riskClass": "low" } },
+            "read_timeout": { "$ref": "#/definitions/duration" },
+            "write_timeout": { "$ref": "#/definitions/duration" },
+            "idle_timeout": { "$ref": "#/definitions/duration" },
+            "enable_swagger": { "type": "boolean" },
+            "trusted_proxies": { "type": "array", "items": { "type": "string" } },
+            "default_admin_user": { "type": "string" },
+            "dev_mode": { "type": "boolean", "x-arinna": { "userExposed": false, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true } }
+          }
+        }
+      }
+    }
+  }
+}

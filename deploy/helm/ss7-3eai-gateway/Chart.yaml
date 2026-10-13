@@ -1,0 +1,44 @@
+apiVersion: v2
+name: ss7-3eai-gateway
+description: >-
+  SS7 signalling gateway (M3UA/SCCP/TCAP/MAP) that lets applications send and
+  receive SMS over MAP through NATS: SRI-for-SM, MT-ForwardSM, MO-ForwardSM.
+  Active-active over M3UA loadshare. Not yet tested against real SS7 equipment.
+  Packaged for Arinna onboarding per the Product Packaging Contract v2.1
+  (chart-only intake, smoke-install).
+type: application
+
+# Chart version (SemVer of the packaging). Bump on any chart change; a
+# smoke-relevant change (helmChart/properties/serviceLevelPresets) unblesses the
+# ProductDefinition and forces a re-smoke — see packaging contract §9.2.
+version: 0.4.0
+
+# The gateway binary version this chart deploys. Overridable via image.tag.
+appVersion: "0.7.0"
+
+keywords:
+  - ss7
+  - sigtran
+  - m3ua
+  - sccp
+  - tcap
+  - map
+  - camel
+  - signalling-gateway
+  - telco
+
+home: https://github.com/3eAI-Labs/ss7-3eai-gateway
+sources:
+  - https://github.com/3eAI-Labs/ss7-3eai-gateway
+
+maintainers:
+  - name: 3eAI Labs — Telco
+    url: https://github.com/3eAI-Labs
+
+annotations:
+  artifacthub.io/license: AGPL-3.0-only
+  # Arinna packaging metadata (informational; the authoritative operational
+  # surface is values.schema.json x-arinna — see contract §2.1).
+  arinna.3eai-labs.com/packaging-contract: "v2.1"
+  arinna.3eai-labs.com/intake: "chart-only"
+  arinna.3eai-labs.com/smoke: "install"

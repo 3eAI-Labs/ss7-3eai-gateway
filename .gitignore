@@ -1,0 +1,74 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+coverage.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Configuration files with secrets
+config.yaml
+config.*.yaml
+!config.example.yaml
+
+# Data directories
+/data/
+/var/
+/raft/
+/logs/
+
+# AWS credentials
+.aws/
+credentials
+
+# TLS certificates and keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Log files
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+# Docker volumes
+docker-compose.override.yml
+
+# Prometheus data
+prometheus_data/
+
+# Grafana data
+grafana_data/
+
+# Build output of `go build ./cmd/gateway` at the repository root
+/gateway

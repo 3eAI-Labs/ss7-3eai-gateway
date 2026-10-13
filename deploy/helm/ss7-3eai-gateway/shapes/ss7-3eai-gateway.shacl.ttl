@@ -1,0 +1,119 @@
+@prefix sh:    <http://www.w3.org/ns/shacl#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix ss7g:  <https://arinna.3eai-labs.com/ns/ss7-3eai-gateway#> .
+
+#
+# Write-class safety shapes for the SS7 3eAI Gateway (Arinna packaging contract
+# §6, ADR-027). These encode the cross-field invariants the gateway's own
+# validateConfig enforces at boot, so Arinna's SHACL gate can refuse an unsafe
+# write BEFORE it is applied — rather than the pod crash-looping on a bad config.
+# Uploaded to TMF on onboarding as ProductSpecification characteristic
+# `arinna.shapes.shacl` (valueType: text/turtle).
+#
+
+ss7g:GatewayConfigShape a sh:NodeShape ;
+    sh:targetClass ss7g:GatewayConfig ;
+
+    ## network_variant is a closed vocabulary (Q.713 §3.4.1).
+    sh:property [
+        sh:path ss7g:networkVariant ;
+        sh:in ( "itu" "ansi" ) ;
+        sh:maxCount 1 ;
+        sh:message "sccp.network_variant must be 'itu' or 'ansi' (Q.713 §3.4.1)." ;
+    ] ;
+
+    ## traffic_mode is 1 (Override) or 2 (Loadshare) — RFC 4666 §1.4.4.
+    sh:property [
+        sh:path ss7g:trafficMode ;
+        sh:in ( 1 2 ) ;
+        sh:maxCount 1 ;
+        sh:message "m3ua.traffic_mode must be 1 (Override) or 2 (Loadshare) (RFC 4666 §1.4.4)." ;
+    ] ;
+
+    ## firewall.mode closed vocabulary.
+    sh:property [
+        sh:path ss7g:firewallMode ;
+        sh:in ( 0 1 2 ) ;
+        sh:message "firewall.mode must be 0 (Monitoring), 1 (Enforcing) or 2 (Learning)." ;
+    ] ;
+
+    ## max_hop_counter within Q.713 bounds.
+    sh:property [
+        sh:path ss7g:maxHopCounter ;
+        sh:datatype xsd:integer ;
+        sh:minInclusive 1 ; sh:maxInclusive 15 ;
+        sh:message "sccp.max_hop_counter must be within 1..15 (Q.713)." ;
+    ] .
+
+## INVARIANT 1 (ADR-006): when a cluster-shared inbound GT is set, M3UA MUST run
+## loadshare (traffic_mode=2), else the cluster GT pins to one node and the
+## Active-Active benefit is lost.
+ss7g:ClusterGtRequiresLoadshareShape a sh:NodeShape ;
+    sh:targetClass ss7g:GatewayConfig ;
+    sh:sparql [
+        sh:message "sccp.cluster_global_title is set but m3ua.traffic_mode != 2 (loadshare) — violates ADR-006 Active-Active sticky-CgPA." ;
+        sh:prefixes ss7g: ;
+        sh:select """
+            PREFIX ss7g: <https://arinna.3eai-labs.com/ns/ss7-3eai-gateway#>
+            SELECT $this WHERE {
+                $this ss7g:clusterGlobalTitle ?cgt .
+                FILTER (STR(?cgt) != "")
+                $this ss7g:trafficMode ?tm .
+                FILTER (?tm != 2)
+            }
+        """ ;
+    ] .
+
+## INVARIANT 2 (ADR-006): the cluster-shared GT MUST differ from the per-node
+## sticky GT — identical digits in both roles defeats sticky response routing.
+ss7g:GtDistinctShape a sh:NodeShape ;
+    sh:targetClass ss7g:GatewayConfig ;
+    sh:sparql [
+        sh:message "sccp.cluster_global_title.address must differ from sccp.local_global_title.address (sticky-CgPA routing)." ;
+        sh:prefixes ss7g: ;
+        sh:select """
+            PREFIX ss7g: <https://arinna.3eai-labs.com/ns/ss7-3eai-gateway#>
+            SELECT $this WHERE {
+                $this ss7g:clusterGlobalTitle ?cgt .
+                $this ss7g:localGlobalTitle ?lgt .
+                FILTER (STR(?cgt) != "" && STR(?cgt) = STR(?lgt))
+            }
+        """ ;
+    ] .
+
+## INVARIANT 3 (Q.713 §3.4.1): ITU variant uses a 14-bit point code, so
+## local_point_code MUST fit in 14 bits (<= 0x3FFF = 16383).
+ss7g:ItuPointCodeWidthShape a sh:NodeShape ;
+    sh:targetClass ss7g:GatewayConfig ;
+    sh:sparql [
+        sh:message "network_variant=itu requires local_point_code <= 16383 (14-bit, Q.713 §3.4.1)." ;
+        sh:prefixes ss7g: ;
+        sh:select """
+            PREFIX ss7g: <https://arinna.3eai-labs.com/ns/ss7-3eai-gateway#>
+            SELECT $this WHERE {
+                $this ss7g:networkVariant ?nv .
+                FILTER (?nv = "itu")
+                $this ss7g:localPointCode ?pc .
+                FILTER (?pc > 16383)
+            }
+        """ ;
+    ] .
+
+## INVARIANT 4 (security): outside dev_mode, CORS must not use the "*" wildcard
+## (the CORS spec forbids "*" with Allow-Credentials, which browsers then reject).
+ss7g:CorsWildcardShape a sh:NodeShape ;
+    sh:targetClass ss7g:GatewayConfig ;
+    sh:sparql [
+        sh:message "api.cors_origins must not contain '*' when api.dev_mode=false (CORS + credentials)." ;
+        sh:prefixes ss7g: ;
+        sh:select """
+            PREFIX ss7g: <https://arinna.3eai-labs.com/ns/ss7-3eai-gateway#>
+            SELECT $this WHERE {
+                $this ss7g:devMode false .
+                $this ss7g:corsEnabled true .
+                $this ss7g:corsOrigin ?o .
+                FILTER (STR(?o) = "*")
+            }
+        """ ;
+    ] .

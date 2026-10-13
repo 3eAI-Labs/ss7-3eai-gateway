@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ss7-3eai-gateway.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ss7-3eai-gateway.labels" . | nindent 4 }}
+data:
+  # Rendered verbatim to /etc/ss7-gateway/config.yaml. Secret-class fields and
+  # per-pod identity are injected via SS7_* env at runtime (see statefulset.yaml)
+  # and therefore stay out of this ConfigMap (contract §2.1 secretRefOnly).
+  config.yaml: |
+    {{- toYaml .Values.config | nindent 4 }}
+
+  # opsTrigger tokens (contract §5). Mounted read-only; the gateway observes a
+  # changed token and performs the action idempotently. A ConfigMap change from
+  # `helm upgrade` (Arinna writing a new token) rolls to the pods; the
+  # checksum/config annotation on the pod template forces a restart-free reload
+  # path where supported, otherwise a rollout.
+  opstrigger.yaml: |
+    opsTrigger:
+      reloadConfig: {{ .Values.opsTrigger.reloadConfig | quote }}
+      resetPeer: {{ .Values.opsTrigger.resetPeer | quote }}
+      drain: {{ .Values.opsTrigger.drain | quote }}
+      flushTDR: {{ .Values.opsTrigger.flushTDR | quote }}

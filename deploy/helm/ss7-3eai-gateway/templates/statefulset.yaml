@@ -1,0 +1,210 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "ss7-3eai-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ss7-3eai-gateway.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "ss7-3eai-gateway.headlessServiceName" . }}
+  replicas: {{ .Values.replicaCount }}
+  # All nodes are equal (NATS-JetStream-KV HA, no leader election) — start them
+  # in parallel rather than one-at-a-time.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "ss7-3eai-gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Roll pods when the rendered gateway config changes. opsTrigger tokens
+        # are intentionally EXCLUDED from this checksum: they propagate via the
+        # live ConfigMap mount without a disruptive SCTP-dropping rollout.
+        checksum/config: {{ toYaml .Values.config | sha256sum }}
+        {{- if and .Values.secrets.create (not .Values.secrets.existingSecret) }}
+        # Hashes the EXPLICIT values only: generated ones are kept across
+        # upgrades, so they must not roll the pods on every release.
+        checksum/secret: {{ printf "%s|%s|%s" .Values.secrets.jwtSecret .Values.secrets.adminPassword .Values.secrets.tdrHmacSecret | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "ss7-3eai-gateway.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "ss7-3eai-gateway.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 60
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "ss7-3eai-gateway.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: gateway
+          image: {{ include "ss7-3eai-gateway.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # Derive per-pod identity from the StatefulSet ordinal, then exec the
+          # gateway. node_id/node_id_numeric/tcap.node_id are made unique per pod;
+          # when stickyGtBase is set, each ordinal gets base+N as its sticky-CgPA
+          # GT (ADR-006). Secrets arrive as SS7_*/AWS_* env from the Secret.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ORD="${POD_NAME##*-}"
+              case "$ORD" in ''|*[!0-9]*) ORD=0 ;; esac
+              export SS7_NODE_ID="node-$((ORD + 1))"
+              export SS7_NODE_ID_NUMERIC="$((ORD + 1))"
+              export SS7_TCAP_NODE_ID="$((ORD + 1))"
+              {{- if .Values.stickyGtBase }}
+              export SS7_SCCP_LOCAL_GLOBAL_TITLE_ADDRESS="$(({{ .Values.stickyGtBase }} + ORD))"
+              {{- end }}
+              exec /usr/local/bin/ss7-gateway -config /etc/ss7-gateway/config.yaml
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: SS7_NATS_URL
+              value: {{ include "ss7-3eai-gateway.natsURL" . | quote }}
+            - name: SS7_API_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ss7-3eai-gateway.secretName" . }}
+                  key: jwt-secret
+            - name: SS7_API_DEFAULT_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ss7-3eai-gateway.secretName" . }}
+                  key: admin-password
+            - name: SS7_TDR_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ss7-3eai-gateway.secretName" . }}
+                  key: tdr-hmac-secret
+                  optional: true
+            {{- if or .Values.secrets.awsAccessKeyId (and .Values.secrets.existingSecret) }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ss7-3eai-gateway.secretName" . }}
+                  key: aws-access-key-id
+                  optional: true
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ss7-3eai-gateway.secretName" . }}
+                  key: aws-secret-access-key
+                  optional: true
+            {{- end }}
+          ports:
+            - name: m3ua
+              containerPort: {{ .Values.service.m3ua.port }}
+              protocol: SCTP
+            - name: http
+              containerPort: {{ .Values.service.api.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /api/v1/ready
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ss7-gateway
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/ss7-gateway
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "ss7-3eai-gateway.fullname" . }}-config
+            items:
+              - key: config.yaml
+                path: config.yaml
+              - key: opstrigger.yaml
+                path: opstrigger.yaml
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "ss7-3eai-gateway.labels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+  {{- end }}
