@@ -87,8 +87,8 @@ func (b *natsBridge) onPSIRequest(msg *natsbridge.NatsMessage) error {
 	if vlr == nil {
 		return errors.New("PSI request: vlr_number required in parameters")
 	}
-	if !isDigits(vlr.Digits) {
-		return fmt.Errorf("PSI request: vlr_number %q is not E.164 digits", vlr.Digits)
+	if !isDigits(vlr.Digits) || len(vlr.Digits) > maxGTDigits {
+		return fmt.Errorf("PSI request: vlr_number %q is not E.164 digits (at most %d)", vlr.Digits, maxGTDigits)
 	}
 	requested, err := requestedInfo(msg, false)
 	if err != nil {

@@ -166,3 +166,28 @@ func TestSubscriberInfoWire(t *testing.T) {
 	}
 	assert.Equal(t, want, got)
 }
+
+// A global title taken from a request is bounded: the SCCP address encoder
+// has a one-octet length.
+func TestBridge_RequestGTsAreBounded(t *testing.T) {
+	long := "12345678901234567" // 17 digits
+	state := &ss7client.RequestedInfo{State: true}
+	for name, run := range map[string]func(*natsBridge) error{
+		"ATI HLR GT": func(b *natsBridge) error {
+			return b.onATIRequest(&natsbridge.NatsMessage{MSISDN: "1", GlobalTitle: long, RequestedInfo: state})
+		},
+		"ATI MSISDN": func(b *natsBridge) error {
+			return b.onATIRequest(&natsbridge.NatsMessage{MSISDN: long, RequestedInfo: state})
+		},
+		"PSI VLR number": func(b *natsBridge) error {
+			return b.onPSIRequest(&natsbridge.NatsMessage{IMSI: "1", RequestedInfo: state,
+				Parameters: map[string]interface{}{ss7client.ParamVLRNumber: long}})
+		},
+	} {
+		b, rec := locationBridge(t)
+		err := run(b)
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), "at most 16", name)
+		assert.Empty(t, rec.calls, name)
+	}
+}

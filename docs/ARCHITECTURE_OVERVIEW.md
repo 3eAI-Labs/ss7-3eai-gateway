@@ -22,9 +22,9 @@ implemented, see the [README](../README.md#known-limitations).
 ```
 
 The layers are connected by bounded Go channels and wired in `cmd/gateway/main.go`. They start
-bottom-up (M3UA, SCCP, MAP, CAP, TCAP) and stop in reverse order. The protocol libraries
-underneath are [go-m3ua](https://github.com/wmnsk/go-m3ua) and
-[go-tcap](https://github.com/wmnsk/go-tcap) (MIT); SCCP and the MAP codec are implemented here.
+bottom-up (M3UA, SCCP, MAP, CAP, TCAP) and stop in reverse order. M3UA uses
+[go-m3ua](https://github.com/wmnsk/go-m3ua) (MIT). SCCP, TCAP (ITU-T Q.773) and the MAP codec are
+implemented here, each checked against frames built by hand from its standard.
 
 ## An MT short message, end to end
 

@@ -6,9 +6,9 @@ package ss7peer
 import (
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/mapprotocol"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/tcap"
 	"github.com/wmnsk/go-m3ua"
 	"github.com/wmnsk/go-m3ua/messages/params"
-	gotcap "github.com/wmnsk/go-tcap"
 	"go.uber.org/zap"
 )
 
@@ -39,9 +39,9 @@ func (p *Peer) handleLocationInvoke(
 	conn *m3ua.Conn,
 	pd *params.ProtocolDataPayload,
 	sccpReq *sccp.SccpMessage,
-	tcapReq *gotcap.TCAP,
+	tcapReq *tcap.Message,
 	otidBytes []byte,
-	invokeID uint8,
+	invokeID int32,
 	opCode int32,
 	paramBytes []byte,
 	otid uint32,

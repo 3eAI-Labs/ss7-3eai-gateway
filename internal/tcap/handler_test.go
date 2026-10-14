@@ -11,7 +11,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	gotcap "github.com/wmnsk/go-tcap"
 	"go.uber.org/zap/zaptest"
 )
 
@@ -35,14 +34,14 @@ func TestParseTCAPMessage_Begin(t *testing.T) {
 	handler, err := NewHandler(config, sccpIn, sccpOut, NewDispatcher(logger), logger)
 	require.NoError(t, err)
 
-	// Create a TCAP Begin message using go-tcap
+	// A TCAP Begin message as a peer would send it
 	otid := uint32(0x12345678)
 	invID := 1
 	opCode := 46 // MAP UpdateLocation
 	payload := []byte{0x30, 0x0A, 0x04, 0x08, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00}
 
-	tcapMsg := gotcap.NewBeginInvoke(otid, invID, opCode, payload)
-	data, err := tcapMsg.MarshalBinary()
+	tcapMsg := beginInvoke(otid, invID, opCode, payload)
+	data, err := EncodeMessage(tcapMsg)
 	require.NoError(t, err)
 
 	// Parse the message
@@ -94,8 +93,8 @@ func TestParseTCAPMessage_End(t *testing.T) {
 	opCode := 46
 	payload := []byte{0x30, 0x05, 0x04, 0x03, 0x01, 0x02, 0x03}
 
-	tcapMsg := gotcap.NewEndReturnResult(dtid, invID, opCode, true, payload)
-	data, err := tcapMsg.MarshalBinary()
+	tcapMsg := endReturnResult(dtid, invID, opCode, payload)
+	data, err := EncodeMessage(tcapMsg)
 	require.NoError(t, err)
 
 	// Parse the message
@@ -145,8 +144,8 @@ func TestParseTCAPMessage_Continue(t *testing.T) {
 	opCode := 58 // MAP SendRoutingInfo
 	payload := []byte{0x04, 0x07, 0x91, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
 
-	tcapMsg := gotcap.NewContinueInvoke(otid, dtid, invID, opCode, payload)
-	data, err := tcapMsg.MarshalBinary()
+	tcapMsg := continueInvoke(otid, dtid, invID, opCode, payload)
+	data, err := EncodeMessage(tcapMsg)
 	require.NoError(t, err)
 
 	// Parse the message
@@ -218,16 +217,16 @@ func TestEncodeTCAPMessage_Begin(t *testing.T) {
 	require.NotEmpty(t, data)
 
 	// Parse back to verify
-	parsed, err := gotcap.Parse(data)
+	parsed, err := ParseMessage(data)
 	require.NoError(t, err)
 	require.NotNil(t, parsed)
 
 	// Verify OTID
-	assert.Equal(t, uint32(0xABCDEF01), parsed.OTID())
+	assert.Equal(t, uint32(0xABCDEF01), binary.BigEndian.Uint32(parsed.OriginatingTID))
 
 	// Verify components
 	require.NotNil(t, parsed.Components)
-	require.Len(t, parsed.Components.Component, 1)
+	require.Len(t, parsed.Components, 1)
 }
 
 // Test TCAP encoder with End message
@@ -277,12 +276,12 @@ func TestEncodeTCAPMessage_End(t *testing.T) {
 	require.NotEmpty(t, data)
 
 	// Parse back to verify
-	parsed, err := gotcap.Parse(data)
+	parsed, err := ParseMessage(data)
 	require.NoError(t, err)
 	require.NotNil(t, parsed)
 
 	// Verify DTID
-	assert.Equal(t, uint32(0xDEADBEEF), parsed.DTID())
+	assert.Equal(t, uint32(0xDEADBEEF), binary.BigEndian.Uint32(parsed.DestinationTID))
 }
 
 // Test TCAP round-trip (encode -> parse -> encode)

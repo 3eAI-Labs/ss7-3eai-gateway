@@ -170,8 +170,8 @@ func (b *natsBridge) onMTSmsRequest(msg *natsbridge.NatsMessage) error {
 	if nnn == nil {
 		return errors.New("MT SMS request: network_node_number required in Parameters (from SRI response)")
 	}
-	if !isDigits(nnn.Digits) {
-		return fmt.Errorf("MT SMS request: network_node_number %q is not E.164 digits", nnn.Digits)
+	if !isDigits(nnn.Digits) || len(nnn.Digits) > maxGTDigits {
+		return fmt.Errorf("MT SMS request: network_node_number %q is not E.164 digits (at most %d)", nnn.Digits, maxGTDigits)
 	}
 
 	imsi := mapprotocol.IMSI(msg.IMSI)
@@ -533,8 +533,8 @@ func paramAddressString(msg *natsbridge.NatsMessage, key string) *mapprotocol.Ad
 // no MSISDN to route on.
 func (b *natsBridge) calledForHLR(msg *natsbridge.NatsMessage, what string) (*sccp.SccpAddress, error) {
 	if msg.GlobalTitle != "" || msg.DPC != 0 {
-		if msg.GlobalTitle != "" && !isDigits(msg.GlobalTitle) {
-			return nil, fmt.Errorf("%s: global_title %q is not E.164 digits", what, msg.GlobalTitle)
+		if msg.GlobalTitle != "" && (!isDigits(msg.GlobalTitle) || len(msg.GlobalTitle) > maxGTDigits) {
+			return nil, fmt.Errorf("%s: global_title %q is not E.164 digits (at most %d)", what, msg.GlobalTitle, maxGTDigits)
 		}
 		return b.calledForGT(msg.GlobalTitle, sccp.SSNHLR, msg.DPC), nil
 	}
@@ -547,11 +547,17 @@ func (b *natsBridge) calledForHLR(msg *natsbridge.NatsMessage, what string) (*sc
 	if msg.MSISDN == "" {
 		return nil, fmt.Errorf("%s: by IMSI it needs the HLR's global_title or dpc, or map.sri_routing \"hlr\"", what)
 	}
-	if !isDigits(msg.MSISDN) {
-		return nil, fmt.Errorf("%s: msisdn %q is not E.164 digits", what, msg.MSISDN)
+	if !isDigits(msg.MSISDN) || len(msg.MSISDN) > maxGTDigits {
+		return nil, fmt.Errorf("%s: msisdn %q is not E.164 digits (at most %d)", what, msg.MSISDN, maxGTDigits)
 	}
 	return b.calledForGT(msg.MSISDN, sccp.SSNHLR, 0), nil
 }
+
+// maxGTDigits bounds the digits of a global title taken from a request: an
+// E.164 number has at most 15, an ISDN-AddressString holds 16. The SCCP
+// address encoder has a one-octet length, so an unbounded request field
+// could otherwise corrupt the called party address.
+const maxGTDigits = 16
 
 func isDigits(s string) bool {
 	if s == "" {

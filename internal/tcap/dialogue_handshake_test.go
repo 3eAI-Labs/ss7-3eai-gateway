@@ -11,7 +11,6 @@ import (
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	gotcap "github.com/wmnsk/go-tcap"
 	"go.uber.org/zap/zaptest"
 )
 
@@ -63,12 +62,18 @@ func startHandshakeHandler(t *testing.T) (*Handler, chan *sccp.SccpMessage, chan
 }
 
 // peerBegin is a BEGIN from a peer, OTID 0x0A0B0C0D, opening a dialogue
-// under oid (the last two arcs become go-tcap's context and version).
+// under oid with an MO-ForwardSM Invoke.
 func peerBegin(t *testing.T, oid []int) *sccp.SccpMessage {
 	t.Helper()
-	b := gotcap.NewBeginInvokeWithDialogue(0x0A0B0C0D, gotcap.DialogueAsID,
-		uint8(oid[len(oid)-2]), uint8(oid[len(oid)-1]), 1, 46, []byte{0x30, 0x00})
-	raw, err := b.MarshalBinary()
+	return peerMessage(t, &Message{MessageType: MsgTypeBegin, OriginatingTID: []byte{0x0A, 0x0B, 0x0C, 0x0D},
+		DialoguePortion: &DialoguePortion{ApplicationContext: &ApplicationContext{OID: oid}},
+		Components:      []*Component{{Type: CompTypeInvoke, InvokeID: ptrInt32(1), OperationCode: ptrInt32(46), Parameter: []byte{0x30, 0x00}}}})
+}
+
+// peerMessage is msg as a peer's UDT.
+func peerMessage(t *testing.T, msg *Message) *sccp.SccpMessage {
+	t.Helper()
+	raw, err := EncodeMessage(msg)
 	require.NoError(t, err)
 	return &sccp.SccpMessage{
 		MessageType:    sccp.MsgTypeUDT,
@@ -78,24 +83,17 @@ func peerBegin(t *testing.T, oid []int) *sccp.SccpMessage {
 	}
 }
 
-func nextSent(t *testing.T, out chan *sccp.SccpMessage) *gotcap.TCAP {
+func nextSent(t *testing.T, out chan *sccp.SccpMessage) *Message {
 	t.Helper()
 	select {
 	case m := <-out:
-		parsed, err := ParseWire(m.Data)
+		parsed, err := ParseMessage(m.Data)
 		require.NoError(t, err)
 		return parsed
 	case <-time.After(2 * time.Second):
 		t.Fatal("nothing sent")
 		return nil
 	}
-}
-
-func lastByte(ie *gotcap.IE) byte {
-	if ie == nil || len(ie.Value) == 0 {
-		return 0xFF
-	}
-	return ie.Value[len(ie.Value)-1]
 }
 
 func TestHandshake_FirstAnswerCarriesAARE(t *testing.T) {
@@ -112,19 +110,17 @@ func TestHandshake_FirstAnswerCarriesAARE(t *testing.T) {
 	h.handleOutgoingMessage(end)
 	got := nextSent(t, out)
 
-	require.NotNil(t, got.Dialogue, "the first answer must carry a dialogue portion")
-	pdu := got.Dialogue.DialoguePDU
-	require.NotNil(t, pdu)
-	assert.Equal(t, int(gotcap.AARE), int(pdu.Type.Code()), "AARE, not AARQ")
-	assert.Equal(t, gotcap.Accepted, lastByte(pdu.Result))
-	assert.Equal(t, []byte{0x06, 0x07, 0x04, 0x00, 0x00, 0x01, 0x00, 21, 3},
-		pdu.ApplicationContextName.Value, "the accepted context is echoed")
+	pdu := got.DialoguePortion
+	require.NotNil(t, pdu, "the first answer must carry a dialogue portion")
+	assert.Equal(t, DialoguePDUAARE, pdu.PDU, "AARE, not AARQ")
+	assert.False(t, pdu.Rejected, "accepted")
+	assert.Equal(t, moRelayV3, pdu.ApplicationContext.OID, "the accepted context is echoed")
 
 	// A later message in the same dialogue carries no dialogue portion.
 	again := &Message{MessageType: MsgTypeEnd, DestinationTID: dlg.RemoteTID, Dialogue: dlg,
 		Components: []*Component{{Type: CompTypeReturnResult, InvokeID: ptrInt32(2)}}}
 	h.handleOutgoingMessage(again)
-	assert.Nil(t, nextSent(t, out).Dialogue)
+	assert.Nil(t, nextSent(t, out).DialoguePortion)
 }
 
 func TestHandshake_UnsupportedContextRefusedWithAlternative(t *testing.T) {
@@ -132,19 +128,15 @@ func TestHandshake_UnsupportedContextRefusedWithAlternative(t *testing.T) {
 	in <- peerBegin(t, moRelayV2)
 	got := nextSent(t, out)
 
-	require.NotNil(t, got.Transaction)
-	assert.Equal(t, int(gotcap.Abort), int(got.Transaction.Type.Code()))
-	assert.Nil(t, got.Transaction.PAbortCause, "a TC-U-ABORT, not a P-ABORT")
-	assert.Equal(t, []byte{0x0A, 0x0B, 0x0C, 0x0D}, got.Transaction.DestTransactionID.Value)
+	assert.Equal(t, MsgTypeAbort, got.MessageType)
+	assert.False(t, got.PAbort, "a TC-U-ABORT, not a P-ABORT")
+	assert.Equal(t, []byte{0x0A, 0x0B, 0x0C, 0x0D}, got.DestinationTID)
 
-	require.NotNil(t, got.Dialogue)
-	pdu := got.Dialogue.DialoguePDU
-	assert.Equal(t, int(gotcap.AARE), int(pdu.Type.Code()))
-	assert.Equal(t, gotcap.RejectPerm, lastByte(pdu.Result))
-	assert.Equal(t, gotcap.ApplicationContextNameNotSupplied, lastByte(pdu.ResultSourceDiagnostic),
-		"diagnostic 2: application-context-name-not-supported")
-	assert.Equal(t, []byte{0x06, 0x07, 0x04, 0x00, 0x00, 0x01, 0x00, 21, 3},
-		pdu.ApplicationContextName.Value, "proposes the version we support")
+	pdu := got.DialoguePortion
+	require.NotNil(t, pdu)
+	assert.Equal(t, DialoguePDUAARE, pdu.PDU)
+	assert.True(t, pdu.Rejected, "reject-permanent, application-context-name-not-supported (ber_test.go)")
+	assert.Equal(t, moRelayV3, pdu.ApplicationContext.OID, "proposes the version we support")
 }
 
 func TestSupportedAlternative(t *testing.T) {
@@ -165,23 +157,13 @@ func ptrInt32(v int32) *int32 { return &v }
 func TestEmptyBegin_InboundAcceptedThenDispatched(t *testing.T) {
 	_, in, out, app := startHandshakeHandler(t)
 
-	b := gotcap.NewBeginInvokeWithDialogue(0x0A0B0C0D, gotcap.DialogueAsID, 21, 3, 1, 46, []byte{0x30, 0x00})
-	b.Components = nil
-	b.SetLength()
-	raw, err := b.MarshalBinary()
-	require.NoError(t, err)
-	in <- &sccp.SccpMessage{
-		MessageType:    sccp.MsgTypeUDT,
-		CalledAddress:  &sccp.SccpAddress{PointCode: 1, SubsystemNumber: sccp.SSNMSC},
-		CallingAddress: &sccp.SccpAddress{PointCode: 2, SubsystemNumber: sccp.SSNMSC},
-		Data:           raw,
-	}
+	in <- emptyBeginFrom(t, 0x0A0B0C0D)
 
 	cont := nextSent(t, out)
-	assert.Equal(t, int(gotcap.Continue), int(cont.Transaction.Type.Code()))
-	assert.Equal(t, []byte{0x0A, 0x0B, 0x0C, 0x0D}, cont.Transaction.DestTransactionID.Value)
-	require.NotNil(t, cont.Dialogue)
-	assert.Equal(t, int(gotcap.AARE), int(cont.Dialogue.DialoguePDU.Type.Code()))
+	assert.Equal(t, MsgTypeContinue, cont.MessageType)
+	assert.Equal(t, []byte{0x0A, 0x0B, 0x0C, 0x0D}, cont.DestinationTID)
+	require.NotNil(t, cont.DialoguePortion)
+	assert.Equal(t, DialoguePDUAARE, cont.DialoguePortion.PDU)
 	select {
 	case <-app.dialogues:
 		t.Fatal("nothing to dispatch yet")
@@ -189,14 +171,11 @@ func TestEmptyBegin_InboundAcceptedThenDispatched(t *testing.T) {
 	}
 
 	// The peer's CONTINUE with the Invoke.
-	ourTID := uint32(cont.Transaction.OrigTransactionID.Value[0])<<24 | uint32(cont.Transaction.OrigTransactionID.Value[1])<<16 |
-		uint32(cont.Transaction.OrigTransactionID.Value[2])<<8 | uint32(cont.Transaction.OrigTransactionID.Value[3])
-	c := gotcap.NewContinueInvoke(0x0A0B0C0D, ourTID, 1, 46, []byte{0x30, 0x00})
-	raw, err = c.MarshalBinary()
-	require.NoError(t, err)
-	in <- &sccp.SccpMessage{MessageType: sccp.MsgTypeUDT, Data: raw,
-		CalledAddress:  &sccp.SccpAddress{PointCode: 1, SubsystemNumber: sccp.SSNMSC},
-		CallingAddress: &sccp.SccpAddress{PointCode: 2, SubsystemNumber: sccp.SSNMSC}}
+	ourTID := uint32(cont.OriginatingTID[0])<<24 | uint32(cont.OriginatingTID[1])<<16 |
+		uint32(cont.OriginatingTID[2])<<8 | uint32(cont.OriginatingTID[3])
+	in <- peerMessage(t, &Message{MessageType: MsgTypeContinue,
+		OriginatingTID: []byte{0x0A, 0x0B, 0x0C, 0x0D}, DestinationTID: cont.OriginatingTID,
+		Components: []*Component{{Type: CompTypeInvoke, InvokeID: ptrInt32(1), OperationCode: ptrInt32(46), Parameter: []byte{0x30, 0x00}}}})
 	select {
 	case d := <-app.dialogues:
 		assert.Equal(t, ourTID, d.LocalTID)
@@ -213,32 +192,28 @@ func TestEmptyBegin_OutboundDefersComponents(t *testing.T) {
 
 	called := &sccp.SccpAddress{PointCode: 2, SubsystemNumber: sccp.SSNMSC}
 	calling := &sccp.SccpAddress{PointCode: 1, SubsystemNumber: sccp.SSNMSC}
-	dlg, err := h.Originate(&ACShortMsgMTRelayV3, called, calling, 44, make([]byte, 90), "corr-long")
+	dlg, err := h.Originate(&ACShortMsgMTRelayV3, called, calling, 44, longParameter(), "corr-long")
 	require.NoError(t, err)
 
 	begin := nextSent(t, out)
-	assert.Equal(t, int(gotcap.Begin), int(begin.Transaction.Type.Code()))
-	assert.NotNil(t, begin.Dialogue, "the AARQ goes in the empty Begin")
-	assert.Nil(t, begin.Components, "the components are held back")
+	assert.Equal(t, MsgTypeBegin, begin.MessageType)
+	assert.NotNil(t, begin.DialoguePortion, "the AARQ goes in the empty Begin")
+	assert.Empty(t, begin.Components, "the components are held back")
 
 	// Peer accepts: CONTINUE with an AARE.
-	acc := &gotcap.TCAP{
-		Transaction: gotcap.NewContinue(0x0C0C0C0C, dlg.LocalTID, []byte{}),
-		Dialogue: gotcap.NewDialogue(gotcap.DialogueAsID, 1,
-			gotcap.NewAARE(1, 25, 3, gotcap.Accepted, gotcap.DialogueServiceUser, gotcap.Null), nil),
-	}
-	acc.SetLength()
-	raw, err := acc.MarshalBinary()
-	require.NoError(t, err)
-	in <- &sccp.SccpMessage{MessageType: sccp.MsgTypeUDT, Data: raw, CalledAddress: calling, CallingAddress: called}
+	acc := peerMessage(t, &Message{MessageType: MsgTypeContinue,
+		OriginatingTID: []byte{0x0C, 0x0C, 0x0C, 0x0C}, DestinationTID: h.encodeTID(dlg.LocalTID),
+		DialoguePortion: &DialoguePortion{ApplicationContext: &ApplicationContext{OID: ACShortMsgMTRelayV3.OID}}})
+	acc.CalledAddress, acc.CallingAddress = calling, called
+	in <- acc
 
 	cont := nextSent(t, out)
-	assert.Equal(t, int(gotcap.Continue), int(cont.Transaction.Type.Code()))
-	assert.Equal(t, []byte{0x0C, 0x0C, 0x0C, 0x0C}, cont.Transaction.DestTransactionID.Value)
-	assert.Nil(t, cont.Dialogue, "no dialogue portion in the second forward message")
-	require.NotNil(t, cont.Components)
-	require.Len(t, cont.Components.Component, 1)
-	assert.Equal(t, int(gotcap.Invoke), int(cont.Components.Component[0].Type.Code()))
+	assert.Equal(t, MsgTypeContinue, cont.MessageType)
+	assert.Equal(t, []byte{0x0C, 0x0C, 0x0C, 0x0C}, cont.DestinationTID)
+	assert.Nil(t, cont.DialoguePortion, "no dialogue portion in the second forward message")
+	require.Len(t, cont.Components, 1)
+	assert.Equal(t, CompTypeInvoke, cont.Components[0].Type)
+	assert.Equal(t, longParameter(), cont.Components[0].Parameter)
 }
 
 func TestEmptyBegin_TooLongEvenForContinue(t *testing.T) {
@@ -246,21 +221,21 @@ func TestEmptyBegin_TooLongEvenForContinue(t *testing.T) {
 	h.SetUserDataLimit(func(_, _ *sccp.SccpAddress) int { return 60 })
 	called := &sccp.SccpAddress{PointCode: 2, SubsystemNumber: sccp.SSNMSC}
 	calling := &sccp.SccpAddress{PointCode: 1, SubsystemNumber: sccp.SSNMSC}
-	_, err := h.Originate(&ACShortMsgMTRelayV3, called, calling, 44, make([]byte, 90), "corr-too-long")
+	_, err := h.Originate(&ACShortMsgMTRelayV3, called, calling, 44, longParameter(), "corr-too-long")
 	assert.ErrorIs(t, err, ErrMessageTooLong)
 	assert.Zero(t, h.getDialogueCount(), "nothing left registered")
 }
 
 func emptyBeginFrom(t *testing.T, otid uint32) *sccp.SccpMessage {
 	t.Helper()
-	b := gotcap.NewBeginInvokeWithDialogue(otid, gotcap.DialogueAsID, 21, 3, 1, 46, []byte{0x30, 0x00})
-	b.Components = nil
-	b.SetLength()
-	raw, err := b.MarshalBinary()
-	require.NoError(t, err)
-	return &sccp.SccpMessage{MessageType: sccp.MsgTypeUDT, Data: raw,
-		CalledAddress:  &sccp.SccpAddress{PointCode: 1, SubsystemNumber: sccp.SSNMSC},
-		CallingAddress: &sccp.SccpAddress{PointCode: 2, SubsystemNumber: sccp.SSNMSC}}
+	return peerMessage(t, &Message{MessageType: MsgTypeBegin,
+		OriginatingTID:  []byte{byte(otid >> 24), byte(otid >> 16), byte(otid >> 8), byte(otid)},
+		DialoguePortion: &DialoguePortion{ApplicationContext: &ApplicationContext{OID: moRelayV3}}})
+}
+
+// longParameter is a 90-octet argument: an OCTET STRING of 88.
+func longParameter() []byte {
+	return append([]byte{0x04, 88}, make([]byte, 88)...)
 }
 
 // Sending END terminates the dialogue (Q.774): its state goes at once, not
@@ -285,7 +260,7 @@ func TestEmptyBegin_Bounded(t *testing.T) {
 
 	in <- emptyBeginFrom(t, 0x01010101)
 	first := nextSent(t, out)
-	require.Equal(t, int(gotcap.Continue), int(first.Transaction.Type.Code()))
+	require.Equal(t, MsgTypeContinue, first.MessageType)
 	assert.Equal(t, int64(1), h.pendingEmptyBegins.Load())
 	h.dialoguesMu.RLock()
 	for _, d := range h.dialogues {
@@ -295,9 +270,9 @@ func TestEmptyBegin_Bounded(t *testing.T) {
 
 	in <- emptyBeginFrom(t, 0x02020202)
 	second := nextSent(t, out)
-	assert.Equal(t, int(gotcap.Abort), int(second.Transaction.Type.Code()))
-	require.NotNil(t, second.Transaction.PAbortCause)
-	assert.Equal(t, byte(AbortResourceLimitation), lastByte(second.Transaction.PAbortCause))
+	assert.Equal(t, MsgTypeAbort, second.MessageType)
+	require.NotNil(t, second.AbortCause)
+	assert.Equal(t, AbortResourceLimitation, *second.AbortCause)
 	assert.Equal(t, 1, h.getDialogueCount(), "the refused one leaves no state")
 
 	// Once the waiting dialogue goes, the slot is free again.
@@ -341,15 +316,15 @@ func TestVersionFallback_RetriesOnce(t *testing.T) {
 	refuse(first.LocalTID, ACShortMsgMTRelayV2.OID)
 
 	retry := nextSent(t, out)
-	assert.Equal(t, int(gotcap.Begin), int(retry.Transaction.Type.Code()))
-	assert.Equal(t, []byte{0x06, 0x07, 0x04, 0x00, 0x00, 0x01, 0x00, 25, 2}, retry.Dialogue.DialoguePDU.ApplicationContextName.Value)
-	require.NotNil(t, retry.Components)
-	assert.Equal(t, []byte{46}, retry.Components.Component[0].OperationCode.Value, "op sent under v2")
+	assert.Equal(t, MsgTypeBegin, retry.MessageType)
+	assert.Equal(t, ACShortMsgMTRelayV2.OID, retry.DialoguePortion.ApplicationContext.OID)
+	require.Len(t, retry.Components, 1)
+	assert.Equal(t, int32(46), *retry.Components[0].OperationCode, "op sent under v2")
 	assert.Empty(t, rec.snapshot(), "the caller is not told about the first refusal")
 
 	// The retry is refused too: no third attempt, the caller hears ABORTED.
 	var retryTID uint32
-	for _, b := range retry.Transaction.OrigTransactionID.Value {
+	for _, b := range retry.OriginatingTID {
 		retryTID = retryTID<<8 | uint32(b)
 	}
 	refuse(retryTID, ACShortMsgMTRelayV2.OID)

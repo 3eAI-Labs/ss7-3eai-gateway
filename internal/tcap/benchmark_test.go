@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"testing"
 
-	gotcap "github.com/wmnsk/go-tcap"
 	"go.uber.org/zap/zaptest"
 )
 
@@ -24,8 +23,8 @@ func BenchmarkParseTCAPBegin(b *testing.B) {
 	opCode := 46
 	payload := []byte{0x30, 0x0A, 0x04, 0x08, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00}
 
-	tcapMsg := gotcap.NewBeginInvoke(otid, invID, opCode, payload)
-	data, _ := tcapMsg.MarshalBinary()
+	tcapMsg := beginInvoke(otid, invID, opCode, payload)
+	data, _ := EncodeMessage(tcapMsg)
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -51,8 +50,8 @@ func BenchmarkParseTCAPEnd(b *testing.B) {
 	opCode := 46
 	payload := []byte{0x30, 0x05, 0x04, 0x03, 0x01, 0x02, 0x03}
 
-	tcapMsg := gotcap.NewEndReturnResult(dtid, invID, opCode, true, payload)
-	data, _ := tcapMsg.MarshalBinary()
+	tcapMsg := endReturnResult(dtid, invID, opCode, payload)
+	data, _ := EncodeMessage(tcapMsg)
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -79,8 +78,8 @@ func BenchmarkParseTCAPContinue(b *testing.B) {
 	opCode := 58
 	payload := []byte{0x04, 0x07, 0x91, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
 
-	tcapMsg := gotcap.NewContinueInvoke(otid, dtid, invID, opCode, payload)
-	data, _ := tcapMsg.MarshalBinary()
+	tcapMsg := continueInvoke(otid, dtid, invID, opCode, payload)
+	data, _ := EncodeMessage(tcapMsg)
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -274,7 +273,7 @@ func BenchmarkTCAPSmallPayload(b *testing.B) {
 
 	invID := int32(1)
 	opCode := int32(46)
-	payload := []byte{0x01} // Minimal payload
+	payload := []byte{0x30, 0x00} // Minimal payload: one BER element
 
 	msg := &Message{
 		MessageType:    MsgTypeBegin,
@@ -314,11 +313,8 @@ func BenchmarkTCAPLargePayload(b *testing.B) {
 
 	invID := int32(1)
 	opCode := int32(46)
-	// Use moderate size payload (100 bytes instead of 256)
-	payload := make([]byte, 100)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
+	// An OCTET STRING of 250: long-form lengths throughout.
+	payload := append([]byte{0x04, 0x81, 250}, make([]byte, 250)...)
 
 	msg := &Message{
 		MessageType:    MsgTypeBegin,
@@ -343,18 +339,6 @@ func BenchmarkTCAPLargePayload(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-	}
-}
-
-// BenchmarkParseOID benchmarks OID parsing
-func BenchmarkParseOID(b *testing.B) {
-	testData := []byte{0x28, 0x04, 0x00, 0x00, 0x01, 0x00, 0x01, 0x03}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		_ = parseOID(testData)
 	}
 }
 

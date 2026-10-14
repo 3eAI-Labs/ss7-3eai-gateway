@@ -5,14 +5,12 @@ package tcap
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
-	gotcap "github.com/wmnsk/go-tcap"
 	"go.uber.org/zap"
 )
 
@@ -490,6 +488,12 @@ func (h *Handler) handleEnd(sccpCtx *sccp.SccpMessage, msg *Message) {
 	// END is terminal regardless of dispatch outcome.
 	h.dispatchToApplication(sccpCtx, dialogue, msg)
 	h.removeDialogue(localTID)
+
+	// An END that answered nothing — no result, no error, only the segments
+	// of one — leaves the originator without an outcome; tell it.
+	if dialogue.initiatedLocally {
+		h.reportFailure(dialogue, FailureRemoteError, "dialogue ended without a result")
+	}
 }
 
 // handleAbort processes TCAP ABORT message.
@@ -534,11 +538,6 @@ func (h *Handler) handleAbort(sccpCtx *sccp.SccpMessage, msg *Message) {
 		zap.Uint32("local_tid", localTID),
 		zap.String("detail", detail))
 
-	// Snapshot the originated-dialogue context before the dispatch / delete
-	// race below; sink fires post-removal so it can't observe stale state.
-	corrID := dialogue.NATSCorrelationID
-	opCode := dialogue.OriginatingOpCode
-
 	if h.retryUnderLowerVersion(dialogue, msg) {
 		h.removeDialogue(localTID)
 		return
@@ -548,9 +547,7 @@ func (h *Handler) handleAbort(sccpCtx *sccp.SccpMessage, msg *Message) {
 	h.dispatchToApplication(sccpCtx, dialogue, msg)
 	h.removeDialogue(localTID)
 
-	if h.failureSink != nil && corrID != "" {
-		h.failureSink(corrID, opCode, FailureAbortReceived, detail)
-	}
+	h.reportFailure(dialogue, FailureAbortReceived, detail)
 }
 
 // handleUnidirectional processes TCAP UNIDIRECTIONAL message.
@@ -670,9 +667,9 @@ func (h *Handler) processComponents(dialogue *Dialogue, components []*Component)
 
 		case CompTypeReturnResult:
 			h.metrics.ResultsReceived.Add(1)
-			// Remove pending invoke
-			if comp.LinkedID != nil {
-				delete(dialogue.PendingInvokes, *comp.LinkedID)
+			// A Last answers the invoke it names; a Not Last does not.
+			if comp.InvokeID != nil && !comp.NotLast {
+				delete(dialogue.PendingInvokes, *comp.InvokeID)
 			}
 
 		case CompTypeReturnError:
@@ -786,16 +783,12 @@ func (h *Handler) HandleDeliveryFailure(msg *sccp.SccpMessage, reason string) {
 	if dialogue == nil {
 		return
 	}
-	corrID := dialogue.NATSCorrelationID
-	opCode := dialogue.OriginatingOpCode
 	h.removeDialogue(localTID)
 	h.metrics.Errors.Add(1)
 	h.logger.Warn("Dialogue ended: message not delivered",
 		zap.Uint32("local_tid", localTID), zap.String("reason", reason))
 
-	if h.failureSink != nil && corrID != "" {
-		h.failureSink(corrID, opCode, FailureNotDelivered, reason)
-	}
+	h.reportFailure(dialogue, FailureNotDelivered, reason)
 }
 
 // SetVersionFallback enables retrying an originated dialogue under the
@@ -1047,37 +1040,6 @@ func (h *Handler) getDialogueCount() int {
 	return len(h.dialogues)
 }
 
-// ParseWire parses a TCAP message. go-tcap's Parse reads the three octets
-// after an ABORT's DTID as a P-Abort cause unconditionally, so it cannot read
-// a TC-U-ABORT, whose dialogue portion follows the DTID directly (Q.773
-// §3.2); ABORTs go through its tag-driven BER parser instead.
-//
-// go-tcap indexes into the input without bounds checks in places (a 3-octet
-// message is enough to panic Transaction.UnmarshalBinary), and a panic in a
-// TCAP worker would take the gateway down on one malformed message from any
-// peer. A parser panic is therefore turned into an error here.
-func ParseWire(data []byte) (msg *gotcap.TCAP, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			msg, err = nil, fmt.Errorf("%w: malformed TCAP message (%v)", ErrInvalidMessage, r)
-		}
-	}()
-	if len(data) > 0 && data[0] == tagAbort {
-		msgs, err := gotcap.ParseBER(data)
-		if err != nil {
-			return nil, err
-		}
-		if len(msgs) == 0 {
-			return nil, ErrInvalidMessage
-		}
-		return msgs[0], nil
-	}
-	return gotcap.Parse(data)
-}
-
-// tagAbort is the ABORT message type tag (Q.773 §3.2, [APPLICATION 7]).
-const tagAbort = 0x67
-
 func oidString(oid []int) string {
 	s, err := canonicalOID(oid)
 	if err != nil {
@@ -1087,333 +1049,19 @@ func oidString(oid []int) string {
 }
 
 // parseTCAPMessage parses a raw TCAP payload (ITU-T Q.773) from the SCCP
-// data field. Returns ErrInvalidMessage on payloads too short to contain a
-// transaction tag and length octet.
+// data field (ber.go).
 func (h *Handler) parseTCAPMessage(data []byte) (*Message, error) {
-	if len(data) < 2 {
-		return nil, ErrInvalidMessage
-	}
-
-	tcapMsg, err := ParseWire(data)
+	msg, err := ParseMessage(data)
 	if err != nil {
-		h.logger.Error("Failed to parse TCAP message", zap.Error(err))
+		h.logger.Debug("Failed to parse TCAP message", zap.Error(err))
 		return nil, fmt.Errorf("TCAP parse error: %w", err)
 	}
-
-	// Convert go-tcap.TCAP to our internal Message format
-	msg := &Message{}
-
-	// Parse Transaction Portion
-	if tx := tcapMsg.Transaction; tx != nil {
-		switch tx.Type.Code() {
-		case gotcap.Unidirectional:
-			msg.MessageType = MsgTypeUnidirectional
-		case gotcap.Begin:
-			msg.MessageType = MsgTypeBegin
-			if otid := tx.OrigTransactionID; otid != nil {
-				msg.OriginatingTID = otid.Value
-			}
-		case gotcap.End:
-			msg.MessageType = MsgTypeEnd
-			if dtid := tx.DestTransactionID; dtid != nil {
-				msg.DestinationTID = dtid.Value
-			}
-		case gotcap.Continue:
-			msg.MessageType = MsgTypeContinue
-			if otid := tx.OrigTransactionID; otid != nil {
-				msg.OriginatingTID = otid.Value
-			}
-			if dtid := tx.DestTransactionID; dtid != nil {
-				msg.DestinationTID = dtid.Value
-			}
-		case gotcap.Abort:
-			msg.MessageType = MsgTypeAbort
-			if dtid := tx.DestTransactionID; dtid != nil {
-				msg.DestinationTID = dtid.Value
-			}
-			if cause := tx.PAbortCause; cause != nil && len(cause.Value) > 0 {
-				abortCause := AbortCause(cause.Value[0])
-				msg.AbortCause = &abortCause
-				msg.PAbort = true
-			}
-		}
-	}
-
-	// Parse Dialogue Portion. ApplicationContextName.Value is the inner
-	// BER-encoded OBJECT IDENTIFIER (tag 0x06 + length + content) — strip
-	// the tag+length wrapper before handing the raw arc bytes to parseOID.
-	// go-tcap's NewApplicationContextName builds Value as
-	// [0x06, 0x07, 4, 0, 0, 1, 0, ctx, ver]; parseOID expects only the
-	// last 7 octets, otherwise it produces a phantom "0.6.7..." prefix
-	// that no registered AC will ever match (TIER 1 Item 4 catch).
-	if dlg := tcapMsg.Dialogue; dlg != nil {
-		msg.DialoguePortion = &DialoguePortion{}
-		if dlgPDU := dlg.DialoguePDU; dlgPDU != nil {
-			if acn := dlgPDU.ApplicationContextName; acn != nil && len(acn.Value) > 0 {
-				oidBytes := acn.Value
-				if len(oidBytes) >= 2 && oidBytes[0] == 0x06 {
-					// Skip OID tag + length octet.
-					oidBytes = oidBytes[2:]
-				}
-				msg.DialoguePortion.ApplicationContext = &ApplicationContext{
-					OID: parseOID(oidBytes),
-				}
-			}
-			if ui := dlgPDU.UserInformation; ui != nil {
-				msg.DialoguePortion.UserInformation = ui.Value
-			}
-			// An AARE whose result is not "accepted" refuses the dialogue.
-			if dlgPDU.Type.Code() == gotcap.AARE {
-				if r := dlgPDU.Result; r != nil && len(r.Value) > 0 && r.Value[len(r.Value)-1] != gotcap.Accepted {
-					msg.DialoguePortion.Rejected = true
-				}
-			}
-		}
-	}
-
-	// Parse Components
-	if comps := tcapMsg.Components; comps != nil {
-		msg.Components = make([]*Component, 0, len(comps.Component))
-		for _, comp := range comps.Component {
-			c := &Component{}
-
-			// Component Type
-			switch comp.Type.Code() {
-			case gotcap.Invoke:
-				c.Type = CompTypeInvoke
-			case gotcap.ReturnResultLast, gotcap.ReturnResultNotLast:
-				c.Type = CompTypeReturnResult
-			case gotcap.ReturnError:
-				c.Type = CompTypeReturnError
-			case gotcap.Reject:
-				c.Type = CompTypeReject
-			}
-
-			// Invoke ID
-			if invID := comp.InvokeID; invID != nil && len(invID.Value) > 0 {
-				id := int32(invID.Value[0])
-				c.InvokeID = &id
-			}
-
-			// Linked ID
-			if linkID := comp.LinkedID; linkID != nil && len(linkID.Value) > 0 {
-				id := int32(linkID.Value[0])
-				c.LinkedID = &id
-			}
-
-			// Operation Code
-			if opCode := comp.OperationCode; opCode != nil && len(opCode.Value) > 0 {
-				code := int32(opCode.Value[0])
-				c.OperationCode = &code
-			}
-
-			// Error Code
-			if errCode := comp.ErrorCode; errCode != nil && len(errCode.Value) > 0 {
-				code := int32(errCode.Value[0])
-				c.ErrorCode = &code
-			}
-
-			// Parameter
-			if param := comp.Parameter; param != nil {
-				c.Parameter = param.Value
-			}
-
-			msg.Components = append(msg.Components, c)
-		}
-	}
-
 	return msg, nil
 }
 
-// encodeTCAPMessage encodes TCAP message to bytes (ITU-T Q.773)
+// encodeTCAPMessage encodes a TCAP message (ITU-T Q.773, ber.go).
 func (h *Handler) encodeTCAPMessage(msg *Message) ([]byte, error) {
-	if msg == nil {
-		return nil, ErrInvalidMessage
-	}
-
-	// Convert our internal Message to go-tcap.TCAP format
-	tcapMsg := &gotcap.TCAP{}
-
-	// Build Transaction Portion
-	switch msg.MessageType {
-	case MsgTypeUnidirectional:
-		tcapMsg.Transaction = gotcap.NewUnidirectional([]byte{})
-
-	case MsgTypeBegin:
-		if len(msg.OriginatingTID) < 4 {
-			return nil, fmt.Errorf("invalid OTID length: %d", len(msg.OriginatingTID))
-		}
-		otid := binary.BigEndian.Uint32(msg.OriginatingTID)
-		tcapMsg.Transaction = gotcap.NewBegin(otid, []byte{})
-
-	case MsgTypeEnd:
-		if len(msg.DestinationTID) < 4 {
-			return nil, fmt.Errorf("invalid DTID length: %d", len(msg.DestinationTID))
-		}
-		dtid := binary.BigEndian.Uint32(msg.DestinationTID)
-		tcapMsg.Transaction = gotcap.NewEnd(dtid, []byte{})
-
-	case MsgTypeContinue:
-		if len(msg.OriginatingTID) < 4 || len(msg.DestinationTID) < 4 {
-			return nil, fmt.Errorf("invalid TID length: OTID=%d, DTID=%d",
-				len(msg.OriginatingTID), len(msg.DestinationTID))
-		}
-		otid := binary.BigEndian.Uint32(msg.OriginatingTID)
-		dtid := binary.BigEndian.Uint32(msg.DestinationTID)
-		tcapMsg.Transaction = gotcap.NewContinue(otid, dtid, []byte{})
-
-	case MsgTypeAbort:
-		if len(msg.DestinationTID) < 4 {
-			return nil, fmt.Errorf("invalid DTID length: %d", len(msg.DestinationTID))
-		}
-		dtid := binary.BigEndian.Uint32(msg.DestinationTID)
-		cause := uint8(0)
-		if msg.AbortCause != nil {
-			cause = uint8(*msg.AbortCause)
-		}
-		tcapMsg.Transaction = gotcap.NewAbort(dtid, cause, []byte{})
-		if !msg.PAbort {
-			// TC-U-ABORT: no P-Abort cause; the reason, if any, is in the
-			// dialogue portion.
-			tcapMsg.Transaction.PAbortCause = nil
-		}
-
-	default:
-		return nil, fmt.Errorf("unsupported message type: %v", msg.MessageType)
-	}
-
-	// Build Dialogue Portion (if present). go-tcap encodes ApplicationContext
-	// as the 9-byte template [0x06, 0x07, 4, 0, 0, 1, 0, ctx, ver]; ctx is
-	// the AC short ID (e.g. 1 = networkLocUp, 25 = shortMsgGateway), ver is
-	// the application-version. They're the LAST TWO arcs of the registered
-	// AC OID, so pull both — the previous code used OID[len-1] for ctx and
-	// hard 3 for ver, producing on-wire OID 0.4.0.0.1.0.{ver}.{3} that
-	// failed dispatcher lookup on inbound responses (TIER 1 Item 4 catch).
-	if dlg := msg.DialoguePortion; dlg != nil && dlg.ApplicationContext != nil {
-		ctx := uint8(0)
-		ctxver := uint8(3)
-		if oid := dlg.ApplicationContext.OID; len(oid) >= 2 {
-			ctx = uint8(oid[len(oid)-2])
-			ctxver = uint8(oid[len(oid)-1])
-		}
-		var pdu *gotcap.DialoguePDU
-		switch {
-		case msg.MessageType == MsgTypeBegin:
-			pdu = gotcap.NewAARQ(1, ctx, ctxver)
-		case dlg.Rejected:
-			// "ApplicationContextNameNotSupplied" is go-tcap's name for
-			// dialogue-service-user diagnostic 2, which Q.773 calls
-			// application-context-name-not-supported.
-			pdu = gotcap.NewAARE(1, ctx, ctxver, gotcap.RejectPerm, gotcap.DialogueServiceUser,
-				gotcap.ApplicationContextNameNotSupplied)
-		default:
-			pdu = gotcap.NewAARE(1, ctx, ctxver, gotcap.Accepted, gotcap.DialogueServiceUser, gotcap.Null)
-		}
-		tcapMsg.Dialogue = gotcap.NewDialogue(1, 1, pdu, dlg.UserInformation)
-	}
-
-	// Build Components
-	if len(msg.Components) > 0 {
-		comps := make([]*gotcap.Component, 0, len(msg.Components))
-		for _, c := range msg.Components {
-			var comp *gotcap.Component
-
-			switch c.Type {
-			case CompTypeInvoke:
-				invID := int(0)
-				if c.InvokeID != nil {
-					invID = int(*c.InvokeID)
-				}
-				linkID := int(-1)
-				if c.LinkedID != nil {
-					linkID = int(*c.LinkedID)
-				}
-				opCode := int(0)
-				if c.OperationCode != nil {
-					opCode = int(*c.OperationCode)
-				}
-				comp = gotcap.NewInvoke(invID, linkID, opCode, true, c.Parameter)
-
-			case CompTypeReturnResult:
-				invID := int(0)
-				if c.InvokeID != nil {
-					invID = int(*c.InvokeID)
-				}
-				opCode := int(0)
-				if c.OperationCode != nil {
-					opCode = int(*c.OperationCode)
-				}
-				// Assume Last for now
-				comp = gotcap.NewReturnResult(invID, opCode, true, true, c.Parameter)
-
-			case CompTypeReturnError:
-				invID := int(0)
-				if c.InvokeID != nil {
-					invID = int(*c.InvokeID)
-				}
-				errCode := int(0)
-				if c.ErrorCode != nil {
-					errCode = int(*c.ErrorCode)
-				}
-				comp = gotcap.NewReturnError(invID, errCode, true, c.Parameter)
-
-			case CompTypeReject:
-				invID := int(0)
-				if c.InvokeID != nil {
-					invID = int(*c.InvokeID)
-				}
-				problemType := gotcap.GeneralProblem
-				problemCode := uint8(0)
-				if c.ProblemCode != nil {
-					problemType = int(c.ProblemCode.Type)
-					problemCode = c.ProblemCode.Code
-				}
-				comp = gotcap.NewReject(invID, problemType, problemCode, c.Parameter)
-			}
-
-			if comp != nil {
-				comps = append(comps, comp)
-			}
-		}
-
-		tcapMsg.Components = gotcap.NewComponents(comps...)
-	}
-
-	// Set lengths
-	tcapMsg.SetLength()
-
-	// Marshal to bytes
-	data, err := tcapMsg.MarshalBinary()
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal TCAP message: %w", err)
-	}
-
-	return data, nil
-}
-
-// parseOID parses ASN.1 OID bytes to integer slice
-func parseOID(data []byte) []int {
-	if len(data) < 2 {
-		return nil
-	}
-
-	oid := make([]int, 0, len(data))
-
-	// First byte encodes first two arcs: 40*X + Y
-	if data[0] >= 80 {
-		oid = append(oid, 2, int(data[0])-80)
-	} else if data[0] >= 40 {
-		oid = append(oid, 1, int(data[0])-40)
-	} else {
-		oid = append(oid, 0, int(data[0]))
-	}
-
-	// Remaining bytes
-	for i := 1; i < len(data); i++ {
-		oid = append(oid, int(data[i]))
-	}
-
-	return oid
+	return EncodeMessage(msg)
 }
 
 // updateOutgoingMetrics updates metrics for outgoing messages
@@ -1666,8 +1314,6 @@ func (h *Handler) handleDialogueTimeout(localTID uint32) {
 
 	called := dlg.RemoteAddress
 	calling := dlg.LocalAddress
-	corrID := dlg.NATSCorrelationID
-	opCode := dlg.OriginatingOpCode
 
 	delete(h.dialogues, localTID)
 	h.metrics.ActiveDialogues.Add(-1)
@@ -1679,9 +1325,16 @@ func (h *Handler) handleDialogueTimeout(localTID uint32) {
 			zap.Error(err))
 	}
 
-	if h.failureSink != nil && corrID != "" {
-		h.failureSink(corrID, opCode, FailureTimeout, "dialogue timeout")
+	h.reportFailure(dlg, FailureTimeout, "dialogue timeout")
+}
+
+// reportFailure tells the originator of d how its dialogue ended, unless it
+// has already had its outcome (MarkAnswered).
+func (h *Handler) reportFailure(d *Dialogue, reason FailureReason, detail string) {
+	if h.failureSink == nil || d == nil || d.NATSCorrelationID == "" || !d.MarkAnswered() {
+		return
 	}
+	h.failureSink(d.NATSCorrelationID, d.OriginatingOpCode, reason, detail)
 }
 
 // handleInvokeTimeout handles invoke timeout

@@ -9,9 +9,9 @@ import (
 
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/mapprotocol"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/tcap"
 	"github.com/wmnsk/go-m3ua"
 	"github.com/wmnsk/go-m3ua/messages/params"
-	gotcap "github.com/wmnsk/go-tcap"
 	"go.uber.org/zap"
 )
 
@@ -177,19 +177,11 @@ func (p *Peer) sendACNotSupported(
 	otidBytes []byte,
 	supported []byte,
 ) {
-	tx := gotcap.NewAbort(bytesToUint32(otidBytes), 0, []byte{})
-	tx.PAbortCause = nil
-	ctx, ver := supported[len(supported)-2], supported[len(supported)-1]
-	dlg := gotcap.NewDialogue(gotcap.DialogueAsID, 1,
-		gotcap.NewAARE(1, ctx, ver, gotcap.RejectPerm, gotcap.DialogueServiceUser,
-			gotcap.ApplicationContextNameNotSupplied), // value 2: "not supported" in Q.773
-		nil)
-	msg := &gotcap.TCAP{Transaction: tx, Dialogue: dlg}
-	msg.SetLength()
-	b, err := msg.MarshalBinary()
-	if err != nil {
-		p.logger.Warn("U-ABORT encode failed", zap.Error(err))
-		return
-	}
-	p.writeSCCPResponse(conn, pd, sccpReq, b)
+	// TC-U-ABORT whose AARE is reject-permanent with diagnostic
+	// application-context-name-not-supported, naming the context supported.
+	p.sendTCAP(conn, pd, sccpReq, &tcap.Message{
+		MessageType: tcap.MsgTypeAbort, DestinationTID: otidBytes,
+		DialoguePortion: &tcap.DialoguePortion{
+			ApplicationContext: &tcap.ApplicationContext{OID: acOIDOf(supported)}, Rejected: true},
+	})
 }

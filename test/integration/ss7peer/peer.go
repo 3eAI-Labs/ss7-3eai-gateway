@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // Package ss7peer provides an in-process SS7 peer that the gateway under
-// test connects to over real SCTP/M3UA. It speaks SCCP/TCAP/MAP using the
-// same wire-format codecs the gateway itself uses
-// (`internal/sccp`, `wmnsk/go-tcap`, `internal/mapprotocol`) — single
-// source of truth, so codec drift between SUT and harness can never hide.
+// test connects to over real SCTP/M3UA. It speaks SCCP/TCAP/MAP with the
+// gateway's own codecs (`internal/sccp`, `internal/tcap`,
+// `internal/mapprotocol`). A shared codec cannot show a defect both sides
+// share — a TCAP library that wrapped every parameter in an extra SEQUENCE
+// went unnoticed that way — so each codec is also checked against frames
+// built by hand from the standard (ber_test.go, location_test.go,
+// routing_test.go); the peer checks what the frames carry.
 //
 // Usage (E2E test):
 //
@@ -51,7 +54,6 @@ import (
 	"github.com/ishidawataru/sctp"
 	"github.com/wmnsk/go-m3ua"
 	"github.com/wmnsk/go-m3ua/messages/params"
-	gotcap "github.com/wmnsk/go-tcap"
 	"go.uber.org/zap"
 )
 
@@ -494,33 +496,30 @@ func (p *Peer) handleMTP3(conn *m3ua.Conn, pd *params.ProtocolDataPayload) {
 		return
 	}
 
-	tcapMsg, err := tcap.ParseWire(sccpMsg.Data)
+	tcapMsg, err := tcap.ParseMessage(sccpMsg.Data)
 	if err != nil {
-		p.logger.Warn("TCAP parse failed", zap.Error(err))
+		p.violate("TCAP message not Q.773: %v", err)
 		return
 	}
 
 	// The peer serves a BEGIN carrying an Invoke, or — after an empty Begin
 	// it accepted (TS 29.002 §C.2.1) — the CONTINUE carrying it. END and
 	// ABORT need no answer.
-	if tcapMsg.Transaction == nil {
-		return
-	}
-	otidValue := tcapMsg.Transaction.OrigTransactionID
-	if otidValue == nil || len(otidValue.Value) == 0 {
+	otidBytes := tcapMsg.OriginatingTID
+	if len(otidBytes) == 0 {
 		return
 	}
 	var acValue []byte
-	switch tcapMsg.Transaction.Type.Code() {
-	case gotcap.Begin:
-		acValue = applicationContextValue(tcapMsg)
-		if tcapMsg.Components == nil || len(tcapMsg.Components.Component) == 0 {
-			p.acceptEmptyBegin(conn, pd, sccpMsg, otidValue.Value, acValue)
+	switch tcapMsg.MessageType {
+	case tcap.MsgTypeBegin:
+		acValue = acValueOf(tcapMsg)
+		if len(tcapMsg.Components) == 0 {
+			p.acceptEmptyBegin(conn, pd, sccpMsg, otidBytes, acValue)
 			return
 		}
-	case gotcap.Continue:
+	case tcap.MsgTypeContinue:
 		var ok bool
-		if acValue, ok = p.continueAfterEmptyBegin(tcapMsg, otidValue.Value); !ok {
+		if acValue, ok = p.continueAfterEmptyBegin(tcapMsg, otidBytes); !ok {
 			return
 		}
 	default:
@@ -528,58 +527,48 @@ func (p *Peer) handleMTP3(conn *m3ua.Conn, pd *params.ProtocolDataPayload) {
 	}
 
 	// First Invoke wins (single-component dialogues per gateway today).
-	for _, comp := range tcapMsg.Components.Component {
-		if comp.Type.Code() != gotcap.Invoke {
+	for _, comp := range tcapMsg.Components {
+		if comp.Type != tcap.CompTypeInvoke || comp.OperationCode == nil || comp.InvokeID == nil {
 			continue
 		}
-		opCode := uint8(0)
-		if comp.OperationCode != nil && len(comp.OperationCode.Value) > 0 {
-			opCode = comp.OperationCode.Value[0]
-		}
-		invokeID := uint8(0)
-		if comp.InvokeID != nil && len(comp.InvokeID.Value) > 0 {
-			invokeID = comp.InvokeID.Value[0]
-		}
+		opCode := uint8(*comp.OperationCode)
+		invokeID := *comp.InvokeID
+		paramBytes := comp.Parameter
 
-		paramBytes := []byte(nil)
-		if comp.Parameter != nil {
-			paramBytes = comp.Parameter.Value
-		}
-
-		otid := bytesToUint32(otidValue.Value)
+		otid := bytesToUint32(otidBytes)
 		if p.cfg.OnlyVersion2 {
 			if len(acValue) >= 2 && acValue[len(acValue)-1] == 3 {
-				p.sendACNotSupported(conn, pd, sccpMsg, otidValue.Value, acOID(acValue[len(acValue)-2], 2))
+				p.sendACNotSupported(conn, pd, sccpMsg, otidBytes, acOID(acValue[len(acValue)-2], 2))
 				return
 			}
 			want, known := expectedV2ACByOp[int32(opCode)]
 			if !known || !bytes.Equal(want, acValue) {
 				p.violate("op %d sent under % X in a version 2 dialogue", opCode, acValue)
-				p.sendACNotSupported(conn, pd, sccpMsg, otidValue.Value, acOID(20, 2))
+				p.sendACNotSupported(conn, pd, sccpMsg, otidBytes, acOID(20, 2))
 				return
 			}
 			p.v2Dialogues.Add(1)
 			if int32(opCode) == int32(mapprotocol.OpMoForwardSM) { // forwardSM: MT delivery in v2
-				p.handleMtForwardSMInvoke(conn, pd, sccpMsg, tcapMsg, otidValue.Value, invokeID, paramBytes, otid)
+				p.handleMtForwardSMInvoke(conn, pd, sccpMsg, tcapMsg, otidBytes, invokeID, paramBytes, otid)
 				return
 			}
-			p.handleSRIInvoke(conn, pd, sccpMsg, tcapMsg, otidValue.Value, invokeID, paramBytes, otid)
+			p.handleSRIInvoke(conn, pd, sccpMsg, tcapMsg, otidBytes, invokeID, paramBytes, otid)
 			return
 		}
 		if p.cfg.RefuseContexts {
 			if want, known := expectedACByOp[int32(opCode)]; known {
-				p.sendACNotSupported(conn, pd, sccpMsg, otidValue.Value, acOID(want[len(want)-2], 2))
+				p.sendACNotSupported(conn, pd, sccpMsg, otidBytes, acOID(want[len(want)-2], 2))
 				return
 			}
 		}
 		if supported, ok := p.checkApplicationContext(acValue, int32(opCode)); !ok {
-			p.sendACNotSupported(conn, pd, sccpMsg, otidValue.Value, supported)
+			p.sendACNotSupported(conn, pd, sccpMsg, otidBytes, supported)
 			return
 		}
 		p.checkSubsystems(int32(opCode), sccpMsg.CalledAddress, sccpMsg.CallingAddress)
 		switch int32(opCode) {
 		case int32(mapprotocol.OpAnyTimeInterrogation), int32(mapprotocol.OpProvideSubscriberInfo):
-			p.handleLocationInvoke(conn, pd, sccpMsg, tcapMsg, otidValue.Value, invokeID, int32(opCode), paramBytes, otid)
+			p.handleLocationInvoke(conn, pd, sccpMsg, tcapMsg, otidBytes, invokeID, int32(opCode), paramBytes, otid)
 		case int32(mapprotocol.OpSendRoutingInfoForSM):
 			if p.cfg.OnSRIPreDrop != nil && p.cfg.OnSRIPreDrop(otid) {
 				p.sriRequests.Add(1)
@@ -589,7 +578,7 @@ func (p *Peer) handleMTP3(conn *m3ua.Conn, pd *params.ProtocolDataPayload) {
 					zap.Uint8("node_id", uint8(otid>>24)))
 				return
 			}
-			p.handleSRIInvoke(conn, pd, sccpMsg, tcapMsg, otidValue.Value, invokeID, paramBytes, otid)
+			p.handleSRIInvoke(conn, pd, sccpMsg, tcapMsg, otidBytes, invokeID, paramBytes, otid)
 		case int32(mapprotocol.OpMtForwardSM):
 			if p.cfg.OnMtForwardSM == nil {
 				p.logger.Debug("MT-Forward-SM Invoke received but OnMtForwardSM not configured — dropping",
@@ -604,7 +593,7 @@ func (p *Peer) handleMTP3(conn *m3ua.Conn, pd *params.ProtocolDataPayload) {
 					zap.Uint8("node_id", uint8(otid>>24)))
 				return
 			}
-			p.handleMtForwardSMInvoke(conn, pd, sccpMsg, tcapMsg, otidValue.Value, invokeID, paramBytes, otid)
+			p.handleMtForwardSMInvoke(conn, pd, sccpMsg, tcapMsg, otidBytes, invokeID, paramBytes, otid)
 		default:
 			p.logger.Debug("Ignoring unsupported MAP op",
 				zap.Uint8("op_code", opCode))
@@ -619,9 +608,9 @@ func (p *Peer) handleSRIInvoke(
 	conn *m3ua.Conn,
 	pd *params.ProtocolDataPayload,
 	sccpReq *sccp.SccpMessage,
-	tcapReq *gotcap.TCAP,
+	tcapReq *tcap.Message,
 	otidBytes []byte,
-	invokeID uint8,
+	invokeID int32,
 	paramBytes []byte,
 	otid uint32,
 ) {
@@ -671,9 +660,9 @@ func (p *Peer) handleMtForwardSMInvoke(
 	conn *m3ua.Conn,
 	pd *params.ProtocolDataPayload,
 	sccpReq *sccp.SccpMessage,
-	tcapReq *gotcap.TCAP,
+	tcapReq *tcap.Message,
 	otidBytes []byte,
-	invokeID uint8,
+	invokeID int32,
 	paramBytes []byte,
 	otid uint32,
 ) {
@@ -715,125 +704,55 @@ func (p *Peer) handleMtForwardSMInvoke(
 	p.mtFwdResponses.Add(1)
 }
 
-// sendEndReturnResult builds an END + AARE dialogue + ReturnResultLast
-// component for the in-flight transaction and writes it back on the
-// same M3UA association with OPC/DPC swapped.
-//
-// AARE context/version: parsed from the inbound BEGIN's Dialogue
-// ApplicationContextName so we mirror exactly what the gateway sent
-// (including any non-spec ctx values produced by the gateway encoder).
+// sendEndReturnResult answers the in-flight transaction with an END
+// carrying a Return Result Last — and an AARE accepting the context when the
+// request was the BEGIN that opened the dialogue.
 func (p *Peer) sendEndReturnResult(
 	conn *m3ua.Conn,
 	pd *params.ProtocolDataPayload,
 	sccpReq *sccp.SccpMessage,
-	tcapReq *gotcap.TCAP,
+	tcapReq *tcap.Message,
 	otidBytes []byte,
-	invokeID uint8,
+	invokeID int32,
 	opCode int32,
 	respParam []byte,
 ) {
-	dtid := bytesToUint32(otidBytes)
-	if tcapReq.Dialogue == nil {
-		// Answer to the CONTINUE after an empty Begin: the AARE went in our
-		// CONTINUE, so the END carries no dialogue portion.
-		endTCAP := gotcap.NewEndReturnResult(dtid, int(invokeID), int(opCode), true, respParam)
-		tcapBytes, err := endTCAP.MarshalBinary()
-		if err != nil {
-			p.logger.Warn("END encode failed", zap.Error(err))
-			return
-		}
-		p.writeSCCPResponse(conn, pd, sccpReq, tcapBytes)
-		return
-	}
-	ctx, ctxver := dialogueCtxVerFromBegin(tcapReq)
-
-	endTCAP := gotcap.NewEndReturnResultWithDialogue(
-		dtid, gotcap.DialogueAsID,
-		ctx, ctxver,
-		int(invokeID), int(opCode),
-		true, // isLast
-		respParam,
-	)
-	// Override the dialogue PDU type from default AARQ to AARE — the
-	// constructor uses NewBeginInvokeWithDialogue's AARQ template; for
-	// END responses we need AARE per Q.773.
-	if endTCAP.Dialogue != nil {
-		endTCAP.Dialogue.DialoguePDU = gotcap.NewAARE(1, ctx, ctxver, gotcap.Accepted, gotcap.DialogueServiceUser, gotcap.Null)
-		// Reset SingleAsn1Type length to match new PDU.
-		if endTCAP.Dialogue.SingleAsn1Type != nil {
-			endTCAP.Dialogue.SingleAsn1Type.Length = uint8(endTCAP.Dialogue.DialoguePDU.MarshalLen())
-		}
-		endTCAP.Dialogue.SetLength()
-	}
-	endTCAP.SetLength()
-
-	tcapBytes, err := endTCAP.MarshalBinary()
-	if err != nil {
-		p.logger.Warn("END encode failed", zap.Error(err))
-		return
-	}
-
-	p.writeSCCPResponse(conn, pd, sccpReq, tcapBytes)
+	p.sendTCAP(conn, pd, sccpReq, &tcap.Message{
+		MessageType: tcap.MsgTypeEnd, DestinationTID: otidBytes, DialoguePortion: aareFor(tcapReq),
+		Components: []*tcap.Component{{Type: tcap.CompTypeReturnResult, InvokeID: i32(invokeID),
+			OperationCode: i32(opCode), Parameter: respParam}},
+	})
 }
 
-// sendReturnError emits an END + AARE + ReturnError. Same wire shape as
-// the success path, just a different component type.
+// sendReturnError answers with an END carrying a Return Error, the same
+// shape as the success path.
 func (p *Peer) sendReturnError(
 	conn *m3ua.Conn,
 	pd *params.ProtocolDataPayload,
 	sccpReq *sccp.SccpMessage,
-	tcapReq *gotcap.TCAP,
+	tcapReq *tcap.Message,
 	otidBytes []byte,
-	invokeID uint8,
+	invokeID int32,
 	errCode int32,
 ) {
-	dtid := bytesToUint32(otidBytes)
-	ctx, ctxver := dialogueCtxVerFromBegin(tcapReq)
-
-	// go-tcap doesn't have a NewEndReturnError helper — assemble manually.
-	tx := gotcap.NewEnd(dtid, []byte{})
-	var dlg *gotcap.Dialogue
-	if tcapReq.Dialogue != nil {
-		dlg = gotcap.NewDialogue(gotcap.DialogueAsID, 1,
-			gotcap.NewAARE(1, ctx, ctxver, gotcap.Accepted, gotcap.DialogueServiceUser, gotcap.Null),
-			nil)
-	}
-	errComp := gotcap.NewReturnError(int(invokeID), int(errCode), true, nil)
-
-	tcapMsg := &gotcap.TCAP{
-		Transaction: tx,
-		Dialogue:    dlg,
-		Components:  gotcap.NewComponents(errComp),
-	}
-	tcapMsg.SetLength()
-
-	tcapBytes, err := tcapMsg.MarshalBinary()
-	if err != nil {
-		p.logger.Warn("ReturnError encode failed", zap.Error(err))
-		return
-	}
-
-	p.writeSCCPResponse(conn, pd, sccpReq, tcapBytes)
+	p.sendTCAP(conn, pd, sccpReq, &tcap.Message{
+		MessageType: tcap.MsgTypeEnd, DestinationTID: otidBytes, DialoguePortion: aareFor(tcapReq),
+		Components: []*tcap.Component{{Type: tcap.CompTypeReturnError, InvokeID: i32(invokeID), ErrorCode: i32(errCode)}},
+	})
 }
 
-// sendAbort emits a TCAP P-Abort. Gateway should clean up the dialogue.
+// sendAbort emits a P-ABORT (unrecognizedTransactionID). The gateway
+// cleans up the dialogue.
 func (p *Peer) sendAbort(
 	conn *m3ua.Conn,
 	pd *params.ProtocolDataPayload,
 	sccpReq *sccp.SccpMessage,
 	otidBytes []byte,
 ) {
-	dtid := bytesToUint32(otidBytes)
-	tx := gotcap.NewAbort(dtid, 0 /* unrecognizedTransaction */, []byte{})
-	tcapMsg := &gotcap.TCAP{Transaction: tx}
-	tcapMsg.SetLength()
-
-	tcapBytes, err := tcapMsg.MarshalBinary()
-	if err != nil {
-		p.logger.Warn("Abort encode failed", zap.Error(err))
-		return
-	}
-	p.writeSCCPResponse(conn, pd, sccpReq, tcapBytes)
+	cause := tcap.AbortUnrecognizedTransactionID
+	p.sendTCAP(conn, pd, sccpReq, &tcap.Message{
+		MessageType: tcap.MsgTypeAbort, DestinationTID: otidBytes, PAbort: true, AbortCause: &cause,
+	})
 }
 
 // writeSCCPResponse wraps a TCAP payload in SCCP UDT and writes it back
@@ -897,32 +816,6 @@ func (p *Peer) writeSCCP(conn *m3ua.Conn, pd *params.ProtocolDataPayload, resp *
 		p.logger.Warn("WritePD failed", zap.Error(err))
 		return
 	}
-}
-
-// dialogueCtxVerFromBegin parses the AARQ ApplicationContextName from the
-// inbound BEGIN and returns its last two arcs as ctx,ctxver. The peer
-// must mirror exactly the AC short-ID and version the SUT sent, otherwise
-// the AARE we emit on the END will not match any registered handler in
-// the gateway's TCAP dispatcher.
-//
-// IMPORTANT: read from DialoguePDU.ApplicationContextName.Value (the AC
-// OID, encoded as [0x06, 0x07, 4, 0, 0, 1, 0, ctx, ver]), NOT from
-// Dialogue.ObjectIdentifier (which is the Dialogue-As-ID, always
-// [0,17,134,5,1,1,1] — using it would always yield ctx=1, ver=1).
-func dialogueCtxVerFromBegin(tcapMsg *gotcap.TCAP) (uint8, uint8) {
-	const defaultCtx, defaultVer uint8 = 1, 3
-	if tcapMsg.Dialogue == nil || tcapMsg.Dialogue.DialoguePDU == nil {
-		return defaultCtx, defaultVer
-	}
-	acn := tcapMsg.Dialogue.DialoguePDU.ApplicationContextName
-	if acn == nil {
-		return defaultCtx, defaultVer
-	}
-	v := acn.Value
-	if len(v) < 2 {
-		return defaultCtx, defaultVer
-	}
-	return v[len(v)-2], v[len(v)-1]
 }
 
 func bytesToUint32(b []byte) uint32 {
@@ -1046,13 +939,6 @@ type emptyBeginDialogue struct {
 	acValue []byte
 }
 
-func applicationContextValue(tcapMsg *gotcap.TCAP) []byte {
-	if d := tcapMsg.Dialogue; d != nil && d.DialoguePDU != nil && d.DialoguePDU.ApplicationContextName != nil {
-		return d.DialoguePDU.ApplicationContextName.Value
-	}
-	return nil
-}
-
 // acceptEmptyBegin answers a BEGIN that carries the dialogue portion alone
 // with a CONTINUE whose AARE accepts the context, as an HLR or MSC does.
 func (p *Peer) acceptEmptyBegin(conn *m3ua.Conn, pd *params.ProtocolDataPayload, sccpReq *sccp.SccpMessage, otid, acValue []byte) {
@@ -1075,39 +961,30 @@ func (p *Peer) acceptEmptyBegin(conn *m3ua.Conn, pd *params.ProtocolDataPayload,
 	p.openDialogues.Store(bytesToUint32(otid), emptyBeginDialogue{peerTID: peerTID, acValue: acValue})
 	p.emptyBegins.Add(1)
 
-	ctx, ver := acValue[len(acValue)-2], acValue[len(acValue)-1]
-	msg := &gotcap.TCAP{
-		Transaction: gotcap.NewContinue(peerTID, bytesToUint32(otid), []byte{}),
-		Dialogue: gotcap.NewDialogue(gotcap.DialogueAsID, 1,
-			gotcap.NewAARE(1, ctx, ver, gotcap.Accepted, gotcap.DialogueServiceUser, gotcap.Null), nil),
-	}
-	msg.SetLength()
-	b, err := msg.MarshalBinary()
-	if err != nil {
-		p.logger.Warn("CONTINUE encode failed", zap.Error(err))
-		return
-	}
-	p.writeSCCPResponse(conn, pd, sccpReq, b)
+	p.sendTCAP(conn, pd, sccpReq, &tcap.Message{
+		MessageType: tcap.MsgTypeContinue, OriginatingTID: tidBytes(peerTID), DestinationTID: otid,
+		DialoguePortion: &tcap.DialoguePortion{ApplicationContext: &tcap.ApplicationContext{OID: acOIDOf(acValue)}},
+	})
 }
 
 // continueAfterEmptyBegin checks the gateway's second forward message: it
 // must address the peer's TID, carry the components, and no dialogue
 // portion (that was settled by the AARE). It returns the dialogue's context.
-func (p *Peer) continueAfterEmptyBegin(tcapMsg *gotcap.TCAP, otid []byte) ([]byte, bool) {
+func (p *Peer) continueAfterEmptyBegin(tcapMsg *tcap.Message, otid []byte) ([]byte, bool) {
 	v, ok := p.openDialogues.LoadAndDelete(bytesToUint32(otid))
 	if !ok {
 		p.violate("CONTINUE for a dialogue the peer never accepted (OTID % X)", otid)
 		return nil, false
 	}
 	d := v.(emptyBeginDialogue)
-	if dtid := tcapMsg.Transaction.DestTransactionID; dtid == nil || bytesToUint32(dtid.Value) != d.peerTID {
+	if bytesToUint32(tcapMsg.DestinationTID) != d.peerTID {
 		p.violate("CONTINUE does not address the peer's TID")
 		return nil, false
 	}
-	if tcapMsg.Dialogue != nil {
+	if tcapMsg.DialoguePortion != nil {
 		p.violate("second forward message carries a dialogue portion")
 	}
-	if tcapMsg.Components == nil || len(tcapMsg.Components.Component) == 0 {
+	if len(tcapMsg.Components) == 0 {
 		p.violate("CONTINUE after an empty Begin carries no components")
 		return nil, false
 	}

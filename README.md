@@ -83,6 +83,9 @@ What is planned for each of these is in the [roadmap](docs/ROADMAP.md).
   XUDT, §C.1). LUDT is not supported.
 - ANSI SCCP addresses use the ITU address-indicator layout; this is not verified against
   ANSI T1.112.
+- TCAP messages from peers must use definite lengths; the indefinite form (X.209) is not
+  understood. Operation and error codes must be local values (global OBJECT IDENTIFIER codes are
+  not used by MAP).
 - CAP: an incoming InitialDP gets no answer, and CAP origination needs pre-encoded BER. The CAP
   application context names have not been verified. INAP is not supported.
 

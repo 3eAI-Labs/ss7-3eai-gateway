@@ -35,8 +35,9 @@ go test -tags integration -count=1 -timeout 180s ./cmd/gateway/ ./internal/m3ua/
 # or: make test-e2e
 ```
 
-`ss7peer/` is the programmable peer: an M3UA listener with the gateway's own SCCP codec, TCAP via
-`wmnsk/go-tcap`, and MAP callbacks (`OnSRI`, `OnMtForwardSM`) that tests use to assert on what the
+`ss7peer/` is the programmable peer: an M3UA listener with the gateway's own SCCP, TCAP and MAP
+codecs (each also checked against hand-built frames, since a codec shared by both ends cannot show
+a defect they share), and MAP callbacks (`OnSRI`, `OnMtForwardSM`) that tests use to assert on what the
 gateway sent and to choose the answer.
 
 ## Manual helpers

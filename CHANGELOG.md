@@ -6,6 +6,37 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-10-14
+
+### Fixed
+
+- **TCAP encoding (ITU-T Q.773).** Releases 0.7.0–0.7.4 used a TCAP library whose encoding is not
+  Q.773's, so their dialogues were very unlikely to work with real SS7 equipment:
+  - **Parameter framing.** Every operation's argument was wrapped in an extra SEQUENCE (`30 L 30 L …`
+    instead of `30 L …`). On receipt, a component's parameter lost its own tag and length — for
+    SendRoutingInfoRes, the `[3]`. Q.773 carries the parameter as `ANY DEFINED BY operationCode`:
+    the argument's own value, as is.
+  - **Lengths of 128 octets or more** were written in one octet — not valid BER (Q.773 §4.1.1 asks
+    for the minimal long form). Every MT-ForwardSM with a real short message is that long.
+    Long-form lengths from peers were misread.
+
+  TCAP is now encoded and decoded here, without the library. Frames built by hand from Q.773 check
+  every message type, every component type, the dialogue PDUs (AARQ, AARE accepted or refusing a
+  context, ABRT), signed invoke IDs and long-form lengths.
+
+  The test peer used the same library, so both ends agreed and the end-to-end tests passed. The
+  peer now uses this codec, which is itself checked against the Recommendation.
+- **One outcome per request.**
+  - An END that carried no result and no error — or only the segments of a result — left the
+    caller waiting until its own deadline. It is now answered with `REMOTE_ERROR`, "dialogue
+    ended without a result".
+  - A result that arrived in a CONTINUE was followed, when the dialogue timer ran out, by a second
+    answer, `TIMEOUT`. Now each originated dialogue gives its caller exactly one outcome, and
+    anything after the first is dropped.
+- A global title, MSISDN, network node number or VLR number taken from a request may have at most
+  16 digits. A longer one could corrupt the SCCP called party address, whose length field is one
+  octet; it is now `REJECTED`.
+
 ## [0.7.4] - 2026-10-14
 
 ### Added

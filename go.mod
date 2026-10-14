@@ -35,10 +35,7 @@ require (
 	golang.org/x/crypto v0.46.0
 )
 
-require (
-	github.com/nats-io/nats-server/v2 v2.12.3
-	github.com/wmnsk/go-tcap v0.0.0-20260105100943-25327262deb6
-)
+require github.com/nats-io/nats-server/v2 v2.12.3
 
 require (
 	github.com/3eAI-Labs/ss7-3eai-gateway-client v0.2.0

@@ -62,8 +62,8 @@ func TestOriginate_Happy(t *testing.T) {
 	h, outCh := newOriginateTestHandler(t)
 	called, calling := sampleAddrs()
 
-	const opCode int32 = 45 // SRI-for-SM
-	param := []byte{0xAA, 0xBB, 0xCC}
+	const opCode int32 = 45           // SRI-for-SM
+	param := []byte{0x30, 0x01, 0xAA} // any one BER element
 	corrID := "corr-abc-123"
 
 	dlg, err := h.Originate(&ACMapV3, called, calling, opCode, param, corrID)

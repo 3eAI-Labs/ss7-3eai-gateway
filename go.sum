@@ -165,8 +165,6 @@ github.com/ugorji/go/codec v1.2.11 h1:BMaWp1Bb6fHwEtbplGBGJ498wD+LKlNSl25MjdZY4d
 github.com/ugorji/go/codec v1.2.11/go.mod h1:UNopzCgEMSXjBc6AOMqYvWC1ktqTAfzJZUZgYf6w6lg=
 github.com/wmnsk/go-m3ua v0.1.11 h1:RqFkSfP7k+olJ7vMikpvONEMVNAwuUbQDwNt45+RAgs=
 github.com/wmnsk/go-m3ua v0.1.11/go.mod h1:NFv3y4c6tHeKwyrwTu4wEQOth0tD4T+uaHb3vR/e+Hg=
-github.com/wmnsk/go-tcap v0.0.0-20260105100943-25327262deb6 h1:lElNYkYiLkChgIMu7TU9LA4V7iH0G/gQugZHwGRps+k=
-github.com/wmnsk/go-tcap v0.0.0-20260105100943-25327262deb6/go.mod h1:ArE8qJsnc40TihuiSoQGzZRh9EZYdjlQJB7j1SbgBxU=
 go.uber.org/goleak v1.2.0 h1:xqgm/S+aQvhWFTtR0XK3Jvg7z8kGV8P4X14IzwN3Eqk=
 go.uber.org/goleak v1.2.0/go.mod h1:XJYK+MuIchqpmGmUSAzotztawfKvYLUIgg7guXrwVUo=
 go.uber.org/multierr v1.10.0 h1:S0h4aNzvfcFsC3dRF1jLoaov7oRaKqRGC/pUEJ2yvPQ=

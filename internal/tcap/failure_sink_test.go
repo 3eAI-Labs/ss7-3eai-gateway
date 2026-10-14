@@ -5,11 +5,11 @@ package tcap
 
 import (
 	"context"
-	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
@@ -81,7 +81,7 @@ func TestFailureSink_DialogueTimeout(t *testing.T) {
 	const opCode int32 = 45 // SRI-for-SM
 	const corrID = "nats-corr-timeout-1"
 
-	_, err = h.Originate(&ACMapV3, called, calling, opCode, []byte{0x01}, corrID)
+	_, err = h.Originate(&ACMapV3, called, calling, opCode, []byte{0x30, 0x00}, corrID)
 	require.NoError(t, err)
 
 	// Handler's own worker drains appOutgoingCh and forwards encoded UDT to
@@ -299,7 +299,7 @@ func TestFailureSink_NotDelivered(t *testing.T) {
 	defer h.Stop(ctx)
 
 	called, calling := sampleAddrs()
-	dlg, err := h.Originate(&ACShortMsgMTRelayV3, called, calling, 44, []byte{0x01}, "nats-corr-undelivered")
+	dlg, err := h.Originate(&ACShortMsgMTRelayV3, called, calling, 44, []byte{0x30, 0x00}, "nats-corr-undelivered")
 	require.NoError(t, err)
 
 	var begin *sccp.SccpMessage
@@ -324,4 +324,59 @@ func TestFailureSink_NotDelivered(t *testing.T) {
 	// finds no waiting dialogue and does nothing.
 	h.HandleDeliveryFailure(begin, "again")
 	assert.Len(t, rec.snapshot(), 1)
+}
+
+func startOutcomeHandler(t *testing.T) (*Handler, chan *sccp.SccpMessage, *recordingSink) {
+	t.Helper()
+	logger := zaptest.NewLogger(t)
+	sccpIn, sccpOut := stubChannels()
+	h, err := NewHandler(&Config{
+		NodeID: 1, DialogueTimeout: 150 * time.Millisecond, InvokeTimeout: 150 * time.Millisecond,
+		IdleTimeout: 5 * time.Second, MaxDialogues: 100, MaxComponentsPerMessage: 10,
+		MaxInvokesPerDialogue: 20, ChannelBufferSize: 100, WorkerPoolSize: 1,
+		TimerResolution: 50 * time.Millisecond,
+	}, sccpIn, sccpOut, NewDispatcher(logger), logger)
+	require.NoError(t, err)
+	rec := &recordingSink{}
+	h.SetFailureSink(rec.fn())
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, h.Start(ctx))
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		_ = h.Stop(stopCtx)
+		cancel()
+	})
+	return h, sccpIn, rec
+}
+
+// An END that answers nothing still gives the originator an outcome.
+func TestFailureSink_EndWithoutResult(t *testing.T) {
+	h, in, rec := startOutcomeHandler(t)
+	called, calling := sampleAddrs()
+	dlg, err := h.Originate(&ACMapV3, called, calling, 45, []byte{0x30, 0x00}, "corr-empty-end")
+	require.NoError(t, err)
+	wire, err := EncodeMessage(&Message{MessageType: MsgTypeEnd, DestinationTID: h.encodeTID(dlg.LocalTID)})
+	require.NoError(t, err)
+	in <- &sccp.SccpMessage{MessageType: sccp.MsgTypeUDT, Data: wire, CalledAddress: calling, CallingAddress: called}
+
+	require.Eventually(t, func() bool { return len(rec.snapshot()) == 1 }, time.Second, 10*time.Millisecond)
+	assert.Equal(t, FailureRemoteError, rec.snapshot()[0].reason)
+	assert.Contains(t, rec.snapshot()[0].detail, "without a result")
+	time.Sleep(300 * time.Millisecond) // past DialogueTimeout: no second outcome
+	assert.Len(t, rec.snapshot(), 1)
+}
+
+// A dialogue whose originator already has its outcome — a result that came
+// in a CONTINUE — is not reported again when its timer runs out.
+func TestFailureSink_NoTimeoutAfterOutcome(t *testing.T) {
+	h, _, rec := startOutcomeHandler(t)
+	called, calling := sampleAddrs()
+	dlg, err := h.Originate(&ACMapV3, called, calling, 45, []byte{0x30, 0x00}, "corr-answered")
+	require.NoError(t, err)
+	require.True(t, dlg.MarkAnswered(), "as the MAP layer does on publishing the result")
+
+	require.Eventually(t, func() bool { return h.getDialogueCount() == 0 }, 2*time.Second, 25*time.Millisecond,
+		"the dialogue still times out")
+	assert.Empty(t, rec.snapshot(), "but its originator hears nothing more")
 }

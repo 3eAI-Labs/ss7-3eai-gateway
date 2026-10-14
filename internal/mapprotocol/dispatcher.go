@@ -84,7 +84,7 @@ func (h *Handler) HandleTCAPMessage(dialogue *tcap.Dialogue, msg *tcap.Message) 
 // originated to the error sink. Dialogues opened by a peer carry no NATS
 // correlation ID and have no waiter to tell.
 func (h *Handler) reportRemoteError(dialogue *tcap.Dialogue, code ErrorCode, detail string) {
-	if h.errorSink == nil || dialogue == nil || dialogue.NATSCorrelationID == "" {
+	if h.errorSink == nil || dialogue == nil || dialogue.NATSCorrelationID == "" || !dialogue.MarkAnswered() {
 		return
 	}
 	h.errorSink(dialogue.NATSCorrelationID, OperationCode(dialogue.OriginatingOpCode), code, detail)
@@ -177,6 +177,12 @@ func (h *Handler) handleReturnResult(dialogue *tcap.Dialogue, comp *tcap.Compone
 	}
 	if h.responseSink == nil || resp == nil {
 		// No sink wired (test mode) or no decoder for this op — drop silently.
+		return
+	}
+	if !dialogue.MarkAnswered() {
+		// A second result, or one after the caller was told of a failure.
+		h.logger.Debug("MAP ReturnResult after the outcome was given; dropped",
+			zap.Uint32("tid", tid), zap.String("nats_correlation_id", corrID))
 		return
 	}
 	if err := h.responseSink(corrID, op, resp); err != nil {

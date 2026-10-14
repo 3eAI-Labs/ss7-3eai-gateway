@@ -16,3 +16,24 @@ func stubChannels() (chan *sccp.SccpMessage, chan *sccp.SccpMessage) {
 	out := make(chan *sccp.SccpMessage, 16)
 	return in, out
 }
+
+// Messages a peer would send, for tests that need them on the wire.
+func tid32(v uint32) []byte { return []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)} }
+
+func beginInvoke(otid uint32, invID, op int, param []byte) *Message {
+	id, code := int32(invID), int32(op)
+	return &Message{MessageType: MsgTypeBegin, OriginatingTID: tid32(otid),
+		Components: []*Component{{Type: CompTypeInvoke, InvokeID: &id, OperationCode: &code, Parameter: param}}}
+}
+
+func endReturnResult(dtid uint32, invID, op int, param []byte) *Message {
+	id, code := int32(invID), int32(op)
+	return &Message{MessageType: MsgTypeEnd, DestinationTID: tid32(dtid),
+		Components: []*Component{{Type: CompTypeReturnResult, InvokeID: &id, OperationCode: &code, Parameter: param}}}
+}
+
+func continueInvoke(otid, dtid uint32, invID, op int, param []byte) *Message {
+	m := beginInvoke(otid, invID, op, param)
+	m.MessageType, m.DestinationTID = MsgTypeContinue, tid32(dtid)
+	return m
+}

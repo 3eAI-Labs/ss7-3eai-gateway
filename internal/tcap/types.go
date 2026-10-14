@@ -196,11 +196,14 @@ type VersionFallback func(refused []int, logicalOp int32, proposed []int) (ac *A
 type Component struct {
 	Type          ComponentType
 	InvokeID      *int32 // Invoke ID (nil for some component types)
-	LinkedID      *int32 // Linked ID (for ReturnResult)
+	LinkedID      *int32 // Linked ID (Invoke only)
 	OperationCode *int32 // Operation code (for Invoke)
 	Parameter     []byte // ASN.1 encoded parameters
 	ProblemCode   *ProblemCode
 	ErrorCode     *int32
+	// NotLast marks a ReturnResult sent as Return Result Not Last: one
+	// segment of a result that a Return Result Last completes.
+	NotLast bool
 }
 
 // DialoguePortion represents TCAP dialogue portion
@@ -211,10 +214,29 @@ type Component struct {
 // with "application-context-name-not-supported" when Rejected is set.
 type DialoguePortion struct {
 	ApplicationContext *ApplicationContext
-	UserInformation    []byte
-	ProtocolVersion    uint8
-	Rejected           bool
+	// UserInformation is the content of user-information [30]: the
+	// EXTERNALs, encoded, without the [30] tag and length.
+	UserInformation []byte
+	// Rejected: an AARE with result reject-permanent (received), or the
+	// AARE to send refuses the context (application-context-name-not-
+	// supported).
+	Rejected bool
+	// PDU is the dialogue PDU received (AARQ, AARE, ABRT); ignored when
+	// encoding, where the message type decides.
+	PDU DialoguePDUType
+	// AbortSourceProvider: an ABRT from the dialogue service provider
+	// rather than the user.
+	AbortSourceProvider bool
 }
+
+// DialoguePDUType is the [APPLICATION n] tag of a dialogue PDU (Q.773 §3.2.1).
+type DialoguePDUType uint8
+
+const (
+	DialoguePDUAARQ DialoguePDUType = 0
+	DialoguePDUAARE DialoguePDUType = 1
+	DialoguePDUABRT DialoguePDUType = 4
+)
 
 // Message represents a TCAP message
 type Message struct {
@@ -251,8 +273,9 @@ type Dialogue struct {
 	// Origination context — set when the gateway opens the dialogue (vs
 	// receives a BEGIN). NATSCorrelationID lets the response path republish
 	// the answer onto the originating NATS request. OriginatingOpCode lets
-	// the application dispatcher pick the right ReturnResult decoder, since
-	// MAP ReturnResult components do not echo the op code on the wire.
+	// the application dispatcher pick the right ReturnResult decoder: a
+	// ReturnResult without a result carries no op code, and the op that was
+	// asked for, not the one echoed, decides how the answer is read.
 	NATSCorrelationID string
 	OriginatingOpCode int32
 
@@ -285,6 +308,11 @@ type Dialogue struct {
 	// retry of a refused one; it is not retried again.
 	versionFallbackUsed bool
 
+	// answered is set once the originator of the dialogue has been given
+	// its outcome — a result, an error, or a failure — so that it is given
+	// exactly one (see MarkAnswered).
+	answered atomic.Bool
+
 	// Pending operations
 	PendingInvokes map[int32]*PendingInvoke
 	invokesMu      sync.RWMutex
@@ -294,6 +322,15 @@ type Dialogue struct {
 	MessagesSent       atomic.Uint64
 	ComponentsReceived atomic.Uint64
 	ComponentsSent     atomic.Uint64
+}
+
+// MarkAnswered records that the dialogue's originator has been given its
+// outcome. It reports true to the first caller only: whoever gets true
+// publishes the outcome, anyone after drops theirs. A result that arrives
+// in a CONTINUE is therefore not followed by a timeout, nor an error by a
+// failure.
+func (d *Dialogue) MarkAnswered() bool {
+	return d.answered.CompareAndSwap(false, true)
 }
 
 // DialogueState represents the state of a TCAP dialogue

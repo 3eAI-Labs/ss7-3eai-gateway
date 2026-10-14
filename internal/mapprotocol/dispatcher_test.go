@@ -244,10 +244,8 @@ func endWith(comp *tcap.Component) *tcap.Message {
 func TestMap_ErrorSink_OriginatedDialogue(t *testing.T) {
 	invID := int32(1)
 	absent := int32(mapprotocol.ErrAbsentSubscriberSM)
-	originated := &tcap.Dialogue{
-		LocalTID:          7,
-		NATSCorrelationID: "corr-1",
-		OriginatingOpCode: int32(mapprotocol.OpMtForwardSM),
+	originated := func() *tcap.Dialogue {
+		return &tcap.Dialogue{LocalTID: 7, NATSCorrelationID: "corr-1", OriginatingOpCode: int32(mapprotocol.OpMtForwardSM)}
 	}
 
 	cases := []struct {
@@ -279,13 +277,40 @@ func TestMap_ErrorSink_OriginatedDialogue(t *testing.T) {
 			h.SetErrorSink(func(corrID string, op mapprotocol.OperationCode, code mapprotocol.ErrorCode, detail string) {
 				got = append(got, sinkCall{corrID, op, code, detail})
 			})
-			if err := h.HandleTCAPMessage(originated, endWith(c.comp)); err != nil {
+			if err := h.HandleTCAPMessage(originated(), endWith(c.comp)); err != nil {
 				t.Fatalf("HandleTCAPMessage: %v", err)
 			}
 			if len(got) != 1 || got[0] != c.want {
 				t.Fatalf("sink calls = %+v, want [%+v]", got, c.want)
 			}
 		})
+	}
+}
+
+// One outcome per originated dialogue: whatever arrives after the first —
+// a second result, an error after a result — is dropped.
+func TestMap_OneOutcomePerDialogue(t *testing.T) {
+	h := newTestHandler(t)
+	var results, errs int
+	h.SetResponseSink(func(string, mapprotocol.OperationCode, any) error { results++; return nil })
+	h.SetErrorSink(func(string, mapprotocol.OperationCode, mapprotocol.ErrorCode, string) { errs++ })
+	invID := int32(1)
+	absent := int32(mapprotocol.ErrAbsentSubscriberSM)
+	dlg := &tcap.Dialogue{LocalTID: 8, NATSCorrelationID: "c", OriginatingOpCode: int32(mapprotocol.OpMtForwardSM)}
+	for _, c := range []*tcap.Component{
+		{Type: tcap.CompTypeReturnResult, InvokeID: &invID},
+		{Type: tcap.CompTypeReturnResult, InvokeID: &invID},
+		{Type: tcap.CompTypeReturnError, InvokeID: &invID, ErrorCode: &absent},
+	} {
+		if err := h.HandleTCAPMessage(dlg, &tcap.Message{MessageType: tcap.MsgTypeContinue, Components: []*tcap.Component{c}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if results != 1 || errs != 0 {
+		t.Fatalf("results %d, errors %d; want 1 and 0", results, errs)
+	}
+	if dlg.MarkAnswered() {
+		t.Fatal("the dialogue was not marked answered")
 	}
 }
 
