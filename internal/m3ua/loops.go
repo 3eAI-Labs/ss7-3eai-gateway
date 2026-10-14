@@ -199,6 +199,9 @@ func (h *Handler) writeLoop(ctx context.Context) {
 		case mtp3Msg := <-h.outgoingCh:
 			if err := h.sendMTP3(mtp3Msg); err != nil {
 				h.logger.Error("Failed to send MTP3", zap.Error(err))
+				if h.onSendFailure != nil {
+					h.onSendFailure(mtp3Msg, err)
+				}
 				h.metrics.Errors.Add(1)
 
 				// Send error to error channel (non-blocking)

@@ -155,6 +155,7 @@ func (h *Handler) worker(ctx context.Context, id int) {
 				h.logger.Error("Failed to forward TCAP outgoing message",
 					zap.Error(err))
 				h.metrics.Errors.Add(1)
+				h.reportNotDelivered(outMsg, "not sent: "+err.Error())
 			}
 		}
 	}
@@ -187,13 +188,12 @@ func (h *Handler) handleIncomingMessage(mtp3Msg *m3ua.MTP3Message) {
 		zap.Int("data_len", len(sccpMsg.Data)))
 
 	if sccpMsg.MessageType == MsgTypeUDTS {
-		// One of our messages could not be delivered. The dialogue it
-		// belonged to ends on its TCAP timer; the cause is what an operator
-		// needs to see (typically a missing translation at the STP).
+		// One of our messages could not be delivered; the UDTS returns it.
 		h.metrics.Errors.Add(1)
 		h.logger.Warn("SCCP UDTS: a message from this node was not delivered",
-			zap.Uint8("return_cause", uint8(sccpMsg.ReturnCause)),
+			zap.Stringer("return_cause", sccpMsg.ReturnCause),
 			zap.Uint32("from_pc", mtp3Msg.OPC))
+		h.reportNotDelivered(sccpMsg, "returned by the network: UDTS "+sccpMsg.ReturnCause.String())
 		return
 	}
 
@@ -221,6 +221,57 @@ func (h *Handler) handleIncomingMessage(mtp3Msg *m3ua.MTP3Message) {
 		}
 		h.sendUDTS(sccpMsg, cause, mtp3Msg.OPC)
 	}
+}
+
+// MaxUserData is how many octets of user data (TCAP) one UDT can carry
+// between two addresses on a network whose links may be narrowband: the
+// whole SCCP message must fit an MTP3 signalling information field of 272
+// octets less the routing label (4 octets ITU, 7 ANSI; Q.703/Q.704), and the
+// data parameter itself holds at most 255. A GT-routed called address may
+// grow by a point code in a final translation, which is reserved for.
+func (h *Handler) MaxUserData(called, calling *SccpAddress) int {
+	const sif = 272
+	label := 4
+	if h.config.NetworkVariant == VariantANSI {
+		label = 7
+	}
+	overhead := 1 + 1 + 3 + 1 // message type, protocol class, three pointers, data length
+	overhead += len(encodeAddress(called, h.config.NetworkVariant))
+	overhead += len(encodeAddress(calling, h.config.NetworkVariant))
+	if called != nil && called.AddressIndicator.RoutesOnGT() {
+		overhead += h.config.NetworkVariant.PCWidth()
+	}
+	if n := sif - label - overhead; n < maxUnitdataData {
+		return n
+	}
+	return maxUnitdataData
+}
+
+// SetDeliveryFailureSink registers the callback told about a message this
+// node sent that will not reach its destination: SCCP found no route, M3UA
+// could not send it, or the network returned it in a UDTS. msg.Data is the
+// user data as sent (for TCAP, our own message). Set before Start.
+func (h *Handler) SetDeliveryFailureSink(sink func(msg *SccpMessage, reason string)) {
+	h.deliveryFailureSink = sink
+}
+
+func (h *Handler) reportNotDelivered(msg *SccpMessage, reason string) {
+	if h.deliveryFailureSink != nil && msg != nil && len(msg.Data) > 0 {
+		h.deliveryFailureSink(msg, reason)
+	}
+}
+
+// HandleMTP3SendFailure is M3UA's send-failure callback: the SCCP message
+// inside could not be written to the SGW.
+func (h *Handler) HandleMTP3SendFailure(mtp3Msg *m3ua.MTP3Message, err error) {
+	if mtp3Msg == nil {
+		return
+	}
+	msg, perr := ParseSCCP(mtp3Msg.PayloadData, h.config.NetworkVariant)
+	if perr != nil || msg.MessageType == MsgTypeUDTS {
+		return
+	}
+	h.reportNotDelivered(msg, "not sent: "+err.Error())
 }
 
 // addressedToUs reports whether an inbound called address names this node:

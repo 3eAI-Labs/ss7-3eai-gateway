@@ -4,6 +4,7 @@
 package sccp
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -139,6 +140,28 @@ const (
 	CauseSCCPFailure             ReturnCause = 11
 	CauseHopCounterViolation     ReturnCause = 12
 )
+
+func (c ReturnCause) String() string {
+	names := [...]string{
+		"no translation for an address of such nature",
+		"no translation for this specific address",
+		"subsystem congestion",
+		"subsystem failure",
+		"unequipped user",
+		"MTP failure",
+		"network congestion",
+		"unqualified",
+		"error in message transport",
+		"error in local processing",
+		"destination cannot perform reassembly",
+		"SCCP failure",
+		"hop counter violation",
+	}
+	if int(c) < len(names) {
+		return fmt.Sprintf("cause %d (%s)", uint8(c), names[c])
+	}
+	return fmt.Sprintf("cause %d", uint8(c))
+}
 
 // ProtocolClass represents SCCP protocol class
 type ProtocolClass uint8
@@ -302,6 +325,9 @@ type Handler struct {
 	// Subsystem status
 	subsystems map[SubsystemNumber]*SubsystemStatus
 	ssnMu      sync.RWMutex
+
+	// deliveryFailureSink: see SetDeliveryFailureSink.
+	deliveryFailureSink func(msg *SccpMessage, reason string)
 
 	// slsCounter rotates the SLS of protocol class 0 messages.
 	slsCounter atomic.Uint32

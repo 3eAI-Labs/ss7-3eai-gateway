@@ -4,6 +4,7 @@
 package sccp
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -220,4 +221,81 @@ func TestValidateGTTRule(t *testing.T) {
 		assert.Error(t, validateGTTRule(bad, VariantITU), "%+v", bad)
 	}
 	assert.NoError(t, validateGTTRule(GTTRuleConfig{Pattern: "*", PointCode: 0x4000}, VariantANSI))
+}
+
+type notDelivered struct {
+	msg    *SccpMessage
+	reason string
+}
+
+func captureNotDelivered(r *routingRig) chan notDelivered {
+	ch := make(chan notDelivered, 4)
+	r.h.SetDeliveryFailureSink(func(m *SccpMessage, reason string) { ch <- notDelivered{m, reason} })
+	return ch
+}
+
+func expectNotDelivered(t *testing.T, ch chan notDelivered) notDelivered {
+	t.Helper()
+	select {
+	case n := <-ch:
+		return n
+	case <-time.After(time.Second):
+		t.Fatal("delivery failure not reported")
+		return notDelivered{}
+	}
+}
+
+// What SCCP cannot deliver is reported with the user data as sent, so TCAP
+// can end the dialogue now instead of on its timer.
+func TestNotDelivered_NoRoute(t *testing.T) {
+	r := newRoutingRig(t, true, GTTRuleConfig{Pattern: "44*", PointCode: stpPC})
+	ch := captureNotDelivered(r)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, r.h.Start(ctx))
+
+	r.h.TcapOutgoingChannel() <- udt(gtAddr("905304445566", SSNMSC), ourAddr())
+	n := expectNotDelivered(t, ch)
+	assert.Equal(t, []byte{0x62, 0x00}, n.msg.Data)
+	assert.Contains(t, n.reason, "no route to destination")
+}
+
+func TestNotDelivered_UDTSReturned(t *testing.T) {
+	r := newRoutingRig(t, true)
+	ch := captureNotDelivered(r)
+	payload, err := EncodeSCCP(&SccpMessage{
+		MessageType: MsgTypeUDTS, ReturnCause: CauseNoTranslationForAddress,
+		CalledAddress: ourAddr(), CallingAddress: gtAddr("905304445566", SSNMSC), Data: []byte{0x62, 0x01},
+	}, VariantITU)
+	require.NoError(t, err)
+	r.h.handleIncomingMessage(&m3ua.MTP3Message{OPC: stpPC, DPC: ourPC, SI: 3, PayloadData: payload})
+
+	n := expectNotDelivered(t, ch)
+	assert.Equal(t, []byte{0x62, 0x01}, n.msg.Data, "the UDTS returns our own message")
+	assert.Contains(t, n.reason, "UDTS cause 1 (no translation for this specific address)")
+}
+
+func TestNotDelivered_MTP3SendFailure(t *testing.T) {
+	r := newRoutingRig(t, true)
+	ch := captureNotDelivered(r)
+	payload, err := EncodeSCCP(udt(gtAddr("905304445566", SSNMSC), ourAddr()), VariantITU)
+	require.NoError(t, err)
+	r.h.HandleMTP3SendFailure(&m3ua.MTP3Message{OPC: ourPC, DPC: stpPC, SI: 3, PayloadData: payload}, m3ua.ErrNotActive)
+
+	n := expectNotDelivered(t, ch)
+	assert.Contains(t, n.reason, "not sent")
+	assert.Equal(t, []byte{0x62, 0x00}, n.msg.Data)
+}
+
+// One UDT must fit an MTP3 signalling information field (272 octets less the
+// routing label) and its data parameter (255).
+func TestMaxUserData(t *testing.T) {
+	itu := newRoutingRig(t, true)
+	pcOnly := &SccpAddress{AddressIndicator: AIPCPresent | AISSNPresent | AIRouteOnSSN, PointCode: 2, SubsystemNumber: SSNHLR}
+	// 272 - 4 - (6 + 5 + 5) = 252
+	assert.Equal(t, 252, itu.h.MaxUserData(pcOnly, pcOnly))
+	// GT-routed called address: length + AI + SSN + GT (TT, NP/ES, NAI + 6
+	// digit octets) = 12, plus 2 reserved for a point code a final
+	// translation may add; calling address with PC: 14. 272 - 4 - (6+12+2+14).
+	assert.Equal(t, 234, itu.h.MaxUserData(gtAddr("905304445566", SSNMSC), ourAddr()))
 }

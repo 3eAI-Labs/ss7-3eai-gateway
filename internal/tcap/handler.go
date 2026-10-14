@@ -20,6 +20,7 @@ var (
 	ErrInvalidMessage       = errors.New("TCAP: invalid message")
 	ErrDialogueNotFound     = errors.New("TCAP: dialogue not found")
 	ErrDialogueLimitReached = errors.New("TCAP: max dialogues reached")
+	ErrMessageTooLong       = errors.New("TCAP: message too long for one SCCP unitdata")
 	ErrInvokeNotFound       = errors.New("TCAP: invoke not found")
 	ErrInvalidTID           = errors.New("TCAP: invalid transaction ID")
 	ErrDialogueExpired      = errors.New("TCAP: dialogue expired")
@@ -238,6 +239,11 @@ func (h *Handler) Originate(
 		Dialogue: dialogue,
 	}
 
+	if err := h.deferComponentsIfTooLong(dialogue, beginMsg); err != nil {
+		h.removeDialogue(localTID)
+		return nil, err
+	}
+
 	select {
 	case h.appOutgoingCh <- beginMsg:
 		h.logger.Info("TCAP dialogue originated",
@@ -364,6 +370,33 @@ func (h *Handler) handleBegin(sccpCtx *sccp.SccpMessage, msg *Message) {
 		zap.Uint32("local_tid", localTID),
 		zap.String("remote_tid", hex.EncodeToString(msg.OriginatingTID)))
 
+	// An empty Begin (TS 29.002 §C.2.1): the peer opens the dialogue with
+	// the AARQ alone and will send its components in a CONTINUE once we
+	// accept. A context we implement is accepted with a CONTINUE carrying
+	// the AARE; anything else goes through dispatch, which refuses it.
+	if len(msg.Components) == 0 && appCtx != nil && h.dispatcher.LookupHandler(appCtx.OID) != nil {
+		// An accepted empty Begin holds state for a peer that has sent no
+		// operation yet: bound how many may wait, and how long. The
+		// continuation follows our CONTINUE after one round trip.
+		if h.pendingEmptyBegins.Load() >= int64(max(1, h.config.MaxDialogues/10)) {
+			h.logger.Warn("Too many dialogues waiting after an empty Begin, refusing")
+			h.removeDialogue(localTID)
+			h.sendAbort(sccpCtx, msg, AbortResourceLimitation, true)
+			return
+		}
+		dialogue.awaitingContinuation.Store(true)
+		h.pendingEmptyBegins.Add(1)
+		dialogue.ExpiresAt = time.Now().Add(min(h.config.DialogueTimeout, emptyBeginWait))
+
+		h.handleOutgoingMessage(&Message{
+			MessageType:    MsgTypeContinue,
+			OriginatingTID: h.encodeTID(localTID),
+			DestinationTID: msg.OriginatingTID,
+			Dialogue:       dialogue,
+		})
+		return
+	}
+
 	h.processComponents(dialogue, msg.Components)
 
 	if h.dispatchToApplication(sccpCtx, dialogue, msg) {
@@ -399,6 +432,11 @@ func (h *Handler) handleContinue(sccpCtx *sccp.SccpMessage, msg *Message) {
 	h.logger.Debug("Updated dialogue",
 		zap.Uint32("local_tid", localTID),
 		zap.String("remote_tid", hex.EncodeToString(dialogue.RemoteTID)))
+
+	if dialogue.awaitingContinuation.Swap(false) {
+		h.pendingEmptyBegins.Add(-1)
+	}
+	h.sendDeferredComponents(dialogue)
 
 	h.processComponents(dialogue, msg.Components)
 
@@ -534,6 +572,14 @@ func (h *Handler) handleOutgoingMessage(msg *Message) {
 		return
 	}
 	h.updateOutgoingMetrics(msg)
+
+	// Sending END or ABORT terminates the dialogue at our end (Q.774):
+	// nothing more can arrive for it, so its state goes now rather than at
+	// its timer — otherwise every answered dialogue would stay counted
+	// against MaxDialogues for DialogueTimeout.
+	if dlg != nil && (msg.MessageType == MsgTypeEnd || msg.MessageType == MsgTypeAbort) {
+		h.removeDialogue(dlg.LocalTID)
+	}
 }
 
 // lookupDialogueForOutgoing locates the dialogue an outbound TCAP message
@@ -703,6 +749,105 @@ func pinApplicationContext(dialogue *Dialogue, msg *Message) {
 	msg.DialoguePortion.ApplicationContext = dialogue.ApplicationContext
 }
 
+// HandleDeliveryFailure is SCCP's delivery-failure sink. msg.Data is a TCAP
+// message this node sent; if it opened or continued a dialogue that is
+// still waiting (our TID is its OTID), the dialogue is ended now and the
+// caller told why, instead of waiting out tcap.dialogue_timeout.
+func (h *Handler) HandleDeliveryFailure(msg *sccp.SccpMessage, reason string) {
+	sent, err := h.parseTCAPMessage(msg.Data)
+	if err != nil || len(sent.OriginatingTID) < 4 {
+		return // END/ABORT we sent: no dialogue of ours is waiting
+	}
+	localTID := h.decodeTID(sent.OriginatingTID)
+	dialogue := h.getDialogue(localTID)
+	if dialogue == nil {
+		return
+	}
+	corrID := dialogue.NATSCorrelationID
+	opCode := dialogue.OriginatingOpCode
+	h.removeDialogue(localTID)
+	h.metrics.Errors.Add(1)
+	h.logger.Warn("Dialogue ended: message not delivered",
+		zap.Uint32("local_tid", localTID), zap.String("reason", reason))
+
+	if h.failureSink != nil && corrID != "" {
+		h.failureSink(corrID, opCode, FailureNotDelivered, reason)
+	}
+}
+
+// SetUserDataLimit tells TCAP how much data one SCCP unitdata can carry
+// between two addresses (sccp.Handler.MaxUserData). Set before Start.
+func (h *Handler) SetUserDataLimit(limit func(called, calling *sccp.SccpAddress) int) {
+	h.maxUserData = limit
+}
+
+// deferComponentsIfTooLong turns a BEGIN that would not fit one SCCP
+// unitdata into an "empty Begin" (TS 29.002 §C.2.1): it keeps the dialogue
+// portion and holds the components back for the first CONTINUE. This is the
+// TCAP-level mechanism 3GPP provides for long MAP messages; SCCP
+// segmentation (XUDT) is not used because not every transit node carries
+// XUDT (§C.1). It fails if even the CONTINUE could not carry them.
+func (h *Handler) deferComponentsIfTooLong(dialogue *Dialogue, begin *Message) error {
+	limit := maxUnitdataData
+	if h.maxUserData != nil {
+		limit = h.maxUserData(dialogue.RemoteAddress, dialogue.LocalAddress)
+	}
+	whole, err := h.encodeTCAPMessage(begin)
+	if err != nil {
+		return err
+	}
+	if len(whole) <= limit {
+		return nil
+	}
+	cont, err := h.encodeTCAPMessage(&Message{
+		MessageType:    MsgTypeContinue,
+		OriginatingTID: begin.OriginatingTID,
+		DestinationTID: []byte{0, 0, 0, 0},
+		Components:     begin.Components,
+	})
+	if err != nil {
+		return err
+	}
+	if len(cont) > limit {
+		return fmt.Errorf("%w: %d octets of components, one SCCP unitdata carries %d", ErrMessageTooLong, len(cont), limit)
+	}
+	dialogue.invokesMu.Lock()
+	dialogue.deferredComponents = begin.Components
+	dialogue.invokesMu.Unlock()
+	begin.Components = nil
+	h.logger.Info("Message too long for one unitdata: opening with an empty Begin",
+		zap.Uint32("local_tid", dialogue.LocalTID), zap.Int("octets", len(whole)), zap.Int("limit", limit))
+	return nil
+}
+
+// sendDeferredComponents sends what an empty Begin held back, in the first
+// CONTINUE after the peer accepted the dialogue.
+func (h *Handler) sendDeferredComponents(dialogue *Dialogue) {
+	dialogue.invokesMu.Lock()
+	comps := dialogue.deferredComponents
+	dialogue.deferredComponents = nil
+	dialogue.invokesMu.Unlock()
+	if len(comps) == 0 {
+		return
+	}
+	dialogue.State = StateActive
+	h.handleOutgoingMessage(&Message{
+		MessageType:    MsgTypeContinue,
+		OriginatingTID: h.encodeTID(dialogue.LocalTID),
+		DestinationTID: dialogue.RemoteTID,
+		Components:     comps,
+		Dialogue:       dialogue,
+	})
+}
+
+// emptyBeginWait bounds how long a dialogue opened by a peer's empty Begin
+// waits for the peer's CONTINUE (one round trip after ours).
+const emptyBeginWait = 5 * time.Second
+
+// maxUnitdataData is the most user data one SCCP UDT can carry (the data
+// parameter's length indicator is one octet, Q.713 §4.10).
+const maxUnitdataData = 255
+
 // answerDialogueRequest attaches the AARE that the first END or CONTINUE of a
 // dialogue opened by the peer must carry (Q.773 §4.2.1): the accepted
 // application context, echoed. Later messages carry no dialogue portion.
@@ -820,9 +965,12 @@ func (h *Handler) removeDialogue(localTID uint32) {
 	h.dialoguesMu.Lock()
 	defer h.dialoguesMu.Unlock()
 
-	if _, exists := h.dialogues[localTID]; exists {
+	if dlg, exists := h.dialogues[localTID]; exists {
 		delete(h.dialogues, localTID)
 		h.metrics.ActiveDialogues.Add(-1)
+		if dlg.awaitingContinuation.Swap(false) {
+			h.pendingEmptyBegins.Add(-1)
+		}
 	}
 }
 

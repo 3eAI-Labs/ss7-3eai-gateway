@@ -100,6 +100,8 @@ func TestE2E_SRIForSM_RoundTrip(t *testing.T) {
 			// HLR can route the response back via GT (HA-friendly path).
 			require.Equal(t, e2eTestOwnGT, callingGT,
 				"CgPA GT must equal sccp.local_global_title.address — own-GT regression")
+			// map.sri_routing default "msisdn": the subscriber is the called GT.
+			require.Equal(t, e2eTestMSISDN, calledGT, "SRI-for-SM must be addressed to the MSISDN")
 			return &mapprotocol.SendRoutingInfoForSMResponse{
 				IMSI: mapprotocol.IMSI(e2eTestIMSI),
 				LocationInfoWithLMSI: mapprotocol.LocationInfoWithLMSI{
@@ -543,6 +545,155 @@ func TestE2E_ContextRefused(t *testing.T) {
 	require.Equal(t, ss7client.StatusAborted, gwErr.Status)
 	require.Contains(t, gwErr.Message, "application context refused")
 	require.Contains(t, gwErr.Message, "0.4.0.0.1.0.20.2", "the version the peer proposes")
+}
+
+// TestE2E_NotDelivered: what never reaches the peer is reported at once —
+// ABORTED with the reason — instead of after tcap.dialogue_timeout.
+//   - SRI-for-SM reaches the "network", which returns it in a UDTS
+//     (subsystem failure).
+//   - MT-ForwardSM, addressed to a GT no sccp.gtt_rules entry covers, has
+//     no route and is never sent.
+func TestE2E_NotDelivered(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+
+	natsServer := startEmbeddedNATS(t)
+	defer natsServer.Shutdown()
+
+	peer, err := ss7peer.Start(context.Background(), ss7peer.Config{
+		SCTPAddr:         allocLoopbackSCTPPort(t),
+		PointCode:        e2ePeerPC,
+		GatewayPointCode: e2eGatewayPC,
+		NetworkIndicator: e2eNetworkIndicator,
+		NetworkVariant:   sccp.VariantANSI,
+		Logger:           logger.Named("peer"),
+		ReturnUDTS:       true,
+		UDTSCause:        sccp.CauseSubsystemFailure,
+		OnSRI: func(*mapprotocol.SendRoutingInfoForSMRequest, string, string, uint32) (*mapprotocol.SendRoutingInfoForSMResponse, error) {
+			t.Error("a returned message must not reach the operation")
+			return nil, nil
+		},
+	})
+	require.NoError(t, err, "start ss7peer")
+	t.Cleanup(func() { require.Empty(t, peer.Violations(), "ss7peer conformance violations") })
+	defer peer.Stop()
+
+	cfg := buildE2EConfig(t, peer.SCTPAddr(), natsServer.ClientURL())
+	// Only UK numbers are routable: the Turkish VMSC GT of the MT request is not.
+	// SRI goes to the configured HLR point code (routed on SSN), so it reaches
+	// the peer, which returns it.
+	cfg.Set("sccp.gtt_rules", []map[string]any{{"pattern": "44*", "point_code": int(e2ePeerPC)}})
+	cfg.Set("map.sri_routing", "hlr")
+	handlers, err := initializeHandlers(cfg, logger.Named("gw"))
+	require.NoError(t, err, "initializeHandlers")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, startServices(ctx, handlers, logger.Named("gw")), "startServices")
+	require.NoError(t, handlers.M3UA.WaitForActive(10*time.Second), "M3UA association")
+	t.Cleanup(func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		_ = stopServices(shutdownCtx, handlers, logger.Named("gw"))
+	})
+
+	nc, err := nats.Connect(natsServer.ClientURL(), nats.Name("e2e-not-delivered"))
+	require.NoError(t, err)
+	defer nc.Close()
+	client, err := ss7client.New(nc)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Well under tcap.dialogue_timeout (10s): a timeout cannot pass this test.
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer reqCancel()
+
+	_, err = client.SendRoutingInfoForSM(reqCtx, ss7client.SRIRequest{
+		MSISDN:               e2eTestMSISDN,
+		ServiceCentreAddress: ss7client.E164(e2eTestSCA),
+	})
+	var gwErr *ss7client.GatewayError
+	require.ErrorAs(t, err, &gwErr)
+	require.Equal(t, ss7client.StatusAborted, gwErr.Status)
+	require.Contains(t, gwErr.Message, "UDTS cause 3 (subsystem failure)")
+
+	_, err = client.MTForwardSM(reqCtx, ss7client.MTRequest{
+		IMSI:                 e2eTestIMSI,
+		NetworkNodeNumber:    ss7client.E164(e2eTestVMSC),
+		ServiceCentreAddress: ss7client.E164(e2eTestSCA),
+		TPDU:                 e2eFakeTPDU,
+	})
+	require.ErrorAs(t, err, &gwErr)
+	require.Equal(t, ss7client.StatusAborted, gwErr.Status)
+	require.Contains(t, gwErr.Message, "no route to destination")
+}
+
+// TestE2E_LongMT_EmptyBegin: a full-length SMS-DELIVER (164 octets) makes
+// MT-ForwardSM too long for one SCCP unitdata. The gateway opens the dialogue
+// with an empty Begin (dialogue portion only), and sends the component in a
+// CONTINUE once the peer accepts (TS 29.002 §C.2.1) — not as XUDT segments,
+// which not every transit node carries (§C.1). The strict peer checks the
+// second forward message (its TID, no dialogue portion, the components).
+func TestE2E_LongMT_EmptyBegin(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+
+	natsServer := startEmbeddedNATS(t)
+	defer natsServer.Shutdown()
+
+	longTPDU := make([]byte, 164)
+	longTPDU[0] = 0x04 // SMS-DELIVER
+	for i := 1; i < len(longTPDU); i++ {
+		longTPDU[i] = byte(i)
+	}
+
+	peer, err := ss7peer.Start(context.Background(), ss7peer.Config{
+		SCTPAddr:         allocLoopbackSCTPPort(t),
+		PointCode:        e2ePeerPC,
+		GatewayPointCode: e2eGatewayPC,
+		NetworkIndicator: e2eNetworkIndicator,
+		NetworkVariant:   sccp.VariantANSI,
+		Logger:           logger.Named("peer"),
+		OnSRI: func(*mapprotocol.SendRoutingInfoForSMRequest, string, string, uint32) (*mapprotocol.SendRoutingInfoForSMResponse, error) {
+			return nil, nil
+		},
+		OnMtForwardSM: func(req *mapprotocol.MtForwardSMRequest, _, _ string, _ uint32) (*mapprotocol.MtForwardSMResponse, error) {
+			require.Equal(t, longTPDU, req.SMRPUI, "the whole TPDU arrives")
+			return &mapprotocol.MtForwardSMResponse{}, nil
+		},
+	})
+	require.NoError(t, err, "start ss7peer")
+	t.Cleanup(func() { require.Empty(t, peer.Violations(), "ss7peer conformance violations") })
+	defer peer.Stop()
+
+	cfg := buildE2EConfig(t, peer.SCTPAddr(), natsServer.ClientURL())
+	handlers, err := initializeHandlers(cfg, logger.Named("gw"))
+	require.NoError(t, err, "initializeHandlers")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, startServices(ctx, handlers, logger.Named("gw")), "startServices")
+	require.NoError(t, handlers.M3UA.WaitForActive(10*time.Second), "M3UA association")
+	t.Cleanup(func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		_ = stopServices(shutdownCtx, handlers, logger.Named("gw"))
+	})
+
+	nc, err := nats.Connect(natsServer.ClientURL(), nats.Name("e2e-long-mt"))
+	require.NoError(t, err)
+	defer nc.Close()
+	client, err := ss7client.New(nc)
+	require.NoError(t, err)
+	defer client.Close()
+
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer reqCancel()
+	_, err = client.MTForwardSM(reqCtx, ss7client.MTRequest{
+		IMSI:                 e2eTestIMSI,
+		NetworkNodeNumber:    ss7client.E164(e2eTestVMSC),
+		ServiceCentreAddress: ss7client.E164(e2eTestSCA),
+		TPDU:                 longTPDU,
+	})
+	require.NoError(t, err, "a long MT-ForwardSM is delivered")
+	require.Equal(t, uint64(1), peer.EmptyBegins(), "opened with an empty Begin")
+	require.Equal(t, uint64(1), peer.MtForwardSMResponses())
 }
 
 // startEmbeddedNATS boots an in-process NATS server on a random port.

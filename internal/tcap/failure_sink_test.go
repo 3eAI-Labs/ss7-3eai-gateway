@@ -5,6 +5,7 @@ package tcap
 
 import (
 	"context"
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
 	"sync"
 	"testing"
 	"time"
@@ -275,4 +276,52 @@ func TestFailureSink_UAbortRefusingContext(t *testing.T) {
 	assert.Equal(t, FailureAbortReceived, calls[0].reason)
 	assert.Contains(t, calls[0].detail, "U-ABORT application context refused")
 	assert.Contains(t, calls[0].detail, "peer proposes 0.4.0.0.1.0.20.2")
+}
+
+// A BEGIN that never reached the peer (no SCCP route, M3UA could not send
+// it, or a UDTS returned it) ends its dialogue at once: the caller is told
+// why, instead of waiting out DialogueTimeout.
+func TestFailureSink_NotDelivered(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	sccpIn, sccpOut := stubChannels()
+	h, err := NewHandler(&Config{
+		NodeID: 1, DialogueTimeout: 30 * time.Second, InvokeTimeout: 30 * time.Second,
+		IdleTimeout: 30 * time.Second, MaxDialogues: 100, MaxComponentsPerMessage: 10,
+		MaxInvokesPerDialogue: 20, ChannelBufferSize: 100, WorkerPoolSize: 1,
+		TimerResolution: 50 * time.Millisecond,
+	}, sccpIn, sccpOut, NewDispatcher(logger), logger)
+	require.NoError(t, err)
+	rec := &recordingSink{}
+	h.SetFailureSink(rec.fn())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, h.Start(ctx))
+	defer h.Stop(ctx)
+
+	called, calling := sampleAddrs()
+	dlg, err := h.Originate(&ACShortMsgMTRelayV3, called, calling, 44, []byte{0x01}, "nats-corr-undelivered")
+	require.NoError(t, err)
+
+	var begin *sccp.SccpMessage
+	select {
+	case begin = <-sccpOut:
+	case <-time.After(time.Second):
+		t.Fatal("BEGIN not sent")
+	}
+
+	h.HandleDeliveryFailure(begin, "returned by the network: UDTS cause 1 (no translation for this specific address)")
+
+	calls := rec.snapshot()
+	require.Len(t, calls, 1, "reported at once, not after DialogueTimeout")
+	assert.Equal(t, "nats-corr-undelivered", calls[0].corrID)
+	assert.Equal(t, int32(44), calls[0].opCode)
+	assert.Equal(t, FailureNotDelivered, calls[0].reason)
+	assert.Equal(t, "ABORTED", calls[0].reason.String())
+	assert.Contains(t, calls[0].detail, "UDTS cause 1")
+	assert.Nil(t, h.getDialogue(dlg.LocalTID), "dialogue removed")
+
+	// A second report for the same message (or one for an END we sent)
+	// finds no waiting dialogue and does nothing.
+	h.HandleDeliveryFailure(begin, "again")
+	assert.Len(t, rec.snapshot(), 1)
 }

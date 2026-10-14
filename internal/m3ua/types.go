@@ -112,6 +112,7 @@ type Handler struct {
 	onStateChange func(oldState, newState ASPState)
 	onLinkUp      func()
 	onLinkDown    func()
+	onSendFailure func(msg *MTP3Message, err error)
 
 	// Metrics
 	metrics *Metrics

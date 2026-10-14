@@ -291,6 +291,11 @@
         "map": {
           "type": "object", "additionalProperties": false,
           "properties": {
+            "sri_routing": {
+              "type": "string", "enum": ["msisdn", "hlr"],
+              "description": "How SendRoutingInfoForSM is addressed: msisdn = the subscriber's MSISDN as GT via the STP (default); hlr = map.hlr_gt / map.hlr_pc",
+              "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+            },
             "hlr_address": { "type": "string" },
             "hlr_gt": { "type": "string" },
             "hlr_pc": { "type": "integer", "minimum": 0 },

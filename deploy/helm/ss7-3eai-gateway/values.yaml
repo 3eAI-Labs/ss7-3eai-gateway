@@ -238,6 +238,7 @@ config:
     timer_resolution: 1s
 
   map:
+    sri_routing: msisdn        # msisdn: SRI to the MSISDN GT via the STP; hlr: to hlr_gt/hlr_pc
     hlr_address: "10.0.0.20"
     hlr_gt: ""
     hlr_pc: 0x0002             # must fit sccp.network_variant (ITU: 14 bits)

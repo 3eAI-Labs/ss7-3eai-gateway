@@ -35,15 +35,21 @@ underneath are [go-m3ua](https://github.com/wmnsk/go-m3ua) and
    to originate a dialogue under `shortMsgGatewayContext-v3`. TCAP allocates a transaction ID
    (upper 8 bits = node number, lower 24 a counter) and remembers the correlation ID and the
    operation against it.
-3. **Addressing.** The called address is the HLR. With a point code configured it routes on
-   DPC/SSN; with only a GT it routes on GT. The calling address carries this node's own GT and
-   routes on GT, so the answer comes back to this node.
+3. **Addressing.** The called address is the subscriber's MSISDN as a global title with SSN 6
+   (the HLR), routed on GT: the STP's translation finds the subscriber's HLR, number portability
+   included, as for any SMS-GMSC. (`map.sri_routing: hlr` sends it to one configured HLR instead.)
+   The calling address carries this node's own GT and routes on GT, so the answer comes back to
+   this node.
 4. **Routing.** SCCP picks the DPC.
    - Route on DPC/SSN: the DPC is the called address's point code.
    - Route on GT: the highest-priority `sccp.gtt_rules` entry matching the called GT gives it.
    - An intermediate rule (`ssn` 0) sends the message to the STP still routing on GT; a final
      rule rewrites the address to route on point code and SSN.
    - The message is encoded as a UDT with the return option set, and the SLS rotates across links.
+   - A message too long for one UDT (which must fit an MTP3 signalling information field) opens
+     the dialogue with an "empty Begin" — the dialogue portion alone — and its components follow
+     in the first CONTINUE once the peer has accepted (TS 29.002 §C.2.1). The gateway accepts
+     that sequence from peers too.
 5. **Transport.** M3UA writes a DATA message whose routing label carries OPC, DPC, SI = 3, the
    configured network indicator, and the SLS. The SCTP stream is chosen from the SLS.
 6. **Answer.** The HLR's TC-END arrives on the association. SCCP checks that it is addressed to
@@ -64,6 +70,7 @@ Every originated dialogue ends with exactly one publish on its response subject:
 | Reject, or ReturnError without a code | `REMOTE_ERROR` | -3 |
 | No answer within `tcap.dialogue_timeout` | `TIMEOUT` | -1 |
 | TC-ABORT from the peer | `ABORTED` | -2 |
+| Not delivered: no SCCP route, M3UA could not send it, or the network returned it in a UDTS | `ABORTED` | -2 (the reason is in `error_message`) |
 
 A request the bridge rejects before a dialogue starts gets no response. The client validates the
 same fields before publishing and bounds every call with a deadline.
@@ -83,7 +90,8 @@ is connected is lost.
 The gateway is an SCCP end node, not a relay.
 - An incoming message not addressed to it is refused with a UDTS, when the sender asked for one,
   and is never forwarded.
-- An incoming UDTS is logged with its return cause and is not passed up as data.
+- An incoming UDTS returns one of our messages: the dialogue that message belonged to is ended at
+  once and its caller told the return cause. It is never passed up as data.
 - Global title translation applies only to messages this node originates.
 
 ## High availability

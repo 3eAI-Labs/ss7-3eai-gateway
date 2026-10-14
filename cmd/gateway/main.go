@@ -324,6 +324,14 @@ func initializeHandlers(cfg *viper.Viper, logger *zap.Logger) (*Handlers, error)
 	}
 	handlers.TCAP = tcapHandler
 
+	// Non-delivery of a message this node sent ends its dialogue at once:
+	// M3UA reports what it could not send to SCCP, SCCP reports that and its
+	// own routing failures and returned UDTSs to TCAP.
+	m3uaHandler.OnSendFailure(sccpHandler.HandleMTP3SendFailure)
+	sccpHandler.SetDeliveryFailureSink(tcapHandler.HandleDeliveryFailure)
+	// Messages too long for one unitdata open with an empty Begin.
+	tcapHandler.SetUserDataLimit(sccpHandler.MaxUserData)
+
 	// Wire MAP/CAP outbound TCAP emission. Now that tcapHandler exists,
 	// hand its application-outbound channel to MAP and CAP so their
 	// dispatchers can push ReturnResult / ReturnError / Reject responses
@@ -751,6 +759,7 @@ func buildTCAPConfig(cfg *viper.Viper) *tcap.Config {
 
 func buildMAPConfig(cfg *viper.Viper) *mapprotocol.Config {
 	return &mapprotocol.Config{
+		SRIRouting:        cfg.GetString("map.sri_routing"),
 		HLRAddress:        cfg.GetString("map.hlr_address"),
 		HLRGlobalTitle:    cfg.GetString("map.hlr_gt"),
 		HLRPointCode:      cfg.GetUint32("map.hlr_pc"),

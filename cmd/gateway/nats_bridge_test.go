@@ -111,10 +111,13 @@ func TestBridge_SRIRequest_Originates(t *testing.T) {
 	assert.Equal(t, int32(mapprotocol.OpSendRoutingInfoForSM), c.opCode)
 	assert.Equal(t, "corr-sri-1", c.corrID)
 
-	// Called GT falls back to map.hlr_gt when NatsMessage doesn't override.
+	// Default map.sri_routing "msisdn": the subscriber's MSISDN is the called
+	// GT, routed on GT (the STP finds the HLR), SSN 6.
 	require.NotNil(t, c.called.GlobalTitle)
-	assert.Equal(t, "905009990001", c.called.GlobalTitle.Address)
+	assert.Equal(t, "905321234567", c.called.GlobalTitle.Address)
 	assert.Equal(t, sccp.SSNHLR, c.called.SubsystemNumber)
+	assert.True(t, c.called.AddressIndicator.RoutesOnGT())
+	assert.Zero(t, c.called.AddressIndicator&sccp.AIPCPresent)
 
 	// Calling = local PC + SSN_MAP, no GT.
 	assert.Equal(t, uint32(9999), c.calling.PointCode)
@@ -330,4 +333,38 @@ func TestBridge_PublishMAPError_NoCorrelationID_NoOp(t *testing.T) {
 	bridge, _ := newBridgeUnderTest(t)
 	// Must return before touching the (nil) NATS handler.
 	bridge.publishMAPError("", mapprotocol.OpSendRoutingInfoForSM, mapprotocol.ErrUnknownSubscriber, "unknownSubscriber")
+}
+
+// map.sri_routing "hlr", and an HLR named in the request.
+func TestBridge_SRIRequest_HLRRouting(t *testing.T) {
+	bridge, rec := newBridgeUnderTest(t)
+	sri := func(gt string, pc uint32) *sccp.SccpAddress {
+		rec.calls = nil
+		require.NoError(t, bridge.onSRIRequest(&natsbridge.NatsMessage{
+			CorrelationID: "c", MSISDN: "905321234567", GlobalTitle: gt, DPC: pc,
+			Parameters: map[string]interface{}{paramServiceCentreAddress: "905001112233"},
+		}))
+		require.Len(t, rec.calls, 1)
+		return rec.calls[0].called
+	}
+
+	bridge.mapCfg.SRIRouting = mapprotocol.SRIRoutingHLR
+	called := sri("", 0)
+	assert.Equal(t, "905009990001", called.GlobalTitle.Address, "configured map.hlr_gt")
+	assert.Equal(t, uint32(1234), called.PointCode, "configured map.hlr_pc")
+
+	bridge.mapCfg.SRIRouting = mapprotocol.SRIRoutingMSISDN
+	called = sri("447700900123", 0)
+	assert.Equal(t, "447700900123", called.GlobalTitle.Address, "an HLR named in the request wins")
+	assert.True(t, called.AddressIndicator.RoutesOnGT())
+}
+
+func TestBridge_SRIRequest_RejectsNonDigitMSISDN(t *testing.T) {
+	bridge, rec := newBridgeUnderTest(t)
+	err := bridge.onSRIRequest(&natsbridge.NatsMessage{
+		CorrelationID: "c", MSISDN: "+90532",
+		Parameters: map[string]interface{}{paramServiceCentreAddress: "905001112233"},
+	})
+	require.Error(t, err)
+	assert.Empty(t, rec.calls)
 }

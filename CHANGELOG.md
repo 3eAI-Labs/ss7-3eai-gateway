@@ -6,6 +6,48 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-14
+
+### Security
+
+- Dialogue-table exhaustion: a dialogue the gateway answered with END (every MO-ForwardSM, every
+  refused or rejected operation) stayed counted against `tcap.max_dialogues` until
+  `tcap.dialogue_timeout` (30 s). Sustained traffic — or a peer sending BEGINs — filled the table,
+  and new dialogues were refused. Sending END or ABORT now ends the dialogue at once (Q.774).
+  0.7.1 and earlier are affected; upgrade.
+- Dialogues opened by a peer's empty Begin are bounded: at most a tenth of `tcap.max_dialogues`
+  may wait for the peer's CONTINUE, each for at most 5 s; beyond that the BEGIN is refused
+  (P-ABORT, resource limitation).
+
+### Changed (breaking for deployments)
+
+- SendRoutingInfoForSM is now addressed the way an SMS-GMSC does it: the called party is the
+  subscriber's MSISDN as a global title with SSN 6, routed on GT (through `sccp.gtt_rules`, to
+  the STP), so the network finds the subscriber's HLR — number ranges and number portability
+  included. Before, every SRI went to the one configured HLR. New `map.sri_routing`: `msisdn`
+  (default) or `hlr` for the previous behaviour. An HLR named in the request still wins.
+  `map.hlr_address` and `map.hlr_pc` are no longer required (`hlr_address` was only ever logged).
+
+### Added
+
+- Long messages. An operation too long for one SCCP unitdata — a full-length SMS in an
+  MT-ForwardSM, for instance — was refused. The gateway now opens such a dialogue with an "empty
+  Begin" (the dialogue portion alone) and sends the components in the first CONTINUE once the
+  peer accepts (TS 29.002 §C.2.1); it accepts the same sequence from a peer (e.g. a long
+  MO-ForwardSM), answering the empty Begin with a CONTINUE carrying the AARE. The size limit
+  accounts for the MTP3 signalling information field (272 octets less the routing label) and the
+  actual SCCP addresses. SCCP segmentation (XUDT) is deliberately not used to send: not every
+  transit node carries it (§C.1).
+
+### Fixed
+
+- A message that never reached the peer left its caller waiting for `tcap.dialogue_timeout`
+  (30 s by default): no SCCP route for its GT, M3UA unable to send it (association down), or the
+  network returning it in a UDTS. Each now ends the dialogue at once, and the caller gets
+  `ABORTED` (`error_code` -2) with the reason in `error_message` — e.g. "returned by the network:
+  UDTS cause 1 (no translation for this specific address)" or "not sent: … no route to
+  destination".
+
 ## [0.7.1] - 2026-10-14
 
 ### Security

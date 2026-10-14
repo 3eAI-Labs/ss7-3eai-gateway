@@ -125,9 +125,16 @@ tcap:
 # hlr_address and hlr_pc must be non-empty/non-zero; they identify the
 # upstream HLR for outbound Invoke addressing once TIER 1 ships.
 map:
-  hlr_address: "10.0.0.20"             # Upstream HLR address (operator-provided)
+  # sri_routing: how SendRoutingInfoForSM is addressed when the request names
+  # no HLR.
+  #   msisdn (default) — called GT = the subscriber's MSISDN, SSN 6, routed on
+  #                      GT through sccp.gtt_rules to the STP, which finds the
+  #                      subscriber's HLR (number ranges, portability);
+  #   hlr              — the HLR below (hlr_gt and/or hlr_pc).
+  sri_routing: msisdn
+  hlr_address: "10.0.0.20"             # informational only (logs)
   hlr_gt: ""
-  hlr_pc: 0x010102                     # 1-1-2
+  hlr_pc: 0x010102                     # 1-1-2; used with sri_routing: hlr
   channel_buffer_size: 10000
   worker_pool_size: 16
   operation_timeout: 10s

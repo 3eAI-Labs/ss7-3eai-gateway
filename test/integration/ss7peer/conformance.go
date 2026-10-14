@@ -114,14 +114,10 @@ func (p *Peer) checkAddress(role string, addr *sccp.SccpAddress, called bool) bo
 // checkApplicationContext validates the AARQ application context name of a
 // BEGIN against the operation it carries. On a mismatch it returns the
 // context the peer supports, which a real HLR/MSC proposes in its AARE.
-func (p *Peer) checkApplicationContext(tcapMsg *gotcap.TCAP, opCode int32) (want []byte, ok bool) {
+func (p *Peer) checkApplicationContext(got []byte, opCode int32) (want []byte, ok bool) {
 	want, known := expectedACByOp[opCode]
 	if !known {
 		return nil, true
-	}
-	var got []byte
-	if d := tcapMsg.Dialogue; d != nil && d.DialoguePDU != nil && d.DialoguePDU.ApplicationContextName != nil {
-		got = d.DialoguePDU.ApplicationContextName.Value
 	}
 	if bytes.Equal(got, want) {
 		return want, true

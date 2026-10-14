@@ -317,6 +317,13 @@ func (h *Handler) OnLinkUp(callback func()) {
 	h.onLinkUp = callback
 }
 
+// OnSendFailure sets the callback for a message that could not be written
+// to the SGW (no active association, invalid label, write error). Set before
+// Start.
+func (h *Handler) OnSendFailure(callback func(msg *MTP3Message, err error)) {
+	h.onSendFailure = callback
+}
+
 // OnLinkDown sets callback for link down events
 func (h *Handler) OnLinkDown(callback func()) {
 	h.onLinkDown = callback

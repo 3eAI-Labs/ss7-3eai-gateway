@@ -646,8 +646,18 @@ type MoForwardSMHandler interface {
 
 // Config holds MAP handler configuration
 type Config struct {
-	// HLR configuration
-	HLRAddress     string `yaml:"hlr_address" json:"hlr_address"`
+	// SRIRouting selects how SendRoutingInfoForSM is addressed when the
+	// request names no HLR:
+	//   - SRIRoutingMSISDN (default): the called party address is the
+	//     subscriber's MSISDN as a global title with SSN 6, routed on GT, so
+	//     the STP's translation finds the subscriber's HLR (number ranges,
+	//     number portability) — how an SMS-GMSC addresses it;
+	//   - SRIRoutingHLR: the configured HLR (HLRGlobalTitle / HLRPointCode),
+	//     for a network with a single HLR reachable directly.
+	SRIRouting string `yaml:"sri_routing" json:"sri_routing"`
+
+	// HLR configuration, used with SRIRoutingHLR.
+	HLRAddress     string `yaml:"hlr_address" json:"hlr_address"` // informational (logs) only
 	HLRGlobalTitle string `yaml:"hlr_gt" json:"hlr_gt"`
 	HLRPointCode   uint32 `yaml:"hlr_pc" json:"hlr_pc"`
 
@@ -656,6 +666,12 @@ type Config struct {
 	WorkerPoolSize    int           `yaml:"worker_pool_size" json:"worker_pool_size"`
 	OperationTimeout  time.Duration `yaml:"operation_timeout" json:"operation_timeout"`
 }
+
+// SRIRouting values; see Config.SRIRouting.
+const (
+	SRIRoutingMSISDN = "msisdn"
+	SRIRoutingHLR    = "hlr"
+)
 
 // Metrics tracks MAP statistics
 type Metrics struct {

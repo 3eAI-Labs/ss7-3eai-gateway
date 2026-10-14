@@ -58,6 +58,11 @@ const (
 	FailureTimeout       FailureReason = iota // local DialogueTimeout — peer never replied
 	FailureAbortReceived                      // P-ABORT or U-ABORT received from peer
 	FailureRemoteError                        // unused by TCAP: a MAP ReturnError / Reject is reported by mapprotocol's ErrorSink with the same REMOTE_ERROR token
+	// FailureNotDelivered: the BEGIN never reached the peer (no SCCP route,
+	// M3UA could not send it, or the network returned it in a UDTS); the
+	// dialogue is ended locally. Reported as ABORTED — the dialogue did not
+	// complete and no answer will come — with the reason in the detail.
+	FailureNotDelivered
 )
 
 // String renders the reason for logs and NATS payloads. The exact tokens are
@@ -70,6 +75,8 @@ func (r FailureReason) String() string {
 		return "ABORTED"
 	case FailureRemoteError:
 		return "REMOTE_ERROR"
+	case FailureNotDelivered:
+		return "ABORTED"
 	}
 	return "UNKNOWN"
 }
@@ -231,6 +238,19 @@ type Dialogue struct {
 	// (Q.773 §4.2.1), after which it is cleared.
 	dialogueResponsePending atomic.Bool
 
+	// deferredComponents are held back by an "empty Begin" (TS 29.002
+	// §C.2.1): the BEGIN carried only the dialogue portion because the
+	// whole message would not fit one SCCP unitdata; they go in the first
+	// CONTINUE, once the peer has accepted the dialogue. Guarded by
+	// invokesMu.
+	deferredComponents []*Component
+
+	// awaitingContinuation marks a dialogue the peer opened with an empty
+	// Begin that we accepted, until its CONTINUE arrives. Such dialogues
+	// hold state for a peer that has sent no operation yet, so they are
+	// bounded (count and lifetime; see handleBegin).
+	awaitingContinuation atomic.Bool
+
 	// Pending operations
 	PendingInvokes map[int32]*PendingInvoke
 	invokesMu      sync.RWMutex
@@ -285,6 +305,14 @@ type Handler struct {
 	// Q.773 §3.1.4: AC is dialogue-scoped (set on BEGIN), not message-scoped.
 	dispatcher    *Dispatcher
 	appOutgoingCh chan *Message // owned by Handler; bidi internally, exposed write-only
+
+	// maxUserData returns how much TCAP data one SCCP unitdata can carry
+	// between two addresses (see SetUserDataLimit); nil means the 255-octet
+	// data parameter limit.
+	maxUserData func(called, calling *sccp.SccpAddress) int
+
+	// pendingEmptyBegins counts dialogues with awaitingContinuation set.
+	pendingEmptyBegins atomic.Int64
 
 	// Control channels
 	errorCh    chan error

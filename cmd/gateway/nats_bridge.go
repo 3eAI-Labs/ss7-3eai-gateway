@@ -459,7 +459,7 @@ func failureErrorCode(r tcap.FailureReason) int32 {
 	switch r {
 	case tcap.FailureTimeout:
 		return ss7client.ErrCodeTimeout
-	case tcap.FailureAbortReceived:
+	case tcap.FailureAbortReceived, tcap.FailureNotDelivered:
 		return ss7client.ErrCodeAborted
 	case tcap.FailureRemoteError:
 		return ss7client.ErrCodeRemoteError
@@ -526,22 +526,37 @@ func paramAddressString(msg *natsbridge.NatsMessage, key string) *mapprotocol.Ad
 	return nil
 }
 
-// calledForHLR builds the SCCP CdPA for the home HLR. Prefers an explicit
-// GT in the NATS message (operators with multi-HLR routing); falls back to
-// the configured map.hlr_gt + map.hlr_pc.
+// calledForHLR builds the SCCP called party address of a
+// SendRoutingInfoForSM. An HLR named in the request wins. Otherwise, with
+// map.sri_routing "msisdn" (the default) the subscriber's MSISDN is the GT,
+// routed on GT so the STP finds the subscriber's HLR — the SMS-GMSC way; with
+// "hlr" it is the configured map.hlr_gt / map.hlr_pc.
 func (b *natsBridge) calledForHLR(msg *natsbridge.NatsMessage) (*sccp.SccpAddress, error) {
-	gt := msg.GlobalTitle
-	pc := msg.DPC
-	if gt == "" {
-		gt = b.mapCfg.HLRGlobalTitle
+	if msg.GlobalTitle != "" || msg.DPC != 0 {
+		return b.calledForGT(msg.GlobalTitle, sccp.SSNHLR, msg.DPC), nil
 	}
-	if pc == 0 {
-		pc = b.mapCfg.HLRPointCode
+	if b.mapCfg.SRIRouting == mapprotocol.SRIRoutingHLR {
+		if b.mapCfg.HLRGlobalTitle == "" && b.mapCfg.HLRPointCode == 0 {
+			return nil, errors.New("HLR address: map.sri_routing is \"hlr\" but neither map.hlr_gt nor map.hlr_pc is set")
+		}
+		return b.calledForGT(b.mapCfg.HLRGlobalTitle, sccp.SSNHLR, b.mapCfg.HLRPointCode), nil
 	}
-	if gt == "" && pc == 0 {
-		return nil, errors.New("HLR address: neither map.hlr_gt nor NatsMessage.global_title set")
+	if !isDigits(msg.MSISDN) {
+		return nil, fmt.Errorf("SRI request: msisdn %q is not E.164 digits", msg.MSISDN)
 	}
-	return b.calledForGT(gt, sccp.SSNHLR, pc), nil
+	return b.calledForGT(msg.MSISDN, sccp.SSNHLR, 0), nil
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // calledForGT builds an SCCP CdPA for a peer GT + SSN (Q.713 §3.4.1).

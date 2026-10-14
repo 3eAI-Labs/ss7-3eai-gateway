@@ -56,15 +56,15 @@ Go client. Applications in other languages implement the same JSON contract.
 
 ## Known limitations
 
+What is planned for each of these is in the [roadmap](docs/ROADMAP.md).
+
 **Protocol:**
 - Only the three operations above. Other MAP operations, and dialogues under other application
   contexts, are refused. Only version 3 contexts are offered or accepted; there is no fallback to v2.
-- SendRoutingInfoForSM is addressed to the configured HLR (`map.hlr_gt` / `map.hlr_pc`), not to
-  the subscriber's MSISDN as a global title. It therefore does not work in networks that locate
-  the HLR by number range or number portability.
-- No SCCP segmentation (XUDT/LUDT): user data over 255 octets is refused.
-- An incoming UDTS is logged with its cause, but the dialogue it belongs to ends only on its
-  timer. A message SCCP cannot route (no matching rule) is logged, and the caller sees `TIMEOUT`.
+- A message too long for one SCCP unitdata (a full-length SMS, for instance) is sent with a TCAP
+  "empty Begin" (TS 29.002 §C.2.1), and accepted that way from peers. Incoming XUDT segments are
+  not reassembled yet, and the gateway never segments with XUDT itself (not every transit node
+  carries XUDT, §C.1). LUDT is not supported.
 - ANSI SCCP addresses use the ITU address-indicator layout; this is not verified against
   ANSI T1.112.
 - CAP: an incoming InitialDP gets no answer, and CAP origination needs pre-encoded BER. The CAP
@@ -122,7 +122,7 @@ The settings that must match the network:
 | `sccp.local_point_code`, `local_subsystems` | This node's point code and subsystems |
 | `sccp.local_global_title`, `cluster_global_title` | Per-node calling GT and the cluster's shared GT |
 | `sccp.gtt_rules` | Where GT-routed messages go: `{pattern: "*", point_code: <STP>}` sends them to the STP, which translates again; a non-zero `ssn` makes it a final translation |
-| `map.hlr_gt` / `map.hlr_pc` | Where SendRoutingInfoForSM is sent |
+| `map.sri_routing` | `msisdn` (default): SendRoutingInfoForSM goes to the subscriber's MSISDN as a GT, through `sccp.gtt_rules` to the STP; `hlr`: to `map.hlr_gt` / `map.hlr_pc` |
 
 Secrets (`api.jwt_secret`, the admin password) and per-node identity can come from environment
 variables (`SS7_` prefix). See the [Helm chart](deploy/helm/ss7-3eai-gateway/README.md) for
@@ -131,6 +131,7 @@ Kubernetes. SCTP needs host networking there.
 ## Documentation
 
 - [Architecture overview](docs/ARCHITECTURE_OVERVIEW.md)
+- [Roadmap](docs/ROADMAP.md): 0.7.x MAP, 0.8.x CAP, 0.9.x INAP
 - [Client module and wire contract](https://github.com/3eAI-Labs/ss7-3eai-gateway-client)
 - [Helm chart](deploy/helm/ss7-3eai-gateway/README.md)
 - [Changelog](CHANGELOG.md)

@@ -11,10 +11,10 @@ type: application
 # Chart version (SemVer of the packaging). Bump on any chart change; a
 # smoke-relevant change (helmChart/properties/serviceLevelPresets) unblesses the
 # ProductDefinition and forces a re-smoke — see packaging contract §9.2.
-version: 0.4.1
+version: 0.4.2
 
 # The gateway binary version this chart deploys. Overridable via image.tag.
-appVersion: "0.7.1"
+appVersion: "0.7.2"
 
 keywords:
   - ss7

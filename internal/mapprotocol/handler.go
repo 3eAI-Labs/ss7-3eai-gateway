@@ -470,11 +470,16 @@ func (h *Handler) Errors() <-chan error {
 
 // validateConfig validates MAP configuration
 func validateConfig(cfg *Config) error {
-	if cfg.HLRAddress == "" {
-		return errors.New("hlr_address is required")
-	}
-	if cfg.HLRPointCode == 0 {
-		return errors.New("hlr_point_code is required")
+	switch cfg.SRIRouting {
+	case "":
+		cfg.SRIRouting = SRIRoutingMSISDN
+	case SRIRoutingMSISDN:
+	case SRIRoutingHLR:
+		if cfg.HLRGlobalTitle == "" && cfg.HLRPointCode == 0 {
+			return errors.New("sri_routing \"hlr\" needs hlr_gt or hlr_pc")
+		}
+	default:
+		return fmt.Errorf("sri_routing must be %q or %q, got %q", SRIRoutingMSISDN, SRIRoutingHLR, cfg.SRIRouting)
 	}
 	if cfg.ChannelBufferSize == 0 {
 		cfg.ChannelBufferSize = ChannelBufferSize
