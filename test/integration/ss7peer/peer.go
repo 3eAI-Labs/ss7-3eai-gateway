@@ -48,12 +48,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/m3ua/wire"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/mapprotocol"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/tcap"
 	"github.com/ishidawataru/sctp"
-	"github.com/wmnsk/go-m3ua"
-	"github.com/wmnsk/go-m3ua/messages/params"
 	"go.uber.org/zap"
 )
 
@@ -136,9 +135,6 @@ type Config struct {
 	// silently corrupts addresses (Q.713 §3.4.1).
 	NetworkVariant sccp.NetworkVariant
 
-	// AspID is the M3UA ASP identifier the peer advertises. Default 1 if 0.
-	AspID uint32
-
 	// OnSRI is the callback invoked on every SRI-for-SM Invoke. Required.
 	OnSRI SRICallback
 
@@ -190,10 +186,6 @@ type Config struct {
 	// segments (Q.714 §4.1.1.1.2), as a node with a long answer may.
 	SegmentAnswers int
 
-	// AcceptTimeout bounds how long Listen.Accept will wait for an ASP
-	// before tearing down. Default 5s if zero.
-	AcceptTimeout time.Duration
-
 	// Logger is optional; defaults to zap.NewNop().
 	Logger *zap.Logger
 }
@@ -201,7 +193,7 @@ type Config struct {
 // Peer is the running in-process HLR / SG-equivalent harness.
 type Peer struct {
 	cfg       Config
-	listener  *m3ua.Listener
+	listener  *wire.Listener
 	sctpAddr  *sctp.SCTPAddr
 	logger    *zap.Logger
 	cancel    context.CancelFunc
@@ -216,7 +208,7 @@ type Peer struct {
 	// (`OriginateMoForwardSM`). The list contains only currently-active
 	// conns; closed associations are pruned automatically.
 	connsMu sync.RWMutex
-	conns   []*m3ua.Conn
+	conns   []*wire.Conn
 
 	// Atomic counter for peer-allocated TIDs (BEGIN we originate). The
 	// upper byte is reserved for the peer (= 0x00 today, distinct from
@@ -264,12 +256,6 @@ func Start(ctx context.Context, cfg Config) (*Peer, error) {
 	if cfg.PointCode == 0 || cfg.GatewayPointCode == 0 {
 		return nil, errors.New("ss7peer: PointCode and GatewayPointCode required")
 	}
-	if cfg.AspID == 0 {
-		cfg.AspID = 1
-	}
-	if cfg.AcceptTimeout == 0 {
-		cfg.AcceptTimeout = 5 * time.Second
-	}
 	if cfg.Logger == nil {
 		cfg.Logger = zap.NewNop()
 	}
@@ -292,34 +278,12 @@ func Start(ctx context.Context, cfg Config) (*Peer, error) {
 	}
 
 	// M3UA config — peer is SGW-side, so OPC = peer PC, DPC = gateway PC.
-	// NewServerConfig (not NewConfig) is required for SGW-side: it
-	// initializes the param wrappers go-m3ua's Listener.Accept handshake
-	// expects when answering ASPUP/ASPAC. Routing context / network
-	// appearance / traffic mode mirror the gateway's client config
-	// (sccp.local_subsystems route on PC+SSN; one routing context suffices here).
-	// Heartbeat disabled — tests run in seconds, not minutes; the BEAT
-	// machinery just adds noise + a state-change opportunity that races
-	// the first ReadPD. Production peers re-enable.
-	hb := &m3ua.HeartbeatInfo{Enabled: false}
-	m3uaCfg := m3ua.NewServerConfig(
-		hb,
-		cfg.PointCode,        // OPC
-		cfg.GatewayPointCode, // DPC
-		cfg.AspID,            // ASP id
-		1,                    // TrafficModeType: 1 = Override (mirror gateway)
-		0,                    // NetworkAppearance
-		0,                    // CorrelationID
-		[]uint32{1},          // RoutingContexts (mirror gateway)
-		3,                    // SI = SCCP
-		0, 0, 0,              // NI / MP / SLS
-	)
-	// CorrelationID is optional and not required for the handshake; null
-	// it out so the param doesn't appear in BEAT frames either.
-	m3uaCfg.CorrelationID = nil
-
-	listener, err := m3ua.Listen("m3ua", sctpAddr, m3uaCfg)
+	// The SG side answers the gateway's ASP Up and ASP Active with the
+	// gateway's own M3UA codec (internal/m3ua/wire), which is checked
+	// against frames built from RFC 4666.
+	listener, err := wire.Listen(sctpAddr, wire.Config{HandshakeTimeout: 5 * time.Second})
 	if err != nil {
-		return nil, fmt.Errorf("ss7peer: m3ua.Listen: %w", err)
+		return nil, fmt.Errorf("ss7peer: M3UA listen: %w", err)
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
@@ -391,52 +355,34 @@ func (p *Peer) MtForwardSMErrors() uint64    { return p.mtFwdErrors.Load() }
 // HA-cluster test needs that.
 //
 // IMPORTANT: the ctx passed into Accept is captured by the library's
-// per-conn monitor goroutine (see go-m3ua server.go:79). Cancelling it
-// kills the live association's read loop, surfacing as ErrNotEstablished
-// on the very next ReadPD. We therefore pass the long-lived runCtx (not
-// a per-Accept WithTimeout) so connections live as long as the peer
-// itself. AcceptTimeout is enforced via Listener.Close on Stop instead.
+// acceptLoop takes each association and serves it in a goroutine of its
+// own, the ASP handshake included, so an ASP that never completes it holds
+// back no other.
 func (p *Peer) acceptLoop(ctx context.Context) {
 	defer p.wg.Done()
 
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		conn, err := p.listener.Accept(ctx)
+		conn, err := p.listener.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
-				return
+			if ctx.Err() == nil {
+				p.logger.Debug("Accept ended", zap.Error(err))
 			}
-			p.logger.Debug("Accept ended", zap.Error(err))
-			// Real SCTP errors (e.g. listener closed) end the loop.
 			return
 		}
-
 		p.connsAccepted.Add(1)
-		p.registerConn(conn)
-		p.logger.Info("M3UA association accepted",
-			zap.String("remote", conn.RemoteAddr().String()))
-
 		p.wg.Add(1)
 		go p.connHandler(ctx, conn)
 	}
 }
 
-// connHandler runs the per-Conn read loop: ReadPD → SCCP/TCAP/MAP decode
-// → callback → response encode → WritePD. One goroutine per association;
-// shutdown via ctx (closes conn to unblock ReadPD) or read error.
-func (p *Peer) connHandler(ctx context.Context, conn *m3ua.Conn) {
+// connHandler completes the ASP handshake, then runs the association's
+// read loop: ReadData → SCCP/TCAP/MAP decode → callback → response encode
+// → WriteData, in the order the gateway sent. Shutdown: ctx closes the
+// association, which ends ReadData.
+func (p *Peer) connHandler(ctx context.Context, conn *wire.Conn) {
 	defer p.wg.Done()
 	defer conn.Close()
-	defer p.deregisterConn(conn)
 
-	// Watcher: ctx cancel → close conn → ReadPD returns ErrNotEstablished
-	// → main loop exits cleanly. Without this, Stop() would block forever
-	// on wg.Wait while ReadPD sits inside an unkillable channel receive.
 	closeOnce := make(chan struct{})
 	go func() {
 		select {
@@ -447,18 +393,24 @@ func (p *Peer) connHandler(ctx context.Context, conn *m3ua.Conn) {
 	}()
 	defer close(closeOnce)
 
+	if err := conn.Handshake(); err != nil {
+		if ctx.Err() == nil {
+			p.logger.Debug("ASP handshake failed", zap.Error(err))
+		}
+		return
+	}
+	p.registerConn(conn)
+	defer p.deregisterConn(conn)
+	p.logger.Info("M3UA association active", zap.String("remote", conn.RemoteAddr().String()))
+
 	for {
-		pd, err := conn.ReadPD()
+		pd, err := conn.ReadData()
 		if err != nil {
 			if ctx.Err() == nil {
-				p.logger.Debug("ReadPD ended", zap.Error(err))
+				p.logger.Debug("ReadData ended", zap.Error(err))
 			}
 			return
 		}
-		if pd == nil {
-			continue
-		}
-
 		p.handleMTP3(conn, pd)
 	}
 }
@@ -466,7 +418,7 @@ func (p *Peer) connHandler(ctx context.Context, conn *m3ua.Conn) {
 // handleMTP3 decodes one inbound MTP3 payload through SCCP → TCAP →
 // MAP, dispatches to the user callback, and writes the response back on
 // the same association with OPC/DPC swapped.
-func (p *Peer) handleMTP3(conn *m3ua.Conn, pd *params.ProtocolDataPayload) {
+func (p *Peer) handleMTP3(conn *wire.Conn, pd *wire.ProtocolData) {
 	if !p.checkRoutingLabel(pd) {
 		return
 	}
@@ -610,8 +562,8 @@ func (p *Peer) handleMTP3(conn *m3ua.Conn, pd *params.ProtocolDataPayload) {
 // handleSRIInvoke decodes the SRI-for-SM parameter, runs OnSRI, and
 // writes back END + AARE + ReturnResult on the same association.
 func (p *Peer) handleSRIInvoke(
-	conn *m3ua.Conn,
-	pd *params.ProtocolDataPayload,
+	conn *wire.Conn,
+	pd *wire.ProtocolData,
 	sccpReq *sccp.SccpMessage,
 	tcapReq *tcap.Message,
 	otidBytes []byte,
@@ -662,8 +614,8 @@ func (p *Peer) handleSRIInvoke(
 // CdPA/CgPA GT digits so tests can assert on the gateway's address-
 // construction (option B per the slice plan).
 func (p *Peer) handleMtForwardSMInvoke(
-	conn *m3ua.Conn,
-	pd *params.ProtocolDataPayload,
+	conn *wire.Conn,
+	pd *wire.ProtocolData,
 	sccpReq *sccp.SccpMessage,
 	tcapReq *tcap.Message,
 	otidBytes []byte,
@@ -713,8 +665,8 @@ func (p *Peer) handleMtForwardSMInvoke(
 // carrying a Return Result Last — and an AARE accepting the context when the
 // request was the BEGIN that opened the dialogue.
 func (p *Peer) sendEndReturnResult(
-	conn *m3ua.Conn,
-	pd *params.ProtocolDataPayload,
+	conn *wire.Conn,
+	pd *wire.ProtocolData,
 	sccpReq *sccp.SccpMessage,
 	tcapReq *tcap.Message,
 	otidBytes []byte,
@@ -732,8 +684,8 @@ func (p *Peer) sendEndReturnResult(
 // sendReturnError answers with an END carrying a Return Error, the same
 // shape as the success path.
 func (p *Peer) sendReturnError(
-	conn *m3ua.Conn,
-	pd *params.ProtocolDataPayload,
+	conn *wire.Conn,
+	pd *wire.ProtocolData,
 	sccpReq *sccp.SccpMessage,
 	tcapReq *tcap.Message,
 	otidBytes []byte,
@@ -749,8 +701,8 @@ func (p *Peer) sendReturnError(
 // sendAbort emits a P-ABORT (unrecognizedTransactionID). The gateway
 // cleans up the dialogue.
 func (p *Peer) sendAbort(
-	conn *m3ua.Conn,
-	pd *params.ProtocolDataPayload,
+	conn *wire.Conn,
+	pd *wire.ProtocolData,
 	sccpReq *sccp.SccpMessage,
 	otidBytes []byte,
 ) {
@@ -766,8 +718,8 @@ func (p *Peer) sendAbort(
 // constructing a fresh ProtocolData with peer-OPC and the request's OPC
 // as DPC.
 func (p *Peer) writeSCCPResponse(
-	conn *m3ua.Conn,
-	pd *params.ProtocolDataPayload,
+	conn *wire.Conn,
+	pd *wire.ProtocolData,
 	sccpReq *sccp.SccpMessage,
 	tcapBytes []byte,
 ) {
@@ -798,27 +750,25 @@ func (p *Peer) writeSCCPResponse(
 
 // writeSCCP encodes an SCCP message and writes it back on the association
 // the request arrived on, with the routing label's OPC/DPC swapped.
-func (p *Peer) writeSCCP(conn *m3ua.Conn, pd *params.ProtocolDataPayload, resp *sccp.SccpMessage) {
+func (p *Peer) writeSCCP(conn *wire.Conn, pd *wire.ProtocolData, resp *sccp.SccpMessage) {
 	sccpBytes, err := sccp.EncodeSCCP(resp, p.cfg.NetworkVariant)
 	if err != nil {
 		p.logger.Warn("SCCP encode failed", zap.Error(err))
 		return
 	}
 
-	// Build MTP3 ProtocolData with OPC/DPC swapped from the request.
-	// SLS preserved so SCTP stream selection on the response side stays
-	// consistent (wmnsk/go-m3ua hashes SLS into stream choice).
-	respPD := params.NewProtocolData(
-		p.cfg.PointCode,         // OPC = peer
-		pd.OriginatingPointCode, // DPC = gateway (was OPC of request)
-		pd.ServiceIndicator,
-		pd.NetworkIndicator,
-		pd.MessagePriority,
-		pd.SignalingLinkSelection,
-		sccpBytes,
-	)
-	if _, err := conn.WritePD(respPD); err != nil {
-		p.logger.Warn("WritePD failed", zap.Error(err))
+	// OPC/DPC swapped from the request; the SLS, and with it the stream,
+	// kept, so the answers of one transaction stay in sequence.
+	respPD := &wire.ProtocolData{
+		OPC: p.cfg.PointCode, DPC: pd.OPC, SI: pd.SI, NI: pd.NI, MP: pd.MP, SLS: pd.SLS,
+		Data: sccpBytes,
+	}
+	stream := uint16(1)
+	if max := conn.MaxStream(); max > 0 {
+		stream = 1 + uint16(pd.SLS)%max
+	}
+	if _, err := conn.WriteData(respPD, stream); err != nil {
+		p.logger.Warn("WriteData failed", zap.Error(err))
 		return
 	}
 }
@@ -866,16 +816,16 @@ func gtDigits(addr *sccp.SccpAddress) string {
 
 // registerConn appends a freshly-accepted association to the active list.
 // Called at acceptLoop entry (after Accept returns successfully).
-func (p *Peer) registerConn(conn *m3ua.Conn) {
+func (p *Peer) registerConn(conn *wire.Conn) {
 	p.connsMu.Lock()
 	defer p.connsMu.Unlock()
 	p.conns = append(p.conns, conn)
 }
 
 // deregisterConn removes a conn that has exited its connHandler. Pruning
-// is done by pointer identity — the wmnsk M3UA Conn is reused by reference
-// throughout the connection's lifetime, so this is reliable.
-func (p *Peer) deregisterConn(conn *m3ua.Conn) {
+// is done by pointer identity: one *wire.Conn per association, for its
+// whole lifetime.
+func (p *Peer) deregisterConn(conn *wire.Conn) {
 	p.connsMu.Lock()
 	defer p.connsMu.Unlock()
 	for i, c := range p.conns {
@@ -893,10 +843,10 @@ func (p *Peer) deregisterConn(conn *m3ua.Conn) {
 // Cluster tests use this for explicit conn selection (e.g. round-robin
 // MO-Fwd origination across cluster members). Returned conns are valid
 // only at the moment of the call; a node restart would mutate the list.
-func (p *Peer) AcceptedConns() []*m3ua.Conn {
+func (p *Peer) AcceptedConns() []*wire.Conn {
 	p.connsMu.RLock()
 	defer p.connsMu.RUnlock()
-	out := make([]*m3ua.Conn, len(p.conns))
+	out := make([]*wire.Conn, len(p.conns))
 	copy(out, p.conns)
 	return out
 }
@@ -946,7 +896,7 @@ type emptyBeginDialogue struct {
 
 // acceptEmptyBegin answers a BEGIN that carries the dialogue portion alone
 // with a CONTINUE whose AARE accepts the context, as an HLR or MSC does.
-func (p *Peer) acceptEmptyBegin(conn *m3ua.Conn, pd *params.ProtocolDataPayload, sccpReq *sccp.SccpMessage, otid, acValue []byte) {
+func (p *Peer) acceptEmptyBegin(conn *wire.Conn, pd *wire.ProtocolData, sccpReq *sccp.SccpMessage, otid, acValue []byte) {
 	if len(acValue) < 2 {
 		p.violate("empty BEGIN without an application context")
 		return

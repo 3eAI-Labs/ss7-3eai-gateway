@@ -12,63 +12,53 @@ import (
 	"testing"
 	"time"
 
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/m3ua/wire"
 	"github.com/ishidawataru/sctp"
 	"github.com/stretchr/testify/require"
-	gom3ua "github.com/wmnsk/go-m3ua"
 	"go.uber.org/zap/zaptest"
 )
 
 // sgw is a minimal SG side over real SCTP: it completes the ASP handshake
-// and hands each association to the test.
+// of each association in a goroutine of its own and hands the association
+// to the test.
 type sgw struct {
-	listener *gom3ua.Listener
-	conns    chan *gom3ua.Conn
-	cancel   context.CancelFunc
+	listener *wire.Listener
+	conns    chan *wire.Conn
 }
 
 func startSGW(t *testing.T, port int) *sgw {
 	t.Helper()
-	cfg := gom3ua.NewServerConfig(&gom3ua.HeartbeatInfo{Enabled: false},
-		200, 100, 1, 2, 0, 0, []uint32{1}, 3, 2, 0, 0)
-	cfg.CorrelationID = nil
-	l, err := gom3ua.Listen("m3ua", &sctp.SCTPAddr{
+	l, err := wire.Listen(&sctp.SCTPAddr{
 		IPAddrs: []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, Port: port,
-	}, cfg)
+	}, wire.Config{HandshakeTimeout: 2 * time.Second})
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &sgw{listener: l, conns: make(chan *gom3ua.Conn, 4), cancel: cancel}
-	// One acceptor (go-m3ua's Accept is not safe for concurrent use). An
-	// association the ASP gave up on fails its handshake after go-m3ua's
-	// fixed 10 s; the acceptor carries on with the next instead of stopping.
+	s := &sgw{listener: l, conns: make(chan *wire.Conn, 8)}
 	go func() {
 		for {
-			c, err := l.Accept(ctx)
+			c, err := l.Accept()
 			if err != nil {
-				if ctx.Err() != nil {
+				return
+			}
+			go func() {
+				if c.Handshake() == nil {
+					s.conns <- c
 					return
 				}
-				continue
-			}
-			s.conns <- c
+				_ = c.Close()
+			}()
 		}
 	}()
-	t.Cleanup(s.stop)
+	t.Cleanup(func() { _ = l.Close() })
 	return s
 }
 
-func (s *sgw) stop() {
-	s.cancel()
-	_ = s.listener.Close()
-}
-
-func (s *sgw) accept(t *testing.T) *gom3ua.Conn {
+func (s *sgw) accept(t *testing.T) *wire.Conn {
 	t.Helper()
 	select {
 	case c := <-s.conns:
 		return c
-	// Room for one association the SGW holds 10 s before giving up on it.
-	case <-time.After(30 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("no association reached the SGW")
 		return nil
 	}
@@ -120,7 +110,7 @@ func TestM3UA_StartWithoutSGWThenSGWAppears(t *testing.T) {
 
 	s := startSGW(t, port)
 	s.accept(t)
-	require.NoError(t, h.WaitForActive(30*time.Second))
+	require.NoError(t, h.WaitForActive(10*time.Second))
 }
 
 // The SGW drops the association. The gateway must re-establish it, and keep
@@ -143,4 +133,33 @@ func TestM3UA_ReconnectsAfterAssociationLoss(t *testing.T) {
 	time.Sleep(time.Second)
 	require.True(t, h.IsActive(), "association closed itself after reconnect")
 	require.NotNil(t, c)
+}
+
+// The messages the SG sends on one SLS reach SCCP in that order, through the
+// handler's read loop and channel — not only through the association.
+func TestM3UA_InboundOrderReachesSCCP(t *testing.T) {
+	port := freeLoopbackPort(t)
+	s := startSGW(t, port)
+	h := startASP(t, port)
+	c := s.accept(t)
+	require.NoError(t, h.WaitForActive(10*time.Second))
+
+	const n = 500
+	go func() {
+		for i := 0; i < n; i++ {
+			pd := &wire.ProtocolData{OPC: 200, DPC: 100, SI: 3, NI: 2, SLS: 7, Data: []byte{byte(i >> 8), byte(i)}}
+			if _, err := c.WriteData(pd, 1+7%c.MaxStream()); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	for i := 0; i < n; i++ {
+		select {
+		case m := <-h.IncomingMessages():
+			require.Equal(t, i, int(m.PayloadData[0])<<8|int(m.PayloadData[1]), "message %d out of order", i)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("message %d did not arrive", i)
+		}
+	}
 }

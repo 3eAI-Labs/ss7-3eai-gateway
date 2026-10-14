@@ -7,11 +7,10 @@ import (
 	"bytes"
 	"fmt"
 
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/m3ua/wire"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/mapprotocol"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/tcap"
-	"github.com/wmnsk/go-m3ua"
-	"github.com/wmnsk/go-m3ua/messages/params"
 	"go.uber.org/zap"
 )
 
@@ -107,22 +106,22 @@ func (p *Peer) violate(format string, args ...any) {
 // checkRoutingLabel validates the MTP3 routing label of an inbound DATA
 // (RFC 4666 §3.3.1, Protocol Data). A real STP discards a message whose DPC
 // is not a known destination, so the caller drops on false.
-func (p *Peer) checkRoutingLabel(pd *params.ProtocolDataPayload) bool {
+func (p *Peer) checkRoutingLabel(pd *wire.ProtocolData) bool {
 	ok := true
-	if pd.ServiceIndicator != siSCCP {
-		p.violate("MTP3 SI=%d, want %d (SCCP)", pd.ServiceIndicator, siSCCP)
+	if pd.SI != siSCCP {
+		p.violate("MTP3 SI=%d, want %d (SCCP)", pd.SI, siSCCP)
 		ok = false
 	}
-	if pd.DestinationPointCode != p.cfg.PointCode {
-		p.violate("MTP3 DPC=%d, want the peer's point code %d", pd.DestinationPointCode, p.cfg.PointCode)
+	if pd.DPC != p.cfg.PointCode {
+		p.violate("MTP3 DPC=%d, want the peer's point code %d", pd.DPC, p.cfg.PointCode)
 		ok = false
 	}
-	if pd.OriginatingPointCode != p.cfg.GatewayPointCode {
-		p.violate("MTP3 OPC=%d, want the gateway's point code %d", pd.OriginatingPointCode, p.cfg.GatewayPointCode)
+	if pd.OPC != p.cfg.GatewayPointCode {
+		p.violate("MTP3 OPC=%d, want the gateway's point code %d", pd.OPC, p.cfg.GatewayPointCode)
 		ok = false
 	}
-	if pd.NetworkIndicator != p.cfg.NetworkIndicator {
-		p.violate("MTP3 NI=%d, want %d", pd.NetworkIndicator, p.cfg.NetworkIndicator)
+	if pd.NI != p.cfg.NetworkIndicator {
+		p.violate("MTP3 NI=%d, want %d", pd.NI, p.cfg.NetworkIndicator)
 		ok = false
 	}
 	return ok
@@ -174,8 +173,8 @@ func (p *Peer) checkApplicationContext(got []byte, opCode int32) (want []byte, o
 // the dialogue (reject-permanent, application-context-name-not-supported)
 // and names the context the peer supports (Q.773 §4.2.2; TS 29.002 §15.6).
 func (p *Peer) sendACNotSupported(
-	conn *m3ua.Conn,
-	pd *params.ProtocolDataPayload,
+	conn *wire.Conn,
+	pd *wire.ProtocolData,
 	sccpReq *sccp.SccpMessage,
 	otidBytes []byte,
 	supported []byte,

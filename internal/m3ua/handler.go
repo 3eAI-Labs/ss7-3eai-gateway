@@ -8,16 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"syscall"
 	"time"
 
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/m3ua/wire"
 	"github.com/ishidawataru/sctp"
-	"github.com/wmnsk/go-m3ua"
 	"go.uber.org/zap"
 )
-
-// eisconnRetries bounds the immediate re-dials after EISCONN (connectSCTP).
-const eisconnRetries = 3
 
 var (
 	ErrNotConnected    = errors.New("M3UA: not connected to SGW")
@@ -109,8 +105,9 @@ func (h *Handler) Stop(ctx context.Context) error {
 	return nil
 }
 
-// connectSCTP establishes SCTP connection with multi-homing (BR-M3UA-003)
-func (h *Handler) connectSCTP(ctx context.Context) error {
+// connectSCTP establishes the association, multi-homed when several local
+// addresses are configured (BR-M3UA-003), and brings it to ASP-ACTIVE.
+func (h *Handler) connectSCTP() error {
 	// Parse local IPs for multi-homing
 	var localAddrs []net.IPAddr
 	for _, ipStr := range h.config.LocalIPs {
@@ -137,43 +134,23 @@ func (h *Handler) connectSCTP(ctx context.Context) error {
 		zap.Strings("local_ips", h.config.LocalIPs),
 		zap.String("remote", remoteAddr.String()))
 
-	// Create M3UA config. The routing-label arguments are unused: every
-	// DATA is written with its own label (sendMTP3 → WritePDToStream), so
-	// they are zero rather than plausible-looking placeholders.
-	m3uaConfig := m3ua.NewConfig(0, 0, 0, 0, 0, 0).SetAspIdentifier(h.config.ASPIdentifier).
-		SetTrafficModeType(h.config.TrafficMode).
-		SetRoutingContexts(h.config.RoutingContext).
-		SetNetworkAppearance(h.config.NetworkAppearance).
-		EnableHeartbeat(h.config.HeartbeatInterval, 30*time.Second)
-
-	// The context handed to Dial is the association's lifetime: go-m3ua's
-	// monitor closes the connection when it ends. It is cancelled only by
-	// closeConnection, never by the dial's own completion.
-	connCtx, connCancel := context.WithCancel(ctx)
-	var conn *m3ua.Conn
-	var err error
-	// A blocking SCTP connect interrupted by a signal is restarted by the
-	// kernel on the same socket; if the association came up meanwhile, the
-	// restarted call reports EISCONN and the SCTP library closes the socket
-	// — an association lost on the way in (our reading of one CI failure,
-	// not reproduced locally). The attempt is repeated at once rather than
-	// after the reconnect interval.
-	for attempt := 1; ; attempt++ {
-		conn, err = m3ua.Dial(connCtx, "m3ua", localAddr, remoteAddr, m3uaConfig)
-		if err == nil || !errors.Is(err, syscall.EISCONN) || attempt == eisconnRetries {
-			break
-		}
-		h.logger.Warn("M3UA dial: association reported as already connected; dialling again", zap.Int("attempt", attempt))
-	}
+	conn, err := wire.Dial(localAddr, remoteAddr, wire.Config{
+		ASPIdentifier:     h.config.ASPIdentifier,
+		RoutingContext:    h.config.RoutingContext,
+		NetworkAppearance: h.config.NetworkAppearance,
+		TrafficMode:       h.config.TrafficMode,
+		HandshakeTimeout:  h.config.ASPUPACKTimeout,
+		ActiveAckTimeout:  h.config.ASPACACKTimeout,
+		HeartbeatInterval: h.config.HeartbeatInterval,
+		OnManagement:      h.logManagement,
+	})
 	if err != nil {
-		connCancel()
 		h.metrics.Errors.Add(1)
 		return fmt.Errorf("M3UA dial failed: %w", err)
 	}
 
 	h.connMu.Lock()
 	h.conn = conn
-	h.connCancel = connCancel
 	h.connMu.Unlock()
 
 	h.logger.Info("M3UA connection established",
@@ -223,7 +200,7 @@ func (h *Handler) transitionState(oldState, newState ASPState) {
 
 // ResetAssociation drops the current SCTP/M3UA association so the
 // supervisor re-establishes it. Closing the connection makes the active
-// readLoop's ReadPD return, and the supervisor re-dials — exactly the path a
+// readLoop's ReadData return, and the supervisor re-dials — exactly the path a
 // real link flap takes. Backs the
 // opsTrigger `resetPeer` action; idempotent (a no-op when the link is not
 // active). Operator-gated (x-arinna requiresApproval) so it is not invoked at
@@ -242,19 +219,33 @@ func (h *Handler) ResetAssociation() error {
 // context. Safe to call concurrently and repeatedly.
 func (h *Handler) closeConnection() {
 	h.connMu.Lock()
-	conn, cancel := h.conn, h.connCancel
-	h.conn, h.connCancel = nil, nil
+	conn := h.conn
+	h.conn = nil
 	h.connMu.Unlock()
 	if conn != nil {
 		_ = conn.Close()
 	}
-	if cancel != nil {
-		cancel()
+}
+
+// logManagement logs the M3UA management the SG sends: NTFY, ERR, and the
+// SS7 network management messages (DUNA, DAVA, SCON, DUPU, DRST), which the
+// gateway does not act on.
+func (h *Handler) logManagement(m *wire.Message) {
+	fields := []zap.Field{zap.Uint8("class", m.Class), zap.Uint8("type", m.Type)}
+	if v, ok := m.Uint32(wire.TagStatus); ok {
+		fields = append(fields, zap.Uint32("status", v))
 	}
+	if v, ok := m.Uint32(wire.TagErrorCode); ok {
+		fields = append(fields, zap.Uint32("error_code", v))
+	}
+	if v, ok := m.Get(wire.TagAffectedPointCode); ok {
+		fields = append(fields, zap.Binary("affected_point_codes", v))
+	}
+	h.logger.Info("M3UA management message", fields...)
 }
 
 // currentConn returns the live association, or nil between associations.
-func (h *Handler) currentConn() *m3ua.Conn {
+func (h *Handler) currentConn() *wire.Conn {
 	h.connMu.RLock()
 	defer h.connMu.RUnlock()
 	return h.conn

@@ -4,11 +4,10 @@
 package ss7peer
 
 import (
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/m3ua/wire"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/mapprotocol"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/tcap"
-	"github.com/wmnsk/go-m3ua"
-	"github.com/wmnsk/go-m3ua/messages/params"
 	"go.uber.org/zap"
 )
 
@@ -28,8 +27,8 @@ type RoutingCallback func(
 func (p *Peer) RoutingRequests() uint64 { return p.routingRequests.Load() }
 
 func (p *Peer) handleRoutingInvoke(
-	conn *m3ua.Conn,
-	pd *params.ProtocolDataPayload,
+	conn *wire.Conn,
+	pd *wire.ProtocolData,
 	sccpReq *sccp.SccpMessage,
 	tcapReq *tcap.Message,
 	otidBytes []byte,

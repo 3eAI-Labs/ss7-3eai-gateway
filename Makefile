@@ -1,4 +1,4 @@
-.PHONY: all build clean test lint docker-build docker-push run fmt vet test-client licenses export-check
+.PHONY: all build clean test lint docker-build docker-push run fmt vet test-client licenses export-check ci-local ci-local-dirty test-e2e
 
 # Build variables
 BINARY_NAME=ss7-gateway
@@ -93,14 +93,20 @@ install-tools:
 # Build tag keeps it out of `go test ./...`; SCTP requires Linux kernel
 # support, so this target is gated to ubuntu CI runners (see .github/workflows/ci.yml).
 #
-# -race intentionally OMITTED: wmnsk/go-m3ua@v0.1.11 has two pre-existing
-# library races on HeartbeatInfo.{Enabled,Data} that we cannot fix without
-# forking. Our code is race-free (proven by `make test` which DOES use
-# -race). Re-enable here once a v0.1.x patch ships, or once the library
-# is replaced.
+# The GitHub Actions gate (ci.yml, internal.yml) run locally through nektos/act —
+# the Actions allowance is the binding constraint. See scripts/ci-local.sh.
+ci-local:
+	@scripts/ci-local.sh
+
+ci-local-dirty:
+	@scripts/ci-local.sh --dirty
+
+# With -race: the M3UA library whose own races kept it off is gone
+# (internal/m3ua/wire), and running with it found a race of ours that the
+# unit tests did not reach.
 test-e2e:
 	@echo "Running E2E SS7 integration test..."
-	@go test -tags integration -count=1 -timeout 180s ./cmd/gateway/ ./internal/m3ua/
+	@go test -tags integration -race -count=1 -timeout 600s ./cmd/gateway/ ./internal/m3ua/
 
 # Client module (Apache-2.0): its own go.mod, so `go test ./...` at the root skips it.
 test-client:

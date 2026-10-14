@@ -6,10 +6,9 @@ package ss7peer
 import (
 	"encoding/asn1"
 
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/m3ua/wire"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/tcap"
-	"github.com/wmnsk/go-m3ua"
-	"github.com/wmnsk/go-m3ua/messages/params"
 	"go.uber.org/zap"
 )
 
@@ -54,7 +53,7 @@ func i32(v int32) *int32 { return &v }
 func tidBytes(v uint32) []byte { return []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)} }
 
 // sendTCAP encodes msg and writes it back to the gateway.
-func (p *Peer) sendTCAP(conn *m3ua.Conn, pd *params.ProtocolDataPayload, sccpReq *sccp.SccpMessage, msg *tcap.Message) {
+func (p *Peer) sendTCAP(conn *wire.Conn, pd *wire.ProtocolData, sccpReq *sccp.SccpMessage, msg *tcap.Message) {
 	b, err := tcap.EncodeMessage(msg)
 	if err != nil {
 		p.logger.Warn("TCAP encode failed", zap.Error(err))

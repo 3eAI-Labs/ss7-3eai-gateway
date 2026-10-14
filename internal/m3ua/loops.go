@@ -8,12 +8,11 @@ import (
 	"fmt"
 	"time"
 
-	gom3ua "github.com/wmnsk/go-m3ua"
-	"github.com/wmnsk/go-m3ua/messages/params"
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/m3ua/wire"
 	"go.uber.org/zap"
 )
 
-// stateManager monitors connection state (go-m3ua library handles state transitions automatically)
+// stateManager logs the association's state periodically.
 func (h *Handler) stateManager(ctx context.Context) {
 	h.logger.Info("State manager started")
 	defer h.logger.Info("State manager stopped")
@@ -51,7 +50,7 @@ func (h *Handler) supervise(ctx context.Context) {
 		if h.stopping(ctx) {
 			return
 		}
-		if err := h.connectSCTP(ctx); err != nil {
+		if err := h.connectSCTP(); err != nil {
 			failures++
 			h.logger.Warn("M3UA association not established",
 				zap.Error(err), zap.Int("consecutive_failures", failures))
@@ -126,19 +125,31 @@ func (h *Handler) linkDown() {
 }
 
 // readLoop reads M3UA DATA from one association and forwards it to SCCP
-// over h.incomingCh. It returns when the association is lost or closed, or
-// on shutdown; the supervisor decides what happens next.
-//
-// go-m3ua's Conn.ReadPD blocks on an internal channel (not the SCTP socket),
-// so read deadlines have no effect; closing the connection makes ReadPD
-// return ErrNotEstablished. Backpressure into SCCP is bounded by
-// shutdownCh/ctx so a wedged consumer cannot block shutdown.
-func (h *Handler) readLoop(ctx context.Context, conn *gom3ua.Conn) {
+// over h.incomingCh, in the order the SG sent it. It returns when the
+// association is lost or closed, or on shutdown; the supervisor decides what
+// happens next. Closing the association makes ReadData return. Backpressure
+// into SCCP is bounded by shutdownCh/ctx so a wedged consumer cannot block
+// shutdown.
+func (h *Handler) readLoop(ctx context.Context, conn *wire.Conn) {
 	if conn == nil {
 		return
 	}
+	// Shutdown closes the association, which ends ReadData — also when Stop
+	// came while the association was still being dialled and found nothing
+	// to close.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-h.shutdownCh:
+		case <-ctx.Done():
+		case <-done:
+			return
+		}
+		_ = conn.Close()
+	}()
 	for {
-		pd, err := conn.ReadPD()
+		pd, err := conn.ReadData()
 		if err != nil {
 			if !h.stopping(ctx) {
 				h.logger.Error("M3UA association lost", zap.Error(err))
@@ -147,20 +158,13 @@ func (h *Handler) readLoop(ctx context.Context, conn *gom3ua.Conn) {
 			return
 		}
 
-		if pd == nil {
-			// Defensive: library should never deliver a nil payload, but
-			// don't crash the read loop on a malformed frame.
-			h.logger.Warn("ReadPD returned nil ProtocolDataPayload")
-			continue
-		}
-
 		msg := &MTP3Message{
-			OPC:         pd.OriginatingPointCode,
-			DPC:         pd.DestinationPointCode,
-			SI:          pd.ServiceIndicator,
-			NI:          pd.NetworkIndicator,
-			MP:          pd.MessagePriority,
-			SLS:         pd.SignalingLinkSelection,
+			OPC:         pd.OPC,
+			DPC:         pd.DPC,
+			SI:          pd.SI,
+			NI:          pd.NI,
+			MP:          pd.MP,
+			SLS:         pd.SLS,
 			PayloadData: pd.Data,
 		}
 
@@ -216,9 +220,7 @@ func (h *Handler) writeLoop(ctx context.Context) {
 }
 
 // sendMTP3 sends one MTP3 user message to the SGW as an M3UA DATA whose
-// Protocol Data carries the message's own routing label. go-m3ua's
-// Conn.Write would instead stamp the label fixed in the connection config at
-// dial time, which cannot name a per-message DPC.
+// Protocol Data carries the message's own routing label.
 //
 // The SCTP stream is chosen from the SLS so that messages SCCP wants kept in
 // sequence (same SLS) share a stream (RFC 4666 §1.4.7); stream 0 is reserved
@@ -242,11 +244,11 @@ func (h *Handler) sendMTP3(mtp3 *MTP3Message) error {
 	if conn == nil {
 		return ErrNotConnected
 	}
-	pd := params.NewProtocolData(
-		mtp3.OPC, mtp3.DPC, mtp3.SI, h.config.NetworkIndicator,
-		mtp3.MP, mtp3.SLS, mtp3.PayloadData,
-	)
-	n, err := conn.WritePDToStream(pd, streamForSLS(mtp3.SLS, conn.MaxMessageStreamID()))
+	pd := &wire.ProtocolData{
+		OPC: mtp3.OPC, DPC: mtp3.DPC, SI: mtp3.SI, NI: h.config.NetworkIndicator,
+		MP: mtp3.MP, SLS: mtp3.SLS, Data: mtp3.PayloadData,
+	}
+	_, err := conn.WriteData(pd, streamForSLS(mtp3.SLS, conn.MaxStream()))
 	if err != nil {
 		h.metrics.Errors.Add(1)
 		return fmt.Errorf("failed to send MTP3: %w", err)
@@ -254,7 +256,7 @@ func (h *Handler) sendMTP3(mtp3 *MTP3Message) error {
 
 	// Update metrics
 	h.metrics.MessagesSent.Add(1)
-	h.metrics.BytesSent.Add(uint64(n))
+	h.metrics.BytesSent.Add(uint64(len(mtp3.PayloadData))) // user data, as BytesReceived
 
 	h.logger.Debug("Sent MTP3 message",
 		zap.Uint32("opc", mtp3.OPC),

@@ -4,12 +4,11 @@
 package m3ua
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/wmnsk/go-m3ua"
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/m3ua/wire"
 	"go.uber.org/zap"
 )
 
@@ -87,11 +86,10 @@ type Config struct {
 type Handler struct {
 	config *Config
 
-	// conn is the live association (nil between associations) and
-	// connCancel ends its context; both are replaced by the supervisor.
-	conn       *m3ua.Conn
-	connCancel context.CancelFunc
-	connMu     sync.RWMutex
+	// conn is the live association, nil between associations; the
+	// supervisor replaces it.
+	conn   *wire.Conn
+	connMu sync.RWMutex
 
 	state   ASPState
 	stateMu sync.RWMutex

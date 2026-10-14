@@ -39,13 +39,35 @@ versioning follows [SemVer](https://semver.org/).
 
 ### Fixed
 
-- **M3UA reconnect after EISCONN.** A dial whose SCTP association came up while the connect call was
-  being restarted after a signal returned EISCONN, and the SCTP library closed the association.
-  The gateway then waited a full reconnect interval and the SGW was left holding a dead
-  association. It now dials again at once (up to 3 times). This was seen once in CI; the cause is
-  our reading of it and could not be reproduced locally. The test SGW also no longer stops
-  accepting after one failed handshake.
+- **M3UA message order.** The M3UA library parsed every received SCTP message, and handled every
+  DATA, in a goroutine of its own. Messages of one signalling relation could therefore reach SCCP
+  in any order, against RFC 4666 §1.4.7. A result in TC-Result-NL segments could fail on that
+  (seen in CI), and so could anything relying on MTP's in-sequence delivery. M3UA is now
+  implemented here (`internal/m3ua/wire`):
+  - one reader per association, messages delivered in arrival order;
+  - DATA never on stream 0;
+  - BEAT answered;
+  - NTFY, ERR and SSNM logged;
+  - messages up to 64 KiB, where the library read 1500 octets at a time.
 
+  The codec is checked against frames built from RFC 4666. The library is gone from the module,
+  and the E2E tests run with the race detector again. That found, and this release fixes, a data
+  race on a dialogue's expiry time.
+- **SCTP Payload Protocol Identifier.**
+  - The DATA chunks carried PPID 0x03000000 instead of M3UA's 3 (RFC 4666 §7.1: "any other values
+    MUST not be used"). The value was converted to network order twice, once by the M3UA library and
+    once by the SCTP library.
+  - A signalling gateway, STP or firewall that checks the PPID could drop or misroute all traffic.
+- **M3UA conformance.**
+  - "Alternate ASP Active" now takes this ASP out of service and brings it back. It used to be
+    logged while the link kept showing up.
+  - ERR carries the offending message, and an ERR is never answered with an ERR.
+  - An association with a single stream is refused.
+  - ASP Up Ack and ASP Active Ack keep separate timeouts.
+- **M3UA reconnect after EISCONN.** A connect restarted after a signal can report EISCONN for an
+  association that came up meanwhile. The SCTP library then closes the association. The dial is
+  now repeated at once instead of after the reconnect interval. This was seen once in CI; the
+  cause is our reading of it, and I could not reproduce it locally.
 - **Message order within a transaction.** SCCP and TCAP each handed incoming messages to a pool
   of workers through one shared queue, so two messages of one transaction could be processed in
   either order. A TC-CONTINUE carrying a result segment could be overtaken by the TC-END that

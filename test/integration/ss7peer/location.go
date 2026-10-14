@@ -4,11 +4,10 @@
 package ss7peer
 
 import (
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/m3ua/wire"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/mapprotocol"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/tcap"
-	"github.com/wmnsk/go-m3ua"
-	"github.com/wmnsk/go-m3ua/messages/params"
 	"go.uber.org/zap"
 )
 
@@ -36,8 +35,8 @@ func (p *Peer) PSIRequests() uint64 { return p.psiRequests.Load() }
 // handleLocationInvoke serves op 71 or op 70: decode with the gateway's
 // codec, ask the callback, answer with the result or the error.
 func (p *Peer) handleLocationInvoke(
-	conn *m3ua.Conn,
-	pd *params.ProtocolDataPayload,
+	conn *wire.Conn,
+	pd *wire.ProtocolData,
 	sccpReq *sccp.SccpMessage,
 	tcapReq *tcap.Message,
 	otidBytes []byte,

@@ -28,7 +28,6 @@ require (
 
 	// Testing
 	github.com/stretchr/testify v1.11.1
-	github.com/wmnsk/go-m3ua v0.1.11
 
 	// Logging
 	go.uber.org/zap v1.26.0
@@ -36,6 +35,8 @@ require (
 )
 
 require github.com/nats-io/nats-server/v2 v2.12.3
+
+require github.com/google/go-cmp v0.7.0 // indirect
 
 require (
 	github.com/3eAI-Labs/ss7-3eai-gateway-client v0.3.0

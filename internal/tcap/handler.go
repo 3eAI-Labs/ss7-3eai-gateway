@@ -476,7 +476,9 @@ func (h *Handler) handleBegin(sccpCtx *sccp.SccpMessage, msg *Message) {
 		}
 		dialogue.awaitingContinuation.Store(true)
 		h.pendingEmptyBegins.Add(1)
+		h.dialoguesMu.Lock()
 		dialogue.ExpiresAt = time.Now().Add(min(h.config.DialogueTimeout, emptyBeginWait))
+		h.dialoguesMu.Unlock()
 
 		h.handleOutgoingMessage(&Message{
 			MessageType:    MsgTypeContinue,
@@ -511,8 +513,11 @@ func (h *Handler) handleContinue(sccpCtx *sccp.SccpMessage, msg *Message) {
 		return
 	}
 
+	// The timer manager reads these under dialoguesMu.
+	h.dialoguesMu.Lock()
 	dialogue.LastActivity = time.Now()
 	dialogue.ExpiresAt = time.Now().Add(h.config.DialogueTimeout)
+	h.dialoguesMu.Unlock()
 	dialogue.MessagesReceived.Add(1)
 
 	if len(msg.OriginatingTID) > 0 {
