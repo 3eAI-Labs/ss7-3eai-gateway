@@ -43,7 +43,10 @@ m3ua:
   reconnect_max_attempts: 0            # 0 = retry forever
 
 # SCCP Configuration — ITU-T Q.713. local_subsystems lists every SSN this
-# node terminates locally (HLR=6, VLR=7, MSC=8, gsmSCF=146, etc.).
+# node terminates locally (TS 23.003 §8: HLR=6, VLR=7, MSC=8, CAP=146,
+# gsmSCF (MAP)=147). Answers come back to the subsystem a request was sent
+# from: 6 for SRI-for-SM and ProvideSubscriberInfo, 8 for MT-ForwardSM, 147
+# for AnyTimeInterrogation.
 #
 # network_variant selects the SS7 variant which dictates SCCP point-code
 # field width on the wire (Q.713 §3.4.1):
@@ -54,7 +57,7 @@ m3ua:
 sccp:
   network_variant: ansi                # this example uses ANSI 24-bit PCs
   local_point_code: 0x010101           # 1-1-1 (ANSI 24-bit)
-  local_subsystems: [6, 8, 146]        # HLR, MSC, gsmSCF
+  local_subsystems: [6, 8, 146, 147]   # HLR, MSC, CAP, gsmSCF (MAP)
   # local_global_title: this NODE's per-node sticky GT used as CgPA on
   # outbound traffic. Each cluster node configures its OWN distinct GT
   # (e.g. node1 → 905300000001, node2 → 905300000002). Peers pin this
@@ -125,8 +128,8 @@ tcap:
 # hlr_address and hlr_pc must be non-empty/non-zero; they identify the
 # upstream HLR for outbound Invoke addressing once TIER 1 ships.
 map:
-  # sri_routing: how SendRoutingInfoForSM is addressed when the request names
-  # no HLR.
+  # sri_routing: how a request to the subscriber's HLR (SendRoutingInfoForSM,
+  # AnyTimeInterrogation) is addressed when the request names no HLR.
   #   msisdn (default) — called GT = the subscriber's MSISDN, SSN 6, routed on
   #                      GT through sccp.gtt_rules to the STP, which finds the
   #                      subscriber's HLR (number ranges, portability);
@@ -135,6 +138,10 @@ map:
   hlr_address: "10.0.0.20"             # informational only (logs)
   hlr_gt: ""
   hlr_pc: 0x010102                     # 1-1-2; used with sri_routing: hlr
+  # gsmscf_address: the gsmSCF-Address AnyTimeInterrogation carries, which the
+  # HLR may screen (TS 29.002 §8.11.1). Empty: the cluster GT, else this
+  # node's own GT. Requests cannot set it.
+  gsmscf_address: ""
   channel_buffer_size: 10000
   worker_pool_size: 16
   operation_timeout: 10s

@@ -153,7 +153,7 @@ func TestE2E_Cluster_3Node_NATSLoadShare(t *testing.T) {
 				IMSI: mapprotocol.IMSI(e2eTestIMSI),
 				LocationInfoWithLMSI: mapprotocol.LocationInfoWithLMSI{
 					NetworkNodeNumber: &mapprotocol.AddressString{
-						Nature: 4, NumberPlan: 1, Digits: e2eTestVMSC,
+						Nature: mapprotocol.NatureInternational, NumberPlan: mapprotocol.NumberingPlanISDN, Digits: e2eTestVMSC,
 					},
 				},
 			}, nil
@@ -312,7 +312,7 @@ func TestE2E_Cluster_NodeOutage_FailureSinkTimeout(t *testing.T) {
 				IMSI: mapprotocol.IMSI(e2eTestIMSI),
 				LocationInfoWithLMSI: mapprotocol.LocationInfoWithLMSI{
 					NetworkNodeNumber: &mapprotocol.AddressString{
-						Nature: 4, NumberPlan: 1, Digits: e2eTestVMSC,
+						Nature: mapprotocol.NatureInternational, NumberPlan: mapprotocol.NumberingPlanISDN, Digits: e2eTestVMSC,
 					},
 				},
 			}, nil

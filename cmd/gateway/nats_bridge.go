@@ -58,6 +58,8 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 
 	handlers.NATS.OnSRIRequest(bridge.onSRIRequest)
 	handlers.NATS.OnMTSmsRequest(bridge.onMTSmsRequest)
+	handlers.NATS.OnATIRequest(bridge.onATIRequest)
+	handlers.NATS.OnPSIRequest(bridge.onPSIRequest)
 	handlers.NATS.OnCAPInitialDP(bridge.onCAPInitialDP)
 	handlers.NATS.OnINAPInitialDP(bridge.onINAPInitialDP)
 
@@ -76,6 +78,8 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 		zap.Strings("subjects", []string{
 			natsbridge.SubjectMTSmsRequest,
 			natsbridge.SubjectSRIRequest,
+			natsbridge.SubjectATIRequest,
+			natsbridge.SubjectPSIRequest,
 			natsbridge.SubjectCAPInitialDP,
 			natsbridge.SubjectINAPInitialDP,
 		}))
@@ -112,13 +116,13 @@ func (b *natsBridge) onSRIRequest(msg *natsbridge.NatsMessage) error {
 	if sca == nil {
 		// Fall back to a SCA derived from the gateway's own GT — operators
 		// running the gateway co-located with an SMSC sometimes accept this.
-		sca = &mapprotocol.AddressString{Nature: 4, NumberPlan: 1, Digits: msg.Sender}
+		sca = &mapprotocol.AddressString{Nature: mapprotocol.NatureInternational, NumberPlan: mapprotocol.NumberingPlanISDN, Digits: msg.Sender}
 	}
 	if sca.Digits == "" {
 		return errors.New("SRI request: service_centre_address required (Parameters or Sender)")
 	}
 
-	called, err := b.calledForHLR(msg)
+	called, err := b.calledForHLR(msg, "SRI request")
 	if err != nil {
 		return err
 	}
@@ -165,6 +169,9 @@ func (b *natsBridge) onMTSmsRequest(msg *natsbridge.NatsMessage) error {
 	nnn := paramAddressString(msg, paramNetworkNodeNumber)
 	if nnn == nil {
 		return errors.New("MT SMS request: network_node_number required in Parameters (from SRI response)")
+	}
+	if !isDigits(nnn.Digits) {
+		return fmt.Errorf("MT SMS request: network_node_number %q is not E.164 digits", nnn.Digits)
 	}
 
 	imsi := mapprotocol.IMSI(msg.IMSI)
@@ -249,6 +256,12 @@ func (b *natsBridge) publishMAPResponse(corrID string, op mapprotocol.OperationC
 	case *mapprotocol.MtForwardSMResponse:
 		return b.natsHandler.PublishMTSmsResponse(corrID, ss7client.StatusDelivered, 0)
 
+	case *mapprotocol.AnyTimeInterrogationResponse:
+		return b.natsHandler.PublishSubscriberInfo(natsbridge.MsgTypeMAPATI, corrID, subscriberInfoWire(&r.SubscriberInfo))
+
+	case *mapprotocol.ProvideSubscriberInfoResponse:
+		return b.natsHandler.PublishSubscriberInfo(natsbridge.MsgTypeMAPPSI, corrID, subscriberInfoWire(&r.SubscriberInfo))
+
 	case *mapprotocol.MoForwardSMResponse:
 		// MO response from VMSC — not part of the SMSC inbound flow today;
 		// log for trace and treat as success.
@@ -279,10 +292,8 @@ func (b *natsBridge) publishMAPResponse(corrID string, op mapprotocol.OperationC
 //     upstream waiter has one reply path per request — correlation by
 //     corrID, no fragmented subscriber topology.
 //
-// Op-code routing must mirror publishMAPResponse:
-//   - OpSendRoutingInfoForSM (45) → SubjectSRIResponse
-//   - OpMtForwardSM          (44) → SubjectMTSmsResponse
-//   - OpMoForwardSM          (46) → MO is gateway-originated trace, no waiter
+// The response subject follows the operation (responseTypeByOp), as for
+// publishMAPResponse.
 func (b *natsBridge) publishMAPFailure(corrID string, opCode int32, reason tcap.FailureReason, detail string) {
 	if corrID == "" {
 		return
@@ -293,29 +304,32 @@ func (b *natsBridge) publishMAPFailure(corrID string, opCode int32, reason tcap.
 		zap.String("reason", reason.String()),
 		zap.String("detail", detail))
 
-	status := reason.String()
-	errCode := failureErrorCode(reason)
+	b.publishFailure(corrID, mapprotocol.OperationCode(opCode), reason.String(), failureErrorCode(reason), detail)
+}
 
-	switch mapprotocol.OperationCode(opCode) {
-	case mapprotocol.OpSendRoutingInfoForSM:
-		if err := b.natsHandler.PublishSRIFailure(corrID, status, errCode, detail); err != nil {
-			b.logger.Error("publish SRI failure",
-				zap.String("nats_correlation_id", corrID),
-				zap.Error(err))
-		}
-	case mapprotocol.OpMtForwardSM:
-		if err := b.natsHandler.PublishMTSmsFailure(corrID, status, errCode, detail); err != nil {
-			b.logger.Error("publish MT-SMS failure",
-				zap.String("nats_correlation_id", corrID),
-				zap.Error(err))
-		}
-	case mapprotocol.OpMoForwardSM:
-		// MO is gateway-originated trace toward a peer SMSC; no upstream
-		// waiter on our NATS side. Logged above; nothing to publish.
-	default:
-		b.logger.Warn("failure sink: no publisher for op",
-			zap.Int32("op_code", opCode),
+// responseTypeByOp is the response message type — hence subject — of each
+// operation a NATS request originates.
+var responseTypeByOp = map[mapprotocol.OperationCode]natsbridge.MessageType{
+	mapprotocol.OpSendRoutingInfoForSM:  natsbridge.MsgTypeMAPSRI,
+	mapprotocol.OpMtForwardSM:           natsbridge.MsgTypeMAPMTSms,
+	mapprotocol.OpAnyTimeInterrogation:  natsbridge.MsgTypeMAPATI,
+	mapprotocol.OpProvideSubscriberInfo: natsbridge.MsgTypeMAPPSI,
+}
+
+func (b *natsBridge) publishFailure(corrID string, op mapprotocol.OperationCode, status string, errCode int32, detail string) {
+	msgType, ok := responseTypeByOp[op]
+	if !ok {
+		// MO-Forward-SM the gateway sends has no NATS waiter.
+		b.logger.Warn("no response subject for op",
+			zap.Int32("op_code", int32(op)),
 			zap.String("nats_correlation_id", corrID))
+		return
+	}
+	if err := b.natsHandler.PublishFailure(msgType, corrID, status, errCode, detail); err != nil {
+		b.logger.Error("publish failure",
+			zap.String("nats_correlation_id", corrID),
+			zap.Int32("op_code", int32(op)),
+			zap.Error(err))
 	}
 }
 
@@ -338,23 +352,7 @@ func (b *natsBridge) publishMAPError(corrID string, op mapprotocol.OperationCode
 		zap.Int32("error_code", errCode),
 		zap.String("detail", detail))
 
-	var err error
-	switch op {
-	case mapprotocol.OpSendRoutingInfoForSM:
-		err = b.natsHandler.PublishSRIFailure(corrID, status, errCode, detail)
-	case mapprotocol.OpMtForwardSM:
-		err = b.natsHandler.PublishMTSmsFailure(corrID, status, errCode, detail)
-	default:
-		b.logger.Warn("error sink: no publisher for op",
-			zap.Int32("op_code", int32(op)),
-			zap.String("nats_correlation_id", corrID))
-		return
-	}
-	if err != nil {
-		b.logger.Error("publish MAP error",
-			zap.String("nats_correlation_id", corrID),
-			zap.Error(err))
-	}
+	b.publishFailure(corrID, op, status, errCode, detail)
 }
 
 // remoteErrorWire maps a peer's ReturnError / Reject to the wire status and
@@ -507,9 +505,9 @@ func paramAddressString(msg *natsbridge.NatsMessage, key string) *mapprotocol.Ad
 		if x == "" {
 			return nil
 		}
-		return &mapprotocol.AddressString{Nature: 4, NumberPlan: 1, Digits: x}
+		return &mapprotocol.AddressString{Nature: mapprotocol.NatureInternational, NumberPlan: mapprotocol.NumberingPlanISDN, Digits: x}
 	case map[string]interface{}:
-		addr := &mapprotocol.AddressString{Nature: 4, NumberPlan: 1}
+		addr := &mapprotocol.AddressString{Nature: mapprotocol.NatureInternational, NumberPlan: mapprotocol.NumberingPlanISDN}
 		if d, _ := x["digits"].(string); d != "" {
 			addr.Digits = d
 		} else {
@@ -526,13 +524,18 @@ func paramAddressString(msg *natsbridge.NatsMessage, key string) *mapprotocol.Ad
 	return nil
 }
 
-// calledForHLR builds the SCCP called party address of a
-// SendRoutingInfoForSM. An HLR named in the request wins. Otherwise, with
-// map.sri_routing "msisdn" (the default) the subscriber's MSISDN is the GT,
-// routed on GT so the STP finds the subscriber's HLR — the SMS-GMSC way; with
-// "hlr" it is the configured map.hlr_gt / map.hlr_pc.
-func (b *natsBridge) calledForHLR(msg *natsbridge.NatsMessage) (*sccp.SccpAddress, error) {
+// calledForHLR builds the SCCP called party address of a request to the
+// subscriber's HLR (SendRoutingInfoForSM, AnyTimeInterrogation). An HLR named
+// in the request wins. Otherwise, with map.sri_routing "msisdn" (the default)
+// the subscriber's MSISDN is the GT, routed on GT so the STP finds the
+// subscriber's HLR — the SMS-GMSC way; with "hlr" it is the configured
+// map.hlr_gt / map.hlr_pc. A request naming the subscriber by IMSI alone has
+// no MSISDN to route on.
+func (b *natsBridge) calledForHLR(msg *natsbridge.NatsMessage, what string) (*sccp.SccpAddress, error) {
 	if msg.GlobalTitle != "" || msg.DPC != 0 {
+		if msg.GlobalTitle != "" && !isDigits(msg.GlobalTitle) {
+			return nil, fmt.Errorf("%s: global_title %q is not E.164 digits", what, msg.GlobalTitle)
+		}
 		return b.calledForGT(msg.GlobalTitle, sccp.SSNHLR, msg.DPC), nil
 	}
 	if b.mapCfg.SRIRouting == mapprotocol.SRIRoutingHLR {
@@ -541,8 +544,11 @@ func (b *natsBridge) calledForHLR(msg *natsbridge.NatsMessage) (*sccp.SccpAddres
 		}
 		return b.calledForGT(b.mapCfg.HLRGlobalTitle, sccp.SSNHLR, b.mapCfg.HLRPointCode), nil
 	}
+	if msg.MSISDN == "" {
+		return nil, fmt.Errorf("%s: by IMSI it needs the HLR's global_title or dpc, or map.sri_routing \"hlr\"", what)
+	}
 	if !isDigits(msg.MSISDN) {
-		return nil, fmt.Errorf("SRI request: msisdn %q is not E.164 digits", msg.MSISDN)
+		return nil, fmt.Errorf("%s: msisdn %q is not E.164 digits", what, msg.MSISDN)
 	}
 	return b.calledForGT(msg.MSISDN, sccp.SSNHLR, 0), nil
 }

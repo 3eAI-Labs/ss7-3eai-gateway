@@ -1,5 +1,5 @@
-github.com/3eAI-Labs/ss7-3eai-gateway-client v0.1.0 h1:2CR1/2CJ50CBQZIFcMjmgJqnTuNwx/aaBdeOiTc+RoI=
-github.com/3eAI-Labs/ss7-3eai-gateway-client v0.1.0/go.mod h1:86bj9Y69Ac6rSeEIzDuIZr3P2wE25azqCQjBEHIMkWc=
+github.com/3eAI-Labs/ss7-3eai-gateway-client v0.2.0 h1:iuPU/jSRcJP20dBqfad3qz8zMRpzkS+Gimsw11lmuMY=
+github.com/3eAI-Labs/ss7-3eai-gateway-client v0.2.0/go.mod h1:86bj9Y69Ac6rSeEIzDuIZr3P2wE25azqCQjBEHIMkWc=
 github.com/antithesishq/antithesis-sdk-go v0.5.0-default-no-op h1:Ucf+QxEKMbPogRO5guBNe5cgd9uZgfoJLOYs8WWhtjM=
 github.com/antithesishq/antithesis-sdk-go v0.5.0-default-no-op/go.mod h1:IUpT2DPAKh6i/YhSbt6Gl3v2yvUZjmKncl7U91fup7E=
 github.com/aws/aws-sdk-go-v2 v1.24.1 h1:xAojnj+ktS95YZlDf0zxWBkbFtymPeDP+rvUQIH3uAU=

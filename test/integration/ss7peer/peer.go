@@ -16,7 +16,7 @@
 //	        return &mapprotocol.SendRoutingInfoForSMResponse{
 //	            IMSI: "286010000000123",
 //	            LocationInfoWithLMSI: mapprotocol.LocationInfoWithLMSI{
-//	                NetworkNodeNumber: &mapprotocol.AddressString{Nature: 4, NumberPlan: 1, Digits: "905304445566"},
+//	                NetworkNodeNumber: &mapprotocol.AddressString{Nature: mapprotocol.NatureInternational, NumberPlan: mapprotocol.NumberingPlanISDN, Digits: "905304445566"},
 //	            },
 //	        }, nil
 //	    },
@@ -146,6 +146,12 @@ type Config struct {
 	// exercise the SMS delivery path MUST set this.
 	OnMtForwardSM MtForwardSMCallback
 
+	// OnATI and OnPSI answer AnyTimeInterrogation (op 71) and
+	// ProvideSubscriberInfo (op 70). Optional: when nil, the peer counts and
+	// drops them.
+	OnATI ATICallback
+	OnPSI PSICallback
+
 	// OnSRIPreDrop is consulted before OnSRI is invoked. When it returns
 	// true, the peer drops the SRI Invoke silently (no ReturnResult, no
 	// ReturnError, no Abort) — exclusively for exercising the TCAP TIMEOUT
@@ -224,6 +230,8 @@ type Peer struct {
 	mtFwdResponses  atomic.Uint64
 	mtFwdErrors     atomic.Uint64
 	moFwdOriginated atomic.Uint64
+	atiRequests     atomic.Uint64
+	psiRequests     atomic.Uint64
 	connsAccepted   atomic.Uint64
 
 	violationsMu sync.Mutex
@@ -568,7 +576,10 @@ func (p *Peer) handleMTP3(conn *m3ua.Conn, pd *params.ProtocolDataPayload) {
 			p.sendACNotSupported(conn, pd, sccpMsg, otidValue.Value, supported)
 			return
 		}
+		p.checkSubsystems(int32(opCode), sccpMsg.CalledAddress, sccpMsg.CallingAddress)
 		switch int32(opCode) {
+		case int32(mapprotocol.OpAnyTimeInterrogation), int32(mapprotocol.OpProvideSubscriberInfo):
+			p.handleLocationInvoke(conn, pd, sccpMsg, tcapMsg, otidValue.Value, invokeID, int32(opCode), paramBytes, otid)
 		case int32(mapprotocol.OpSendRoutingInfoForSM):
 			if p.cfg.OnSRIPreDrop != nil && p.cfg.OnSRIPreDrop(otid) {
 				p.sriRequests.Add(1)

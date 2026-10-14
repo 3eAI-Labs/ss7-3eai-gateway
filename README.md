@@ -1,7 +1,7 @@
 # ss7-3eai-gateway
 
-An SS7 signalling gateway that lets applications send and receive SMS over MAP without speaking
-SS7 themselves. Applications talk to it over [NATS](https://nats.io); it talks to the
+An SS7 signalling gateway that lets applications send and receive SMS, and ask where a subscriber
+is, over MAP without speaking SS7 themselves. Applications talk to it over [NATS](https://nats.io); it talks to the
 signalling network over SIGTRAN (M3UA over SCTP) as an application server process behind a
 signalling gateway (SG) or STP.
 
@@ -10,6 +10,8 @@ signalling gateway (SG) or STP.
  ──────────────────   NATS   ┌──────────────────────────────┐  M3UA/SCTP  ┌──────────┐
   map.sri.request    ───────►│ MAP ─ TCAP ─ SCCP ─ M3UA     │────────────►│  SG/STP  │─► HLR, MSC
   map.mt.sms.request ───────►│                              │◄────────────│          │
+  map.ati.request    ───────►│                              │             │          │
+  map.psi.request    ───────►│                              │             │          │
   map.*.response     ◄───────│                              │             └──────────┘
   map.mo.sms         ◄───────└──────────────────────────────┘
 ```
@@ -19,8 +21,8 @@ Written in Go. Licensed under the [GNU AGPL v3.0](LICENSE) (only); the
 
 ## Status
 
-**Not production-ready, and not yet tested against real SS7 equipment.** The short-message path
-below is implemented end to end and tested over real SCTP against a peer that checks the routing
+**Not production-ready, and not yet tested against real SS7 equipment.** The operations below are
+implemented end to end and tested over real SCTP against a peer that checks the routing
 label, SCCP addressing and MAP application contexts the way an STP and an HLR would. That is
 evidence of conformance, not proof of interoperability. Read [Known limitations](#known-limitations)
 before connecting it to a network. Versions stay below 1.0 until the gateway has carried traffic on
@@ -33,10 +35,17 @@ real SS7 networks.
 | SendRoutingInfoForSM (op 45) | gateway → HLR | `map.sri.request` → `map.sri.response` | shortMsgGatewayContext-v3 |
 | MT-ForwardSM (op 44) | gateway → serving MSC | `map.mt.sms.request` → `map.mt.sms.response` | shortMsgMT-RelayContext-v3 |
 | MO-ForwardSM (op 46) | MSC → gateway | published on `map.mo.sms` | shortMsgMO-RelayContext-v3 |
+| AnyTimeInterrogation (op 71) | gateway (as gsmSCF) → HLR | `map.ati.request` → `map.ati.response` | anyTimeInfoEnquiryContext-v3 |
+| ProvideSubscriberInfo (op 70) | gateway (in the HLR's role) → VLR | `map.psi.request` → `map.psi.response` | subscriberInfoEnquiryContext-v3 |
 
-- **Every outcome is answered.** The response subject carries `DELIVERED`, or a failure:
+- **Every outcome is answered.** The response subject carries the result, or a failure:
   `REMOTE_ERROR` with the MAP error code (e.g. `absentSubscriberSM` vs `unknownSubscriber`, which
-  an SMSC retries differently), `TIMEOUT`, or `ABORTED`.
+  an SMSC retries differently), `TIMEOUT`, `ABORTED`, or `REJECTED` for a request the gateway
+  refused before starting a dialogue.
+- **Location and state.** AnyTimeInterrogation and ProvideSubscriberInfo return the cell, service
+  area or location area, the serving VLR/MSC or SGSN, the age of the location (or a fresh one, by
+  paging), the subscriber state, the EPS location, IMEI, MS classmark and number portability
+  information, decoded into JSON.
 - **Signalling transport.** M3UA ASP over SCTP (optionally multi-homed), with override or
   loadshare traffic mode. Each message carries its own MTP3 routing label. A lost association is
   re-established automatically, including when the SG is not reachable at start-up.
@@ -59,8 +68,13 @@ Go client. Applications in other languages implement the same JSON contract.
 What is planned for each of these is in the [roadmap](docs/ROADMAP.md).
 
 **Protocol:**
-- Only the three operations above. Other MAP operations, and dialogues under other application
-  contexts, are refused. The gateway offers version 3 and falls back to version 2 when a peer
+- Only the operations above. Other MAP operations, and dialogues under other application
+  contexts, are refused; an Invoke of an operation the gateway does not serve is rejected
+  (unrecognizedOperation). The gateway only asks AnyTimeInterrogation and ProvideSubscriberInfo:
+  peers cannot open those contexts with it.
+- Of a location answer, the GPRS MS class, T-ADS data, time zone, 5GS location, CSG and LSA
+  information and PDP context lists are not decoded. E-UTRAN cell and tracking area identities,
+  routing area identity and geographical / geodetic information are passed through as hex. The gateway offers version 3 and falls back to version 2 when a peer
   refuses it (TS 29.002 §5.2.1); dialogues a peer opens under version 2 (an old MSC's forwardSM)
   are refused with an AARE proposing version 3.
 - A message too long for one SCCP unitdata (a full-length SMS, for instance) is sent with a TCAP
@@ -71,6 +85,11 @@ What is planned for each of these is in the [roadmap](docs/ROADMAP.md).
   ANSI T1.112.
 - CAP: an incoming InitialDP gets no answer, and CAP origination needs pre-encoded BER. The CAP
   application context names have not been verified. INAP is not supported.
+
+**Access:** whoever may publish on `map.ati.request` and `map.psi.request` can locate any
+subscriber the network will answer for. The gateway does not authorise requests; restrict those
+subjects with NATS permissions. (It does fix the gsmSCF-Address itself, so a publisher cannot pass
+as another gsmSCF.)
 
 **Management plane:**
 - **Not implemented on the message path:** the SS7 firewall (`internal/firewall`) and transaction

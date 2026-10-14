@@ -5,11 +5,14 @@ package natsbridge
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	ss7client "github.com/3eAI-Labs/ss7-3eai-gateway-client"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	natstest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
@@ -196,4 +199,48 @@ func TestQueueSubscribe_DistributesAcrossPublishes(t *testing.T) {
 	assert.Equal(t, uint64(N), total, "every message delivered exactly once")
 	assert.Greater(t, n1Count.Load(), uint64(0), "node-1 must receive some share")
 	assert.Greater(t, n2Count.Load(), uint64(0), "node-2 must receive some share")
+}
+
+// A request the bridge refuses is answered with REJECTED on its response
+// subject, under its correlation ID — for every request subject of the
+// contract.
+func TestRefusedRequestIsAnsweredRejected(t *testing.T) {
+	srv := startEmbeddedNATS(t)
+	h, err := NewHandler(&Config{
+		ServerURL: srv.ClientURL(), NodeID: "node-1", ClusterName: "c",
+		ChannelBufferSize: 16, WorkerPoolSize: 1, MessageTimeout: time.Second,
+		ConnectionTimeout: time.Second, ReconnectWait: 100 * time.Millisecond,
+		PingInterval: 10 * time.Second, MaxReconnects: 3,
+	}, zaptest.NewLogger(t))
+	require.NoError(t, err)
+	refuse := func(*NatsMessage) error { return errors.New("no capacity") }
+	h.OnSRIRequest(refuse)
+	h.OnMTSmsRequest(refuse)
+	h.OnATIRequest(refuse)
+	h.OnPSIRequest(refuse)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, h.Start(ctx))
+	defer h.Stop(ctx)
+
+	nc, err := nats.Connect(srv.ClientURL())
+	require.NoError(t, err)
+	defer nc.Close()
+	for req, resp := range map[string]string{
+		SubjectSRIRequest: SubjectSRIResponse, SubjectMTSmsRequest: SubjectMTSmsResponse,
+		SubjectATIRequest: SubjectATIResponse, SubjectPSIRequest: SubjectPSIResponse,
+	} {
+		sub, err := nc.SubscribeSync(resp)
+		require.NoError(t, err)
+		require.NoError(t, nc.Publish(req, []byte(`{"message_id":"m","correlation_id":"corr-`+req+`"}`)))
+		got, err := sub.NextMsg(2 * time.Second)
+		require.NoError(t, err, req)
+		var m NatsMessage
+		require.NoError(t, json.Unmarshal(got.Data, &m))
+		assert.Equal(t, "corr-"+req, m.CorrelationID)
+		assert.Equal(t, ss7client.StatusRejected, m.Status)
+		assert.Equal(t, ss7client.ErrCodeRejected, m.ErrorCode)
+		assert.Equal(t, "no capacity", m.ErrorMessage)
+		require.NoError(t, sub.Unsubscribe())
+	}
 }

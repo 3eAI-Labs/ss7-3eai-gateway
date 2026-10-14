@@ -313,6 +313,7 @@ func TestBridge_ClientMAPErrorCodesMatchMAPLayer(t *testing.T) {
 		ss7client.MAPErrSystemFailure:             mapprotocol.ErrSystemFailure,
 		ss7client.MAPErrDataMissing:               mapprotocol.ErrDataMissing,
 		ss7client.MAPErrUnexpectedDataValue:       mapprotocol.ErrUnexpectedDataValue,
+		ss7client.MAPErrATINotAllowed:             mapprotocol.ErrATINotAllowed,
 	}
 	for clientCode, mapCode := range pairs {
 		assert.Equal(t, int32(mapCode), clientCode, mapCode.String())

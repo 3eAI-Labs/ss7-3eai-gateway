@@ -36,8 +36,42 @@ const aiRouteOnSSN = 0x40
 // BER OBJECT IDENTIFIER the dialogue portion carries (TS 29.002 §17.3.3:
 // map-ac = {0 4 0 0 1 0}, then the context arc and the version).
 var expectedACByOp = map[int32][]byte{
-	int32(mapprotocol.OpSendRoutingInfoForSM): acOID(20, 3), // shortMsgGatewayContext-v3
-	int32(mapprotocol.OpMtForwardSM):          acOID(25, 3), // shortMsgMT-RelayContext-v3
+	int32(mapprotocol.OpSendRoutingInfoForSM):  acOID(20, 3), // shortMsgGatewayContext-v3
+	int32(mapprotocol.OpMtForwardSM):           acOID(25, 3), // shortMsgMT-RelayContext-v3
+	int32(mapprotocol.OpProvideSubscriberInfo): acOID(28, 3), // subscriberInfoEnquiryContext-v3
+	int32(mapprotocol.OpAnyTimeInterrogation):  acOID(29, 3), // anyTimeInfoEnquiryContext-v3
+}
+
+// Subsystem numbers (TS 23.003 §8): the called address names the node the
+// operation is for, and for the location enquiries the calling address names
+// the role the gateway plays — the HLR or the gsmSCF answers there.
+const (
+	ssnHLR    = 6
+	ssnVLR    = 7
+	ssnMSC    = 8
+	ssnGSMSCF = 147
+)
+
+var expectedCalledSSNByOp = map[int32]uint8{
+	int32(mapprotocol.OpSendRoutingInfoForSM):  ssnHLR,
+	int32(mapprotocol.OpMtForwardSM):           ssnMSC,
+	int32(mapprotocol.OpAnyTimeInterrogation):  ssnHLR,
+	int32(mapprotocol.OpProvideSubscriberInfo): ssnVLR,
+}
+
+var expectedCallingSSNByOp = map[int32]uint8{
+	int32(mapprotocol.OpAnyTimeInterrogation):  ssnGSMSCF,
+	int32(mapprotocol.OpProvideSubscriberInfo): ssnHLR,
+}
+
+// checkSubsystems validates the SSNs of an operation's SCCP addresses.
+func (p *Peer) checkSubsystems(opCode int32, called, calling *sccp.SccpAddress) {
+	if want, ok := expectedCalledSSNByOp[opCode]; ok && uint8(called.SubsystemNumber) != want {
+		p.violate("op %d called SSN %d, want %d", opCode, called.SubsystemNumber, want)
+	}
+	if want, ok := expectedCallingSSNByOp[opCode]; ok && uint8(calling.SubsystemNumber) != want {
+		p.violate("op %d calling SSN %d, want %d", opCode, calling.SubsystemNumber, want)
+	}
 }
 
 // Version 2 equivalents (TS 29.002 §17.3.2.21, §17.3.2.26; forwardSM is

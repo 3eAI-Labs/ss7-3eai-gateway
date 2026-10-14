@@ -305,9 +305,13 @@ func initializeHandlers(cfg *viper.Viper, logger *zap.Logger) (*Handlers, error)
 			return nil, fmt.Errorf("failed to register MAP for %s: %w", ac.Name, err)
 		}
 	}
-	// Answers to a version 2 retry (TS 29.002 §5.2.1) are routed for the
-	// dialogues we open; a peer cannot open one under these contexts.
-	for _, ac := range []tcap.ApplicationContext{tcap.ACShortMsgGatewayV2, tcap.ACShortMsgMTRelayV2} {
+	// Contexts only this node opens: answers to a version 2 retry (TS 29.002
+	// §5.2.1), and the location enquiries it sends as gsmSCF (to an HLR) or as
+	// HLR (to a VLR). A peer cannot open a dialogue under them.
+	for _, ac := range []tcap.ApplicationContext{
+		tcap.ACShortMsgGatewayV2, tcap.ACShortMsgMTRelayV2,
+		tcap.ACAnyTimeInfoEnquiryV3, tcap.ACSubscriberInfoEnquiryV3,
+	} {
 		if err := dispatcher.RegisterInitiatorOnly(ac.OID, mapHandler); err != nil {
 			return nil, fmt.Errorf("failed to register MAP for %s: %w", ac.Name, err)
 		}
@@ -772,6 +776,7 @@ func buildMAPConfig(cfg *viper.Viper) *mapprotocol.Config {
 		HLRAddress:        cfg.GetString("map.hlr_address"),
 		HLRGlobalTitle:    cfg.GetString("map.hlr_gt"),
 		HLRPointCode:      cfg.GetUint32("map.hlr_pc"),
+		GSMSCFAddress:     cfg.GetString("map.gsmscf_address"),
 		ChannelBufferSize: cfg.GetInt("map.channel_buffer_size"),
 		WorkerPoolSize:    cfg.GetInt("map.worker_pool_size"),
 		OperationTimeout:  cfg.GetDuration("map.operation_timeout"),

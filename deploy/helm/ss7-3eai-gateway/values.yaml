@@ -205,7 +205,7 @@ config:
   sccp:
     network_variant: itu       # itu (14-bit) | ansi (24-bit)
     local_point_code: 0x0001
-    local_subsystems: [6, 8, 146]
+    local_subsystems: [6, 8, 146, 147]  # HLR, MSC, CAP, gsmSCF (MAP) — TS 23.003 §8
     local_global_title:
       address: "905300000001"  # env-overridden per pod when stickyGtBase set
     cluster_global_title:
@@ -242,6 +242,7 @@ config:
     hlr_address: "10.0.0.20"
     hlr_gt: ""
     hlr_pc: 0x0002             # must fit sccp.network_variant (ITU: 14 bits)
+    gsmscf_address: ""         # AnyTimeInterrogation gsmSCF-Address; empty = cluster GT, else own GT
     channel_buffer_size: 10000
     worker_pool_size: 16
     operation_timeout: 10s

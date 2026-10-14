@@ -10,11 +10,14 @@ import "testing"
 func FuzzDecoders(f *testing.F) {
 	if b, err := EncodeSendRoutingInfoForSMArg(&SendRoutingInfoForSMRequest{
 		MSISDN: "905321112233", SMRPPRI: true,
-		ServiceCentreAddress: AddressString{Nature: 4, NumberPlan: 1, Digits: "905001112233"},
+		ServiceCentreAddress: AddressString{Nature: NatureInternational, NumberPlan: NumberingPlanISDN, Digits: "905001112233"},
 	}); err == nil {
 		f.Add(b)
 	}
 	f.Add([]byte{0x30, 0x03, 0x80, 0x01, 0x09})
+	for _, seed := range locationSeeds() {
+		f.Add(seed)
+	}
 	f.Fuzz(func(t *testing.T, b []byte) {
 		_, _ = decodeTBCD(b)
 		_, _ = decodeAddressString(b)
@@ -23,7 +26,10 @@ func FuzzDecoders(f *testing.F) {
 		_, _ = decodeCancelLocationArg(b)
 		_, _ = decodeSendRoutingInfoArg(b)
 		_, _ = decodeProvideRoamingNumberArg(b)
-		_, _ = decodeAnyTimeInterrogationArg(b)
+		_, _ = DecodeAnyTimeInterrogationRes(b)
+		_, _ = DecodeProvideSubscriberInfoRes(b)
+		_, _ = DecodeAnyTimeInterrogationArg(b)
+		_, _ = DecodeProvideSubscriberInfoArg(b)
 		_, _ = decodeSendRoutingInfoForSMArg(b)
 		_, _ = decodeSendRoutingInfoForSMRes(b)
 		_, _ = decodeMtForwardSMArg(b)

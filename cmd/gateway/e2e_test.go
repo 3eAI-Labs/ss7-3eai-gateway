@@ -106,7 +106,7 @@ func TestE2E_SRIForSM_RoundTrip(t *testing.T) {
 				IMSI: mapprotocol.IMSI(e2eTestIMSI),
 				LocationInfoWithLMSI: mapprotocol.LocationInfoWithLMSI{
 					NetworkNodeNumber: &mapprotocol.AddressString{
-						Nature:     4, // International
+						Nature:     mapprotocol.NatureInternational,
 						NumberPlan: 1, // ISDN
 						Digits:     e2eTestVMSC,
 					},
@@ -354,7 +354,7 @@ func TestE2E_Client_SRIThenMT(t *testing.T) {
 			return &mapprotocol.SendRoutingInfoForSMResponse{
 				IMSI: mapprotocol.IMSI(e2eTestIMSI),
 				LocationInfoWithLMSI: mapprotocol.LocationInfoWithLMSI{
-					NetworkNodeNumber: &mapprotocol.AddressString{Nature: 4, NumberPlan: 1, Digits: e2eTestVMSC},
+					NetworkNodeNumber: &mapprotocol.AddressString{Nature: mapprotocol.NatureInternational, NumberPlan: mapprotocol.NumberingPlanISDN, Digits: e2eTestVMSC},
 				},
 			}, nil
 		},
@@ -717,7 +717,7 @@ func TestE2E_SegmentedAnswer(t *testing.T) {
 			return &mapprotocol.SendRoutingInfoForSMResponse{
 				IMSI: mapprotocol.IMSI(e2eTestIMSI),
 				LocationInfoWithLMSI: mapprotocol.LocationInfoWithLMSI{
-					NetworkNodeNumber: &mapprotocol.AddressString{Nature: 4, NumberPlan: 1, Digits: e2eTestVMSC},
+					NetworkNodeNumber: &mapprotocol.AddressString{Nature: mapprotocol.NatureInternational, NumberPlan: mapprotocol.NumberingPlanISDN, Digits: e2eTestVMSC},
 				},
 			}, nil
 		},
@@ -780,7 +780,7 @@ func TestE2E_Version2Fallback(t *testing.T) {
 			return &mapprotocol.SendRoutingInfoForSMResponse{
 				IMSI: mapprotocol.IMSI(e2eTestIMSI),
 				LocationInfoWithLMSI: mapprotocol.LocationInfoWithLMSI{
-					NetworkNodeNumber: &mapprotocol.AddressString{Nature: 4, NumberPlan: 1, Digits: e2eTestVMSC},
+					NetworkNodeNumber: &mapprotocol.AddressString{Nature: mapprotocol.NatureInternational, NumberPlan: mapprotocol.NumberingPlanISDN, Digits: e2eTestVMSC},
 				},
 			}, nil
 		},
@@ -907,7 +907,7 @@ func buildE2EConfig(t *testing.T, peerSCTPAddr, natsURL string) *viper.Viper {
 	// to exercise 24-bit PC wire encoding (matches config.example.yaml).
 	v.Set("sccp.network_variant", "ansi")
 	v.Set("sccp.local_point_code", int(e2eGatewayPC))
-	v.Set("sccp.local_subsystems", []int{6, 8, 146}) // HLR, MSC, gsmSCF
+	v.Set("sccp.local_subsystems", []int{6, 8, 146, 147}) // HLR, MSC, CAP, gsmSCF (MAP)
 	// Cluster-shared own GT for CgPA — exercises GT-based source addressing
 	// (HA prerequisite). Peer callbacks assert callingGT == e2eTestOwnGT.
 	v.Set("sccp.local_global_title.address", e2eTestOwnGT)

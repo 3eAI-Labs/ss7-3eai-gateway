@@ -19,7 +19,7 @@ func TestSRI_for_SM_RoundTrip(t *testing.T) {
 	in := &SendRoutingInfoForSMRequest{
 		MSISDN:               "905321234567",
 		SMRPPRI:              true,
-		ServiceCentreAddress: AddressString{Nature: 4, NumberPlan: 1, Digits: "905001112233"},
+		ServiceCentreAddress: AddressString{Nature: NatureInternational, NumberPlan: NumberingPlanISDN, Digits: "905001112233"},
 	}
 	b, err := encodeSendRoutingInfoForSMArg(in)
 	if err != nil {
@@ -45,7 +45,7 @@ func TestSRI_for_SM_Response_RoundTrip(t *testing.T) {
 	in := &SendRoutingInfoForSMResponse{
 		IMSI: "286010123456789",
 		LocationInfoWithLMSI: LocationInfoWithLMSI{
-			NetworkNodeNumber: &AddressString{Nature: 4, NumberPlan: 1, Digits: "905304567890"},
+			NetworkNodeNumber: &AddressString{Nature: NatureInternational, NumberPlan: NumberingPlanISDN, Digits: "905304567890"},
 			LMSI:              []byte{0x01, 0x02, 0x03, 0x04},
 		},
 	}
@@ -77,7 +77,7 @@ func TestMtForwardSM_RoundTrip_IMSI_DA(t *testing.T) {
 
 	in := &MtForwardSMRequest{
 		SMRPDA:             SMRPDA{IMSI: &imsi},
-		SMRPOA:             SMRPOA{ServiceCentreAddress: &AddressString{Nature: 4, NumberPlan: 1, Digits: "905001112233"}},
+		SMRPOA:             SMRPOA{ServiceCentreAddress: &AddressString{Nature: NatureInternational, NumberPlan: NumberingPlanISDN, Digits: "905001112233"}},
 		SMRPUI:             tpdu,
 		MoreMessagesToSend: true,
 	}
@@ -146,8 +146,8 @@ func TestMtForwardSM_Response_EmptyOK(t *testing.T) {
 func TestMoForwardSM_RoundTrip(t *testing.T) {
 	imsi := IMSI("286010987654321")
 	in := &MoForwardSMRequest{
-		SMRPDA: SMRPDA{ServiceCentreAddress: &AddressString{Nature: 4, NumberPlan: 1, Digits: "905001112233"}},
-		SMRPOA: SMRPOA{ServiceCentreAddress: &AddressString{Nature: 4, NumberPlan: 1, Digits: "905004445566"}},
+		SMRPDA: SMRPDA{ServiceCentreAddress: &AddressString{Nature: NatureInternational, NumberPlan: NumberingPlanISDN, Digits: "905001112233"}},
+		SMRPOA: SMRPOA{ServiceCentreAddress: &AddressString{Nature: NatureInternational, NumberPlan: NumberingPlanISDN, Digits: "905004445566"}},
 		SMRPUI: []byte{0x11, 0x22, 0x33},
 		IMSI:   &imsi,
 	}

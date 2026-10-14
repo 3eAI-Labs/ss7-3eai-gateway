@@ -41,7 +41,7 @@ require (
 )
 
 require (
-	github.com/3eAI-Labs/ss7-3eai-gateway-client v0.1.0
+	github.com/3eAI-Labs/ss7-3eai-gateway-client v0.2.0
 	github.com/antithesishq/antithesis-sdk-go v0.5.0-default-no-op // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.5.4 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.16.16 // indirect

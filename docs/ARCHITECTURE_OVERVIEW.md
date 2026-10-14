@@ -71,9 +71,14 @@ Every originated dialogue ends with exactly one publish on its response subject:
 | No answer within `tcap.dialogue_timeout` | `TIMEOUT` | -1 |
 | TC-ABORT from the peer | `ABORTED` | -2 |
 | Not delivered: no SCCP route, M3UA could not send it, or the network returned it in a UDTS | `ABORTED` | -2 (the reason is in `error_message`) |
+| A ReturnResult the gateway cannot decode | `REMOTE_ERROR` | -3 |
 
-A request the bridge rejects before a dialogue starts gets no response. The client validates the
-same fields before publishing and bounds every call with a deadline.
+A request refused before a dialogue starts — a missing or invalid field, an address the gateway
+cannot route, no capacity for another dialogue — is answered at once with `REJECTED` / -4 and the
+reason. Only a request that is not valid JSON, or carries no correlation or message ID, goes
+unanswered; the client validates its fields before publishing and bounds every call with a
+deadline. An Invoke of an operation the gateway does not serve, under a context it does, is
+answered with a TCAP Reject (unrecognizedOperation).
 
 ## Version negotiation
 
@@ -83,6 +88,28 @@ request in a new dialogue under version 2 (TS 29.002 §5.2.1) — MT delivery be
 there — once, and the caller sees only the final outcome. Answers to such a dialogue are routed
 by a registration that applies only to dialogues the gateway opened, so peers cannot open
 version 2 dialogues with it.
+
+## Location and state
+
+AnyTimeInterrogation and ProvideSubscriberInfo (TS 29.002 §8.11) are originated only.
+
+- **AnyTimeInterrogation** (`map.ati.request`). The gateway acts as gsmSCF and asks the
+  subscriber's HLR under `anyTimeInfoEnquiryContext-v3`. The called address is found as for
+  SendRoutingInfoForSM: the MSISDN as global title with SSN 6, or the HLR the request or
+  `map.sri_routing: hlr` names; a request by IMSI must name the HLR. The calling SSN is 147,
+  gsmSCF (TS 23.003 §8.2), so it must be in `sccp.local_subsystems`. The argument carries a
+  gsmSCF-Address the HLR may screen — configuration, never the request's, so a NATS publisher cannot
+  pass as another gsmSCF: `map.gsmscf_address`, else the cluster
+  GT, else the node's GT. An HLR that does not admit it answers `ati-NotAllowed` (49).
+- **ProvideSubscriberInfo** (`map.psi.request`). The gateway takes the HLR's role and asks the VLR
+  the request names, called SSN 7, calling SSN 6, under `subscriberInfoEnquiryContext-v3`. The
+  IMSI and VLR number typically come from SendRoutingInfoForSM.
+
+Both contexts exist in version 3 only, so there is no version fallback. The answer's
+SubscriberInfo is decoded into `subscriber_info`: location (cell global identity, service area or
+location area; VLR, MSC or SGSN number; age; whether it was obtained by paging), CS, PS and EPS
+subscriber state, EPS location, IMEI, MS classmark 2 and number portability. Octet strings whose
+layout another specification defines are passed through as hex.
 
 ## An MO short message
 

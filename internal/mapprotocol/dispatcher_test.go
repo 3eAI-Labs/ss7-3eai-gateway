@@ -112,16 +112,76 @@ func TestMap_HandleTCAPMessage_NilMessage(t *testing.T) {
 	}
 }
 
+// An Invoke of an operation the gateway does not serve is answered with a
+// Reject (Q.773 §3.1.5.3.3, unrecognizedOperation), not left unanswered.
 func TestMap_HandleTCAPMessage_UnsupportedOpCode(t *testing.T) {
 	h := newTestHandler(t)
+	out := make(chan *tcap.Message, 1)
+	h.SetTCAPOutbound(out)
 	// Op code 99 is unassigned in 3GPP TS 29.002.
 	msg := invokeMsg(99, tcap.ACMapV3.OID)
 
-	if err := h.HandleTCAPMessage(nil, msg); err != nil {
+	if err := h.HandleTCAPMessage(&tcap.Dialogue{LocalTID: 3, RemoteTID: []byte{1, 2, 3, 4}}, msg); err != nil {
 		t.Fatalf("expected nil (dialogue continues), got %v", err)
 	}
 	if got := h.GetMetrics().Errors.Load(); got != 1 {
 		t.Fatalf("Errors counter = %d, want 1", got)
+	}
+	select {
+	case m := <-out:
+		c := m.Components[0]
+		if m.MessageType != tcap.MsgTypeEnd || c.Type != tcap.CompTypeReject ||
+			c.ProblemCode.Type != tcap.ProblemTypeInvoke || c.ProblemCode.Code != tcap.InvokeProblemUnrecognizedOperation {
+			t.Fatalf("answer = %+v / %+v", m, c)
+		}
+	default:
+		t.Fatal("no answer to an unsupported operation")
+	}
+}
+
+// A ReturnResult the gateway cannot decode ends an originated dialogue: the
+// caller is told through the error sink instead of waiting out its deadline.
+func TestMap_UndecodableResultReachesErrorSink(t *testing.T) {
+	h := newTestHandler(t)
+	var got []sinkCall
+	h.SetErrorSink(func(corrID string, op mapprotocol.OperationCode, code mapprotocol.ErrorCode, detail string) {
+		got = append(got, sinkCall{corrID, op, code, detail})
+	})
+	invID := int32(1)
+	dlg := &tcap.Dialogue{LocalTID: 4, NATSCorrelationID: "corr-ati", OriginatingOpCode: int32(mapprotocol.OpAnyTimeInterrogation)}
+	comp := &tcap.Component{Type: tcap.CompTypeReturnResult, InvokeID: &invID, Parameter: []byte{0x30, 0x00}}
+	if err := h.HandleTCAPMessage(dlg, endWith(comp)); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].corrID != "corr-ati" || got[0].op != mapprotocol.OpAnyTimeInterrogation || got[0].code != 0 {
+		t.Fatalf("sink calls = %+v", got)
+	}
+}
+
+// ATI and PSI results reach the response sink typed.
+func TestMap_LocationResultsReachResponseSink(t *testing.T) {
+	for _, op := range []mapprotocol.OperationCode{mapprotocol.OpAnyTimeInterrogation, mapprotocol.OpProvideSubscriberInfo} {
+		h := newTestHandler(t)
+		var got any
+		h.SetResponseSink(func(_ string, _ mapprotocol.OperationCode, resp any) error { got = resp; return nil })
+		invID := int32(1)
+		dlg := &tcap.Dialogue{LocalTID: 5, NATSCorrelationID: "c", OriginatingOpCode: int32(op)}
+		// { subscriberInfo { subscriberState { assumedIdle } } }
+		param := []byte{0x30, 0x06, 0x30, 0x04, 0xA1, 0x02, 0x80, 0x00}
+		comp := &tcap.Component{Type: tcap.CompTypeReturnResult, InvokeID: &invID, Parameter: param}
+		if err := h.HandleTCAPMessage(dlg, endWith(comp)); err != nil {
+			t.Fatal(err)
+		}
+		var state *mapprotocol.SubscriberState
+		switch r := got.(type) {
+		case *mapprotocol.AnyTimeInterrogationResponse:
+			state = r.SubscriberInfo.SubscriberState
+		case *mapprotocol.ProvideSubscriberInfoResponse:
+			state = r.SubscriberInfo.SubscriberState
+		}
+		if state == nil || state.State != "assumedIdle" {
+			t.Fatalf("op %d: sink got %#v", op, got)
+		}
 	}
 }
 

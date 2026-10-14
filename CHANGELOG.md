@@ -6,6 +6,52 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-10-14
+
+### Added
+
+- Location and state (TS 29.002 §8.11), with client module v0.2.0:
+  - **AnyTimeInterrogation** (op 71) on `map.ati.request` → `map.ati.response`: the gateway asks
+    the subscriber's HLR as gsmSCF under `anyTimeInfoEnquiryContext-v3` — addressed like
+    SendRoutingInfoForSM, calling SSN 147 — with the gsmSCF-Address from `map.gsmscf_address`,
+    else the cluster GT, else the node's GT. Requests cannot set it: the HLR admits ATI by that
+    address, and a NATS publisher must not pass as another gsmSCF.
+  - **ProvideSubscriberInfo** (op 70) on `map.psi.request` → `map.psi.response`: the gateway asks
+    the serving VLR under `subscriberInfoEnquiryContext-v3`, called SSN 7, calling SSN 6.
+  - The answer is decoded into `subscriber_info`: cell global identity, service area or location
+    area, VLR/MSC/SGSN number, age of location, paging, CS/PS/EPS subscriber state, EPS location,
+    IMEI, MS classmark 2, number portability. Decoders are fuzzed; the encoders are checked
+    against octets built by hand from the ASN.1.
+  - Peers cannot open either context with the gateway.
+- `REJECTED` (-4): a request refused before a dialogue starts — invalid, unroutable, or no capacity
+  for another dialogue — is answered at once on its response subject, for every request subject.
+  It used to get no answer at all.
+
+### Changed
+
+- `sccp.local_subsystems` defaults to `[6, 8, 146, 147]` in the chart and the example
+  configuration: AnyTimeInterrogation answers come back to SSN 147. A configuration without 147
+  gets `REJECTED` for AnyTimeInterrogation. The example's comment called 146 "gsmSCF"; it is CAP,
+  and gsmSCF (MAP) is 147 (TS 23.003 §8.2).
+- An Invoke of an operation the gateway does not serve, under a context it does, is answered with
+  a TCAP Reject (unrecognizedOperation) instead of no answer.
+- A ReturnResult the gateway cannot decode ends the request with `REMOTE_ERROR` (-3) instead of
+  leaving the caller to its deadline.
+- Addresses that become a global title — an HLR `global_title` override, MT-ForwardSM's
+  `network_node_number`, ProvideSubscriberInfo's `vlr_number` — must be decimal digits; anything
+  else (`+90…`) is `REJECTED` instead of going out as a corrupted SCCP address.
+
+### Fixed
+
+- **Nature of address of MAP AddressStrings.** The MSISDN of SendRoutingInfoForSM, the MSISDN form
+  of SM-RP-OA, and every address given as a bare digit string were encoded with nature of address
+  4, which in a TS 29.002 AddressString means "subscriber number"; international is 1 (4 is
+  international in an SCCP global title, Q.713, where the value had come from). They now go out as
+  international (first octet 0x91). Applications that build an address object with `"nature": 4`
+  meaning international must send 1; client v0.2.0's `E164()` does. The test peer shared the
+  gateway's codec, so it could not see this; the encoders are now also checked against
+  hand-built octets.
+
 ## [0.7.3] - 2026-10-14
 
 ### Added

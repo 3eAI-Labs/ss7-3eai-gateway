@@ -83,6 +83,7 @@ const (
 	ErrSystemFailure               ErrorCode = 34
 	ErrDataMissing                 ErrorCode = 35
 	ErrUnexpectedDataValue         ErrorCode = 36
+	ErrATINotAllowed               ErrorCode = 49
 	ErrResourceLimitation          ErrorCode = 51
 )
 
@@ -114,6 +115,7 @@ var errorCodeNames = map[ErrorCode]string{
 	ErrSystemFailure:               "systemFailure",
 	ErrDataMissing:                 "dataMissing",
 	ErrUnexpectedDataValue:         "unexpectedDataValue",
+	ErrATINotAllowed:               "ati-NotAllowed",
 	ErrResourceLimitation:          "resourceLimitation",
 }
 
@@ -140,12 +142,27 @@ type MSISDN string
 // IMEI represents International Mobile Equipment Identity
 type IMEI string
 
-// AddressString represents E.164 address
+// AddressString is TS 29.002 AddressString: nature of address, numbering
+// plan and digits.
 type AddressString struct {
-	Nature     uint8 // 3=National, 4=International
-	NumberPlan uint8 // 1=ISDN/Telephony
+	Nature     uint8 // NatureInternational, …
+	NumberPlan uint8 // NumberingPlanISDN, …
 	Digits     string
 }
+
+// Nature-of-address indicators of an AddressString, bits 765 of its first
+// octet (TS 29.002 AddressString). Not the SCCP global title's nature of
+// address (Q.713), where international is 4.
+const (
+	NatureUnknown         uint8 = 0
+	NatureInternational   uint8 = 1
+	NatureNational        uint8 = 2
+	NatureNetworkSpecific uint8 = 3
+	NatureSubscriber      uint8 = 4
+)
+
+// NumberingPlanISDN is ISDN/Telephony (ITU-T E.164), bits 4321 = 0001.
+const NumberingPlanISDN uint8 = 1
 
 // UpdateLocationRequest (3GPP TS 29.002 - MAP-MS-DataTypes)
 type UpdateLocationRequest struct {
@@ -431,41 +448,6 @@ type GMSCCamelSubscriptionInfo struct {
 	TCSI2              []byte
 }
 
-// SubscriberInfo
-type SubscriberInfo struct {
-	LocationInformation *LocationInformation
-	SubscriberState     *SubscriberState
-	ExtensionContainer  []byte
-	MSClassmark2        []byte
-	GPRSMSClass         []byte
-	MNPIMSI             *IMSI
-}
-
-// LocationInformation
-type LocationInformation struct {
-	AgeOfLocationInformation         *int32
-	GeographicalInformation          []byte
-	VLRNumber                        *AddressString
-	LocationNumber                   *AddressString
-	CellGlobalIDOrServiceAreaIDOrLAI []byte
-	ExtensionContainer               []byte
-	LSAIdentity                      []byte
-	MSCNumber                        *AddressString
-	GeodeticInformation              []byte
-	CurrentLocationRetrieved         bool
-	SAIPresent                       bool
-}
-
-// SubscriberState
-type SubscriberState uint8
-
-const (
-	SubscriberStateAssumedIdle                   SubscriberState = 0
-	SubscriberStateCamelBusy                     SubscriberState = 1
-	SubscriberStateNetworkDeterminedNotReachable SubscriberState = 2
-	SubscriberStateNotProvidedFromVLR            SubscriberState = 3
-)
-
 // NumberPortabilityStatus
 type NumberPortabilityStatus uint8
 
@@ -525,46 +507,6 @@ type ProvideRoamingNumberResponse struct {
 	VMSCAddress               *AddressString
 }
 
-// AnyTimeInterrogationRequest (3GPP TS 29.002)
-type AnyTimeInterrogationRequest struct {
-	SubscriberIdentity SubscriberIdentity
-	RequestedInfo      RequestedInfo
-	GSMSCFAddress      AddressString
-	ExtensionContainer []byte
-}
-
-// AnyTimeInterrogationResponse
-type AnyTimeInterrogationResponse struct {
-	SubscriberInfo     SubscriberInfo
-	ExtensionContainer []byte
-}
-
-// SubscriberIdentity
-type SubscriberIdentity struct {
-	IMSI   *IMSI
-	MSISDN *MSISDN
-}
-
-// RequestedInfo
-type RequestedInfo struct {
-	LocationInformation bool
-	SubscriberState     bool
-	ExtensionContainer  []byte
-	CurrentLocation     bool
-	RequestedDomain     *DomainType
-	IMEISVRequested     bool
-	MSClassmark         bool
-	MNPIMSI             bool
-}
-
-// DomainType
-type DomainType uint8
-
-const (
-	DomainTypeCSComain DomainType = 0
-	DomainTypePSDomain DomainType = 1
-)
-
 // Handler manages MAP protocol operations
 type Handler struct {
 	config *Config
@@ -589,7 +531,6 @@ type Handler struct {
 	updateLocationHandler       UpdateLocationHandler
 	sendRoutingInfoHandler      SendRoutingInfoHandler
 	provideRoamingNumHandler    ProvideRoamingNumberHandler
-	anyTimeIntHandler           AnyTimeInterrogationHandler
 	cancelLocationHandler       CancelLocationHandler
 	sendRoutingInfoForSMHandler SendRoutingInfoForSMHandler
 	mtForwardSMHandler          MtForwardSMHandler
@@ -614,10 +555,6 @@ type SendRoutingInfoHandler interface {
 
 type ProvideRoamingNumberHandler interface {
 	HandleProvideRoamingNumber(req *ProvideRoamingNumberRequest) (*ProvideRoamingNumberResponse, *ErrorCode, error)
-}
-
-type AnyTimeInterrogationHandler interface {
-	HandleAnyTimeInterrogation(req *AnyTimeInterrogationRequest) (*AnyTimeInterrogationResponse, *ErrorCode, error)
 }
 
 type CancelLocationHandler interface {
@@ -660,6 +597,11 @@ type Config struct {
 	HLRAddress     string `yaml:"hlr_address" json:"hlr_address"` // informational (logs) only
 	HLRGlobalTitle string `yaml:"hlr_gt" json:"hlr_gt"`
 	HLRPointCode   uint32 `yaml:"hlr_pc" json:"hlr_pc"`
+
+	// GSMSCFAddress is the gsmSCF-Address (E.164 digits) AnyTimeInterrogation
+	// carries for the HLR to screen, unless the request names one. Empty:
+	// the cluster GT, else the node's own GT.
+	GSMSCFAddress string `yaml:"gsmscf_address" json:"gsmscf_address"`
 
 	// Performance
 	ChannelBufferSize int           `yaml:"channel_buffer_size" json:"channel_buffer_size"`

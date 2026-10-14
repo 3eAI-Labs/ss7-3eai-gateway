@@ -113,6 +113,10 @@ func (h *Handler) routeInvoke(dialogue *tcap.Dialogue, comp *tcap.Component) {
 	respBytes, errCode, err := h.processInvoke(op, comp.Parameter, tid)
 
 	switch {
+	case errors.Is(err, errUnsupportedOperation):
+		// Q.773 §3.1.5.3.3 — Invoke / unrecognizedOperation: the peer is
+		// answered instead of left to its timer.
+		h.emitReject(dialogue, comp, tcap.ProblemTypeInvoke, tcap.InvokeProblemUnrecognizedOperation)
 	case errors.Is(err, errCodecDecode):
 		// Q.773 §3.1.5.3.3 — Invoke / mistypedParameter.
 		h.emitReject(dialogue, comp, tcap.ProblemTypeInvoke, tcap.InvokeProblemMistypedParameter)
@@ -130,6 +134,10 @@ func (h *Handler) routeInvoke(dialogue *tcap.Dialogue, comp *tcap.Component) {
 // errCodecDecode tags ASN.1 decode failures so routeInvoke can map them to a
 // TCAP Reject (mistyped-parameter) instead of a MAP-level ReturnError.
 var errCodecDecode = errors.New("map: BER decode failed")
+
+// errUnsupportedOperation tags an Invoke of an operation this gateway does
+// not serve.
+var errUnsupportedOperation = errors.New("map: unsupported operation")
 
 // handleReturnResult decodes an inbound ReturnResult component and forwards
 // the typed response to the registered sink. The dialogue carries the
@@ -162,6 +170,9 @@ func (h *Handler) handleReturnResult(dialogue *tcap.Dialogue, comp *tcap.Compone
 			zap.Int32("op_code", int32(op)),
 			zap.Uint32("tid", tid),
 			zap.Error(err))
+		// The dialogue has ended with an answer the caller cannot use: tell
+		// it so rather than leave it to its deadline.
+		h.reportRemoteError(dialogue, 0, "undecodable result: "+err.Error())
 		return
 	}
 	if h.responseSink == nil || resp == nil {
@@ -188,14 +199,17 @@ func decodeReturnResult(op OperationCode, param []byte) (any, error) {
 		return decodeMtForwardSMRes(param)
 	case OpMoForwardSM:
 		return decodeMoForwardSMRes(param)
+	case OpAnyTimeInterrogation:
+		return DecodeAnyTimeInterrogationRes(param)
+	case OpProvideSubscriberInfo:
+		return DecodeProvideSubscriberInfoRes(param)
 	}
 	return nil, nil
 }
 
 // processInvoke decodes the parameter bytes for op, runs the registered
-// Process* method, and returns the encoded response. respBytes is nil for
-// operations whose response is intentionally empty (CancelLocation) or for
-// unsupported op codes.
+// Process* method, and returns the encoded response. An operation this
+// gateway does not serve returns errUnsupportedOperation.
 func (h *Handler) processInvoke(op OperationCode, param []byte, tid uint32) (respBytes []byte, errCode *ErrorCode, err error) {
 	switch op {
 	case OpUpdateLocation:
@@ -270,24 +284,6 @@ func (h *Handler) processInvoke(op OperationCode, param []byte, tid uint32) (res
 		}
 		return out, nil, nil
 
-	case OpAnyTimeInterrogation:
-		req, derr := decodeAnyTimeInterrogationArg(param)
-		if derr != nil {
-			h.metrics.Errors.Add(1)
-			h.logger.Warn("MAP AnyTimeInterrogation decode failed",
-				zap.Error(derr), zap.Uint32("tid", tid))
-			return nil, nil, fmt.Errorf("%w: %v", errCodecDecode, derr)
-		}
-		resp, ec, perr := h.ProcessAnyTimeInterrogation(req)
-		if perr != nil || resp == nil {
-			return nil, ec, perr
-		}
-		out, eerr := encodeAnyTimeInterrogationRes(resp)
-		if eerr != nil {
-			return nil, nil, eerr
-		}
-		return out, nil, nil
-
 	case OpSendRoutingInfoForSM:
 		req, derr := decodeSendRoutingInfoForSMArg(param)
 		if derr != nil {
@@ -347,7 +343,7 @@ func (h *Handler) processInvoke(op OperationCode, param []byte, tid uint32) (res
 		zap.Int32("op_code", int32(op)),
 		zap.Uint32("tid", tid))
 	h.metrics.Errors.Add(1)
-	return nil, nil, nil
+	return nil, nil, errUnsupportedOperation
 }
 
 // emitReturnResult builds an outbound TCAP END containing a single

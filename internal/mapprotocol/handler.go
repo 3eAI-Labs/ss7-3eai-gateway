@@ -111,11 +111,6 @@ func (h *Handler) SetProvideRoamingNumberHandler(handler ProvideRoamingNumberHan
 	h.provideRoamingNumHandler = handler
 }
 
-// SetAnyTimeInterrogationHandler sets the handler for AnyTimeInterrogation operations
-func (h *Handler) SetAnyTimeInterrogationHandler(handler AnyTimeInterrogationHandler) {
-	h.anyTimeIntHandler = handler
-}
-
 // SetCancelLocationHandler sets the handler for CancelLocation operations
 func (h *Handler) SetCancelLocationHandler(handler CancelLocationHandler) {
 	h.cancelLocationHandler = handler
@@ -278,49 +273,6 @@ func (h *Handler) ProcessProvideRoamingNumber(req *ProvideRoamingNumberRequest) 
 	h.logger.Info("ProvideRoamingNumber successful",
 		zap.String("imsi", string(req.IMSI)),
 		zap.String("roaming_number", resp.RoamingNumber.Digits))
-
-	return resp, nil, nil
-}
-
-// ProcessAnyTimeInterrogation handles AnyTimeInterrogation request. Per-op
-// counter is bumped at the dispatch entry point (routeInvoke).
-func (h *Handler) ProcessAnyTimeInterrogation(req *AnyTimeInterrogationRequest) (*AnyTimeInterrogationResponse, *ErrorCode, error) {
-	subscriberID := ""
-	if req.SubscriberIdentity.IMSI != nil {
-		subscriberID = string(*req.SubscriberIdentity.IMSI)
-	} else if req.SubscriberIdentity.MSISDN != nil {
-		subscriberID = string(*req.SubscriberIdentity.MSISDN)
-	}
-
-	h.logger.Info("Processing AnyTimeInterrogation",
-		zap.String("subscriber_id", subscriberID),
-		zap.String("gsmscf", req.GSMSCFAddress.Digits))
-
-	if h.anyTimeIntHandler == nil {
-		h.logger.Error("AnyTimeInterrogation handler not set")
-		h.metrics.Errors.Add(1)
-		return nil, nil, ErrHandlerNotSet
-	}
-
-	// Validate request
-	if req.SubscriberIdentity.IMSI == nil && req.SubscriberIdentity.MSISDN == nil {
-		h.logger.Error("Invalid AnyTimeInterrogation request: subscriber identity missing")
-		h.metrics.Errors.Add(1)
-		errCode := ErrDataMissing
-		return nil, &errCode, ErrInvalidRequest
-	}
-
-	// Call handler
-	resp, errCode, err := h.anyTimeIntHandler.HandleAnyTimeInterrogation(req)
-	if err != nil {
-		h.logger.Error("AnyTimeInterrogation failed", zap.Error(err))
-		h.metrics.Errors.Add(1)
-		h.updateErrorMetrics(errCode)
-		return nil, errCode, err
-	}
-
-	h.logger.Info("AnyTimeInterrogation successful",
-		zap.String("subscriber_id", subscriberID))
 
 	return resp, nil, nil
 }
@@ -518,13 +470,6 @@ func NewSendRoutingInfoResponse(imsi IMSI, roamingNumber *AddressString) *SendRo
 func NewProvideRoamingNumberResponse(roamingNumber AddressString) *ProvideRoamingNumberResponse {
 	return &ProvideRoamingNumberResponse{
 		RoamingNumber: roamingNumber,
-	}
-}
-
-// NewAnyTimeInterrogationResponse creates a successful AnyTimeInterrogation response
-func NewAnyTimeInterrogationResponse(info SubscriberInfo) *AnyTimeInterrogationResponse {
-	return &AnyTimeInterrogationResponse{
-		SubscriberInfo: info,
 	}
 }
 

@@ -415,85 +415,6 @@ func encodeProvideRoamingNumberRes(r *ProvideRoamingNumberResponse) ([]byte, err
 	return asn1.Marshal(wireProvideRoamingNumberRes{RoamingNumber: rn})
 }
 
-// ----- AnyTimeInterrogationArg / Res ---------------------------------------
-//
-// AnyTimeInterrogationArg ::= SEQUENCE {
-//   subscriberIdentity [0] SubscriberIdentity,
-//   requestedInfo      [1] RequestedInfo,
-//   gsmSCF-Address     [3] ISDN-AddressString,
-//   extensionContainer [2] ExtensionContainer OPTIONAL
-// }
-// SubscriberIdentity ::= CHOICE { imsi [0] IMSI, msisdn [1] ISDN-AddressString }
-//
-// AnyTimeInterrogationRes ::= SEQUENCE {
-//   subscriberInfo     SubscriberInfo,
-//   ...
-// }
-// On the response side we emit an empty SubscriberInfo SEQUENCE — the carrier
-// platform fills it in, but for v1 transport correctness we just ship the
-// SEQUENCE wrapper.
-
-type wireSubscriberIdentity struct {
-	IMSI   []byte `asn1:"tag:0,optional,implicit"`
-	MSISDN []byte `asn1:"tag:1,optional,implicit"`
-}
-
-type wireRequestedInfo struct {
-	LocationInformation asn1.RawValue   `asn1:"tag:0,optional"`
-	SubscriberState     asn1.RawValue   `asn1:"tag:1,optional"`
-	Rest                []asn1.RawValue `asn1:"optional"`
-}
-
-type wireAnyTimeInterrogationArg struct {
-	SubscriberIdentity wireSubscriberIdentity `asn1:"tag:0"`
-	RequestedInfo      wireRequestedInfo      `asn1:"tag:1"`
-	GSMSCFAddress      []byte                 `asn1:"tag:3,implicit"`
-	ExtensionContainer asn1.RawValue          `asn1:"tag:2,optional"`
-}
-
-type wireAnyTimeInterrogationRes struct {
-	SubscriberInfo struct{}
-	Rest           []asn1.RawValue `asn1:"optional"`
-}
-
-func decodeAnyTimeInterrogationArg(b []byte) (*AnyTimeInterrogationRequest, error) {
-	var w wireAnyTimeInterrogationArg
-	if _, err := asn1.Unmarshal(b, &w); err != nil {
-		return nil, fmt.Errorf("AnyTimeInterrogationArg: %w", err)
-	}
-	req := &AnyTimeInterrogationRequest{}
-	if len(w.SubscriberIdentity.IMSI) > 0 {
-		imsi, err := decodeIMSI(w.SubscriberIdentity.IMSI)
-		if err != nil {
-			return nil, err
-		}
-		req.SubscriberIdentity.IMSI = &imsi
-	}
-	if len(w.SubscriberIdentity.MSISDN) > 0 {
-		addr, err := decodeAddressString(w.SubscriberIdentity.MSISDN)
-		if err != nil {
-			return nil, fmt.Errorf("msisdn: %w", err)
-		}
-		m := MSISDN(addr.Digits)
-		req.SubscriberIdentity.MSISDN = &m
-	}
-	if req.SubscriberIdentity.IMSI == nil && req.SubscriberIdentity.MSISDN == nil {
-		return nil, errors.New("AnyTimeInterrogationArg: subscriber identity missing")
-	}
-	gscf, err := decodeAddressString(w.GSMSCFAddress)
-	if err != nil {
-		return nil, fmt.Errorf("gsmSCF-Address: %w", err)
-	}
-	req.GSMSCFAddress = *gscf
-	req.RequestedInfo.LocationInformation = len(w.RequestedInfo.LocationInformation.FullBytes) > 0
-	req.RequestedInfo.SubscriberState = len(w.RequestedInfo.SubscriberState.FullBytes) > 0
-	return req, nil
-}
-
-func encodeAnyTimeInterrogationRes(_ *AnyTimeInterrogationResponse) ([]byte, error) {
-	return asn1.Marshal(wireAnyTimeInterrogationRes{})
-}
-
 // ----- SMS path: SendRoutingInfoForSM / MtForwardSM / MoForwardSM ----------
 //
 // 3GPP TS 29.002 v17 §17.7.13 (SRI-for-SM), §17.7.4 (MT-Fwd-SM),
@@ -588,8 +509,8 @@ func encodeSendRoutingInfoForSMArg(r *SendRoutingInfoForSMRequest) ([]byte, erro
 		return nil, errors.New("SendRoutingInfoForSMArg: nil")
 	}
 	msisdn, err := encodeAddressString(&AddressString{
-		Nature:     4, // International — SRI-for-SM always uses E.164
-		NumberPlan: 1,
+		Nature:     NatureInternational, // SRI-for-SM always uses E.164
+		NumberPlan: NumberingPlanISDN,
 		Digits:     string(r.MSISDN),
 	})
 	if err != nil {
@@ -715,7 +636,7 @@ func encodeSMRPOA(o SMRPOA) (asn1.RawValue, error) {
 	switch {
 	case o.MSISDN != nil:
 		b, err := encodeAddressString(&AddressString{
-			Nature: 4, NumberPlan: 1, Digits: string(*o.MSISDN),
+			Nature: NatureInternational, NumberPlan: NumberingPlanISDN, Digits: string(*o.MSISDN),
 		})
 		if err != nil {
 			return asn1.RawValue{}, err

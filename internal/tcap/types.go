@@ -165,6 +165,17 @@ var (
 		OID:  []int{0, 4, 0, 0, 1, 0, 25, 2},
 		Name: "shortMsgMT-RelayContext-v2",
 	}
+	// Subscriber location and state, TS 29.002 §17.3.2.28–29, both "v3
+	// only": ProvideSubscriberInfo (HLR → VLR) under subscriberInfoEnquiry,
+	// AnyTimeInterrogation (gsmSCF → HLR) under anyTimeInfoEnquiry.
+	ACSubscriberInfoEnquiryV3 = ApplicationContext{
+		OID:  []int{0, 4, 0, 0, 1, 0, 28, 3},
+		Name: "subscriberInfoEnquiryContext-v3",
+	}
+	ACAnyTimeInfoEnquiryV3 = ApplicationContext{
+		OID:  []int{0, 4, 0, 0, 1, 0, 29, 3},
+		Name: "anyTimeInfoEnquiryContext-v3",
+	}
 	ACCapV2 = ApplicationContext{
 		OID:  []int{0, 4, 0, 0, 1, 0, 50, 1},
 		Name: "cap-ac-gsmSCF-gsmSSF-v2",

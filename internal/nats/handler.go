@@ -225,6 +225,8 @@ func (h *Handler) subscribeAll() error {
 	}{
 		{SubjectMTSmsRequest, h.handleMTSmsRequest},
 		{SubjectSRIRequest, h.handleSRIRequest},
+		{SubjectATIRequest, h.handleATIRequest},
+		{SubjectPSIRequest, h.handlePSIRequest},
 		{SubjectCAPInitialDP, h.handleCAPInitialDP},
 		{SubjectINAPInitialDP, h.handleINAPInitialDP},
 	}
@@ -266,6 +268,16 @@ func (h *Handler) handleSRIRequest(msg *nats.Msg) {
 	h.processIncomingMessage(msg, h.onSRIRequest)
 }
 
+func (h *Handler) handleATIRequest(msg *nats.Msg) {
+	h.metrics.ATIRequestCount.Add(1)
+	h.processIncomingMessage(msg, h.onATIRequest)
+}
+
+func (h *Handler) handlePSIRequest(msg *nats.Msg) {
+	h.metrics.PSIRequestCount.Add(1)
+	h.processIncomingMessage(msg, h.onPSIRequest)
+}
+
 func (h *Handler) handleCAPInitialDP(msg *nats.Msg) {
 	h.metrics.CAPInitialDPCount.Add(1)
 	h.processIncomingMessage(msg, h.onCAPInitialDP)
@@ -303,6 +315,7 @@ func (h *Handler) processIncomingMessage(msg *nats.Msg, handler func(*NatsMessag
 				zap.Error(err),
 				zap.String("message_id", natsMsg.MessageID))
 			h.metrics.ProcessingErrors.Add(1)
+			h.publishRejection(msg.Subject, &natsMsg, err)
 		}
 	} else {
 		// No handler registered, queue for application
@@ -314,6 +327,35 @@ func (h *Handler) processIncomingMessage(msg *nats.Msg, handler func(*NatsMessag
 				zap.String("message_id", natsMsg.MessageID))
 			h.metrics.ProcessingErrors.Add(1)
 		}
+	}
+}
+
+// responseTypeBySubject is the response message type of each request subject
+// of the contract.
+var responseTypeBySubject = map[string]MessageType{
+	SubjectSRIRequest:   MsgTypeMAPSRI,
+	SubjectMTSmsRequest: MsgTypeMAPMTSms,
+	SubjectATIRequest:   MsgTypeMAPATI,
+	SubjectPSIRequest:   MsgTypeMAPPSI,
+}
+
+// publishRejection answers a request refused before a dialogue started —
+// invalid, or no capacity for it — with StatusRejected on its response
+// subject, so the caller does not wait out its deadline.
+func (h *Handler) publishRejection(subject string, req *NatsMessage, reason error) {
+	msgType, ok := responseTypeBySubject[subject]
+	if !ok {
+		return
+	}
+	corrID := req.CorrelationID
+	if corrID == "" {
+		corrID = req.MessageID
+	}
+	if corrID == "" {
+		return // nothing the caller could match an answer by
+	}
+	if err := h.PublishFailure(msgType, corrID, ss7client.StatusRejected, ss7client.ErrCodeRejected, reason.Error()); err != nil {
+		h.logger.Error("publish rejection", zap.String("correlation_id", corrID), zap.Error(err))
 	}
 }
 
@@ -411,6 +453,10 @@ func (h *Handler) getSubjectForMessage(msg *NatsMessage) string {
 		return SubjectMTSmsResponse
 	case MsgTypeMAPSRI:
 		return SubjectSRIResponse
+	case MsgTypeMAPATI:
+		return SubjectATIResponse
+	case MsgTypeMAPPSI:
+		return SubjectPSIResponse
 	case MsgTypeCAPEventReport:
 		return SubjectCAPEventReport
 	case MsgTypeINAPEventReport:
@@ -514,30 +560,6 @@ func (h *Handler) PublishMTSmsResponse(correlationID, status string, errorCode i
 	}
 }
 
-// PublishMTSmsFailure publishes an MT-Forward-SM failure with its
-// human-readable reason. Same subject and wire shape as PublishMTSmsResponse
-// plus ErrorMessage; see nats_bridge.publishMAPFailure / publishMAPError.
-func (h *Handler) PublishMTSmsFailure(correlationID, status string, errorCode int32, errMsg string) error {
-	msg := &NatsMessage{
-		MessageID:     uuid.New().String(),
-		CorrelationID: correlationID,
-		MessageType:   MsgTypeMAPMTSms,
-		Direction:     DirectionOutbound,
-		Timestamp:     time.Now(),
-		Status:        status,
-		ErrorCode:     errorCode,
-		ErrorMessage:  errMsg,
-		NodeID:        h.config.NodeID,
-	}
-
-	select {
-	case h.outgoingCh <- msg:
-		return nil
-	default:
-		return fmt.Errorf("outgoing channel full")
-	}
-}
-
 // PublishSRIResponse publishes SendRoutingInfo response to NATS
 func (h *Handler) PublishSRIResponse(correlationID, msisdn, imsi string, vmscAddress string) error {
 	msg := &NatsMessage{
@@ -562,23 +584,38 @@ func (h *Handler) PublishSRIResponse(correlationID, msisdn, imsi string, vmscAdd
 	}
 }
 
-// PublishSRIFailure publishes a SendRoutingInfo failure to NATS. Used when
-// the originated dialogue ended without a ReturnResult (timeout / inbound
-// ABORT). status/errorCode are the gateway-private failure taxonomy; see
-// nats_bridge.publishMAPFailure for the wire contract.
-func (h *Handler) PublishSRIFailure(correlationID, status string, errorCode int32, errMsg string) error {
-	msg := &NatsMessage{
+// PublishFailure publishes the failure of a request on the response subject
+// of msgType: a refused request, a timed-out or aborted dialogue, or the
+// peer's error.
+func (h *Handler) PublishFailure(msgType MessageType, correlationID, status string, errorCode int32, errMsg string) error {
+	return h.enqueue(&NatsMessage{
 		MessageID:     uuid.New().String(),
 		CorrelationID: correlationID,
-		MessageType:   MsgTypeMAPSRI,
+		MessageType:   msgType,
 		Direction:     DirectionOutbound,
 		Timestamp:     time.Now(),
 		Status:        status,
 		ErrorCode:     errorCode,
 		ErrorMessage:  errMsg,
 		NodeID:        h.config.NodeID,
-	}
+	})
+}
 
+// PublishSubscriberInfo publishes a successful AnyTimeInterrogation
+// (MsgTypeMAPATI) or ProvideSubscriberInfo (MsgTypeMAPPSI) answer.
+func (h *Handler) PublishSubscriberInfo(msgType MessageType, correlationID string, info *ss7client.SubscriberInfo) error {
+	return h.enqueue(&NatsMessage{
+		MessageID:      uuid.New().String(),
+		CorrelationID:  correlationID,
+		MessageType:    msgType,
+		Direction:      DirectionOutbound,
+		Timestamp:      time.Now(),
+		SubscriberInfo: info,
+		NodeID:         h.config.NodeID,
+	})
+}
+
+func (h *Handler) enqueue(msg *NatsMessage) error {
 	select {
 	case h.outgoingCh <- msg:
 		return nil
@@ -595,6 +632,14 @@ func (h *Handler) OnMTSmsRequest(handler func(*NatsMessage) error) {
 
 func (h *Handler) OnSRIRequest(handler func(*NatsMessage) error) {
 	h.onSRIRequest = handler
+}
+
+func (h *Handler) OnATIRequest(handler func(*NatsMessage) error) {
+	h.onATIRequest = handler
+}
+
+func (h *Handler) OnPSIRequest(handler func(*NatsMessage) error) {
+	h.onPSIRequest = handler
 }
 
 func (h *Handler) OnCAPInitialDP(handler func(*NatsMessage) error) {

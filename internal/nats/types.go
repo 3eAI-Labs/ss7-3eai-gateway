@@ -18,16 +18,20 @@ import (
 // applications can link it without this AGPL server. The aliases below keep
 // the server's names; change the contract there, not here.
 
-// NATS subjects of the MAP SMS interface (contract: ss7client).
+// NATS subjects of the MAP interfaces (contract: ss7client).
 const (
 	// Inbound: application → gateway
 	SubjectMTSmsRequest = ss7client.SubjectMTSMSRequest
 	SubjectSRIRequest   = ss7client.SubjectSRIRequest
+	SubjectATIRequest   = ss7client.SubjectATIRequest
+	SubjectPSIRequest   = ss7client.SubjectPSIRequest
 
 	// Outbound: gateway → application
 	SubjectMOSms         = ss7client.SubjectMOSMS
 	SubjectMTSmsResponse = ss7client.SubjectMTSMSResponse
 	SubjectSRIResponse   = ss7client.SubjectSRIResponse
+	SubjectATIResponse   = ss7client.SubjectATIResponse
+	SubjectPSIResponse   = ss7client.SubjectPSIResponse
 )
 
 // Server-private subjects: CAP/INAP are bound but not part of the published
@@ -54,6 +58,8 @@ const (
 	MsgTypeMAPMTSms = ss7client.MsgTypeMAPMTSMS
 	MsgTypeMAPMOSms = ss7client.MsgTypeMAPMOSMS
 	MsgTypeMAPSRI   = ss7client.MsgTypeMAPSRI
+	MsgTypeMAPATI   = ss7client.MsgTypeMAPATI
+	MsgTypeMAPPSI   = ss7client.MsgTypeMAPPSI
 
 	// Server-private message types
 	MsgTypeMAPUpdateLocation MessageType = "MAP_UL"
@@ -127,6 +133,8 @@ type Handler struct {
 	// Message handlers (callbacks)
 	onMTSmsRequest  func(*NatsMessage) error
 	onSRIRequest    func(*NatsMessage) error
+	onATIRequest    func(*NatsMessage) error
+	onPSIRequest    func(*NatsMessage) error
 	onCAPInitialDP  func(*NatsMessage) error
 	onINAPInitialDP func(*NatsMessage) error
 
@@ -162,6 +170,8 @@ type Metrics struct {
 	MTSmsRequestCount  atomic.Uint64
 	MOSmsPublishCount  atomic.Uint64
 	SRIRequestCount    atomic.Uint64
+	ATIRequestCount    atomic.Uint64
+	PSIRequestCount    atomic.Uint64
 	CAPInitialDPCount  atomic.Uint64
 	INAPInitialDPCount atomic.Uint64
 
