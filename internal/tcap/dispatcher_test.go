@@ -355,3 +355,23 @@ func TestCanonicalOID(t *testing.T) {
 		})
 	}
 }
+
+type panickingHandler struct{}
+
+func (panickingHandler) HandleTCAPMessage(*Dialogue, *Message) error { panic("decoder bug") }
+func (panickingHandler) Name() string                                { return "panicking" }
+
+// A panic in an application handler costs that message, not the gateway.
+func TestDispatcher_HandlerPanicBecomesError(t *testing.T) {
+	d := NewDispatcher(zap.NewNop())
+	if err := d.Register(ACShortMsgMORelayV3.OID, panickingHandler{}); err != nil {
+		t.Fatal(err)
+	}
+	err := d.Dispatch(nil, dialogueMsgWithAC(ACShortMsgMORelayV3.OID))
+	if !errors.Is(err, ErrHandlerPanic) {
+		t.Fatalf("want ErrHandlerPanic, got %v", err)
+	}
+	if d.Metrics().HandlerErrors.Load() != 1 {
+		t.Fatal("the panic must count as a handler error")
+	}
+}

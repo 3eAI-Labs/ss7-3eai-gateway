@@ -46,6 +46,7 @@ import (
 
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/mapprotocol"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/tcap"
 	"github.com/ishidawataru/sctp"
 	"github.com/wmnsk/go-m3ua"
 	"github.com/wmnsk/go-m3ua/messages/params"
@@ -152,6 +153,13 @@ type Config struct {
 
 	// OnMtForwardSMPreDrop — same semantic as OnSRIPreDrop, for op 44.
 	OnMtForwardSMPreDrop PreDropHook
+
+	// RefuseContexts makes the peer behave like a node that supports only
+	// version 2 of every context: each BEGIN is answered with a TC-U-ABORT
+	// whose AARE refuses the proposed context and proposes version 2 of it
+	// (TS 29.002 §12.1). Exercises the gateway's handling of a refused
+	// dialogue.
+	RefuseContexts bool
 
 	// AcceptTimeout bounds how long Listen.Accept will wait for an ASP
 	// before tearing down. Default 5s if zero.
@@ -438,7 +446,7 @@ func (p *Peer) handleMTP3(conn *m3ua.Conn, pd *params.ProtocolDataPayload) {
 		return
 	}
 
-	tcapMsg, err := gotcap.Parse(sccpMsg.Data)
+	tcapMsg, err := tcap.ParseWire(sccpMsg.Data)
 	if err != nil {
 		p.logger.Warn("TCAP parse failed", zap.Error(err))
 		return
@@ -481,6 +489,12 @@ func (p *Peer) handleMTP3(conn *m3ua.Conn, pd *params.ProtocolDataPayload) {
 		}
 
 		otid := bytesToUint32(otidValue.Value)
+		if p.cfg.RefuseContexts {
+			if want, known := expectedACByOp[int32(opCode)]; known {
+				p.sendACNotSupported(conn, pd, sccpMsg, otidValue.Value, acOID(want[len(want)-2], 2))
+				return
+			}
+		}
 		if supported, ok := p.checkApplicationContext(tcapMsg, int32(opCode)); !ok {
 			p.sendACNotSupported(conn, pd, sccpMsg, otidValue.Value, supported)
 			return

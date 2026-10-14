@@ -483,6 +483,68 @@ func TestE2E_Client_RemoteErrors(t *testing.T) {
 	require.Equal(t, "absentSubscriberSM", gwErr.Message)
 }
 
+// TestE2E_ContextRefused: the HLR supports only version 2 and refuses the
+// gateway's v3 dialogue with a TC-U-ABORT (no P-Abort cause, an AARE that
+// rejects the context and proposes v2). The gateway must parse it and answer
+// the caller at once — ABORTED, naming the refused context — instead of
+// waiting out the dialogue timer.
+func TestE2E_ContextRefused(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+
+	natsServer := startEmbeddedNATS(t)
+	defer natsServer.Shutdown()
+
+	peer, err := ss7peer.Start(context.Background(), ss7peer.Config{
+		SCTPAddr:         allocLoopbackSCTPPort(t),
+		PointCode:        e2ePeerPC,
+		GatewayPointCode: e2eGatewayPC,
+		NetworkIndicator: e2eNetworkIndicator,
+		NetworkVariant:   sccp.VariantANSI,
+		Logger:           logger.Named("peer"),
+		RefuseContexts:   true,
+		OnSRI: func(*mapprotocol.SendRoutingInfoForSMRequest, string, string, uint32) (*mapprotocol.SendRoutingInfoForSMResponse, error) {
+			t.Error("a refused dialogue must not reach the operation")
+			return nil, nil
+		},
+	})
+	require.NoError(t, err, "start ss7peer")
+	t.Cleanup(func() { require.Empty(t, peer.Violations(), "ss7peer conformance violations") })
+	defer peer.Stop()
+
+	cfg := buildE2EConfig(t, peer.SCTPAddr(), natsServer.ClientURL())
+	handlers, err := initializeHandlers(cfg, logger.Named("gw"))
+	require.NoError(t, err, "initializeHandlers")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, startServices(ctx, handlers, logger.Named("gw")), "startServices")
+	require.NoError(t, handlers.M3UA.WaitForActive(10*time.Second), "M3UA association")
+	t.Cleanup(func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		_ = stopServices(shutdownCtx, handlers, logger.Named("gw"))
+	})
+
+	nc, err := nats.Connect(natsServer.ClientURL(), nats.Name("e2e-context-refused"))
+	require.NoError(t, err)
+	defer nc.Close()
+	client, err := ss7client.New(nc)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Well under tcap.dialogue_timeout (10s): a timeout cannot pass this test.
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer reqCancel()
+	_, err = client.SendRoutingInfoForSM(reqCtx, ss7client.SRIRequest{
+		MSISDN:               e2eTestMSISDN,
+		ServiceCentreAddress: ss7client.E164(e2eTestSCA),
+	})
+	var gwErr *ss7client.GatewayError
+	require.ErrorAs(t, err, &gwErr)
+	require.Equal(t, ss7client.StatusAborted, gwErr.Status)
+	require.Contains(t, gwErr.Message, "application context refused")
+	require.Contains(t, gwErr.Message, "0.4.0.0.1.0.20.2", "the version the peer proposes")
+}
+
 // startEmbeddedNATS boots an in-process NATS server on a random port.
 // JetStream not enabled — the gateway uses NATS pub/sub for the SS7
 // bridge subjects, and JetStream KV for ConfigStore. ConfigStore can

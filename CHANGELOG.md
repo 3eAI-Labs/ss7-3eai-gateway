@@ -6,6 +6,30 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-14
+
+### Security
+
+- Remote denial of service: a malformed TCAP message, or a CAP InitialDP without its optional
+  party numbers, could crash the gateway process. Both are fixed; a malformed message is now
+  dropped, and a defect in any operation handler costs that message only. 0.7.0 is affected;
+  upgrade to 0.7.1.
+
+### Fixed
+
+- The answer to a dialogue opened by a peer (MO-ForwardSM from an MSC) carried no dialogue
+  portion. Its first END or CONTINUE now carries an AARE accepting the application context
+  (Q.773 §4.2.1).
+- A dialogue under an application context the gateway does not implement was refused with a
+  P-ABORT (no-common-dialogue-portion). It is now refused the way TS 29.002 §12.1 expects:
+  TC-U-ABORT, AARE reject-permanent / application-context-name-not-supported, naming the version
+  the gateway supports so the peer can retry.
+- A TC-U-ABORT from the peer (e.g. an HLR refusing the proposed version) could not be parsed —
+  go-tcap's parser reads a P-Abort cause unconditionally — so the dialogue ran into its timer;
+  had it parsed, the absent cause would have crashed the abort handler. ABORTs are now parsed
+  with go-tcap's BER parser, and the caller gets `ABORTED` at once with the refused context and
+  the peer's proposal in `error_message`.
+
 ## [0.7.0] - 2026-10-14
 
 The first public release. Internal builds before it carried the

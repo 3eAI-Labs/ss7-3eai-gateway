@@ -72,7 +72,9 @@ same fields before publishing and bounds every call with a deadline.
 
 An MSC opens a dialogue under `shortMsgMO-RelayContext-v3`, addressed to the cluster GT. The STP
 loadshares it to one node. That node decodes MO-ForwardSM, publishes it on `map.mo.sms`, and
-answers the MSC with an empty result: the SMSC takes over delivery. MO delivery over NATS is a
+answers the MSC with an empty result, its dialogue portion an AARE accepting the context: the
+SMSC takes over delivery. A dialogue under a context the gateway does not implement is refused
+with a TC-U-ABORT whose AARE names the version it does support, so the peer can retry with it. MO delivery over NATS is a
 plain publish. Subscribers should use a queue group, and a message published while no subscriber
 is connected is lost.
 

@@ -351,6 +351,8 @@ func (h *Handler) handleBegin(sccpCtx *sccp.SccpMessage, msg *Message) {
 		PendingInvokes:     make(map[int32]*PendingInvoke),
 	}
 
+	dialogue.dialogueResponsePending.Store(appCtx != nil)
+
 	h.dialoguesMu.Lock()
 	h.dialogues[localTID] = dialogue
 	h.dialoguesMu.Unlock()
@@ -457,23 +459,35 @@ func (h *Handler) handleAbort(sccpCtx *sccp.SccpMessage, msg *Message) {
 		abortType = "P-ABORT"
 	}
 
+	// A P-ABORT carries a cause; a TC-U-ABORT may carry none, its reason
+	// being in the dialogue portion (an AARE refusing the context).
+	var detail string
+	switch {
+	case msg.AbortCause != nil:
+		detail = fmt.Sprintf("%s cause=0x%02x", abortType, uint8(*msg.AbortCause))
+	case msg.DialoguePortion != nil && msg.DialoguePortion.Rejected:
+		detail = abortType + " application context refused"
+		if ac := msg.DialoguePortion.ApplicationContext; ac != nil {
+			detail += fmt.Sprintf(", peer proposes %s", oidString(ac.OID))
+		}
+	default:
+		detail = abortType
+	}
+
 	h.logger.Info("Dialogue aborted",
 		zap.Uint32("local_tid", localTID),
-		zap.String("type", abortType),
-		zap.Uint8("cause", uint8(*msg.AbortCause)))
+		zap.String("detail", detail))
 
 	// Snapshot the originated-dialogue context before the dispatch / delete
 	// race below; sink fires post-removal so it can't observe stale state.
 	corrID := dialogue.NATSCorrelationID
 	opCode := dialogue.OriginatingOpCode
-	cause := uint8(*msg.AbortCause)
 
 	// ABORT is terminal regardless of dispatch outcome.
 	h.dispatchToApplication(sccpCtx, dialogue, msg)
 	h.removeDialogue(localTID)
 
 	if h.failureSink != nil && corrID != "" {
-		detail := fmt.Sprintf("%s cause=0x%02x", abortType, cause)
 		h.failureSink(corrID, opCode, FailureAbortReceived, detail)
 	}
 }
@@ -496,6 +510,12 @@ func (h *Handler) handleUnidirectional(sccpCtx *sccp.SccpMessage, msg *Message) 
 func (h *Handler) handleOutgoingMessage(msg *Message) {
 	h.metrics.MessagesSent.Add(1)
 
+	dlg := msg.Dialogue
+	if dlg == nil {
+		dlg = h.lookupDialogueForOutgoing(msg)
+	}
+	answerDialogueRequest(dlg, msg)
+
 	payload, err := h.encodeTCAPMessage(msg)
 	if err != nil {
 		h.logger.Error("Failed to encode TCAP message", zap.Error(err))
@@ -504,15 +524,9 @@ func (h *Handler) handleOutgoingMessage(msg *Message) {
 	}
 
 	var called, calling *sccp.SccpAddress
-	switch {
-	case msg.Dialogue != nil:
-		called = msg.Dialogue.RemoteAddress
-		calling = msg.Dialogue.LocalAddress
-	default:
-		if dlg := h.lookupDialogueForOutgoing(msg); dlg != nil {
-			called = dlg.RemoteAddress
-			calling = dlg.LocalAddress
-		}
+	if dlg != nil {
+		called = dlg.RemoteAddress
+		calling = dlg.LocalAddress
 	}
 
 	if err := h.sendOnSCCP(payload, called, calling); err != nil {
@@ -642,11 +656,18 @@ func (h *Handler) dispatchToApplication(sccpCtx *sccp.SccpMessage, dialogue *Dia
 		}
 
 	case errors.Is(err, ErrUnknownAppContext):
-		// Q.773 §3.1.5: P-Abort, no-common-dialogue-portion
 		h.logger.Warn("No application handler for context",
 			zap.Stringer("type", msg.MessageType),
 			zap.Error(err))
 		h.metrics.Errors.Add(1)
+		if abortable && msg.MessageType == MsgTypeBegin {
+			// TS 29.002 §12.1 / Q.773 §4.2.1: refuse the proposed context with
+			// a TC-U-ABORT carrying an AARE (reject-permanent, application-
+			// context-name-not-supported) that names a context we do support,
+			// so the peer can retry with it.
+			h.sendACNotSupported(sccpCtx, msg)
+			return true
+		}
 		if abortable {
 			h.sendAbort(sccpCtx, msg, AbortNoCommonDialoguePortion, true)
 			return true
@@ -682,19 +703,53 @@ func pinApplicationContext(dialogue *Dialogue, msg *Message) {
 	msg.DialoguePortion.ApplicationContext = dialogue.ApplicationContext
 }
 
+// answerDialogueRequest attaches the AARE that the first END or CONTINUE of a
+// dialogue opened by the peer must carry (Q.773 §4.2.1): the accepted
+// application context, echoed. Later messages carry no dialogue portion.
+func answerDialogueRequest(dlg *Dialogue, msg *Message) {
+	if dlg == nil || msg.DialoguePortion != nil {
+		return
+	}
+	if msg.MessageType != MsgTypeEnd && msg.MessageType != MsgTypeContinue {
+		return
+	}
+	if !dlg.dialogueResponsePending.CompareAndSwap(true, false) {
+		return
+	}
+	msg.DialoguePortion = &DialoguePortion{ApplicationContext: dlg.ApplicationContext}
+}
+
+// sendACNotSupported refuses a BEGIN whose application context has no
+// handler with a TC-U-ABORT whose AARE names the supported alternative.
+func (h *Handler) sendACNotSupported(sccpCtx *sccp.SccpMessage, begin *Message) {
+	proposed := begin.DialoguePortion.ApplicationContext.OID
+	h.sendAbortMessage(sccpCtx, &Message{
+		MessageType:    MsgTypeAbort,
+		DestinationTID: begin.OriginatingTID,
+		DialoguePortion: &DialoguePortion{
+			ApplicationContext: &ApplicationContext{OID: h.dispatcher.SupportedAlternative(proposed)},
+			Rejected:           true,
+		},
+	})
+}
+
 // sendAbort sends a TCAP ABORT directly back to the originator. Uses the
 // incoming SCCP wrapper for addresses (CalledAddress=their CgPA,
 // CallingAddress=their CdPA) since a dialogue may not exist (BEGIN rejected,
 // unknown DTID). Encodes and pushes synchronously; falls through to error
 // metric if the SCCP channel is full.
 func (h *Handler) sendAbort(sccpCtx *sccp.SccpMessage, originalMsg *Message, cause AbortCause, pAbort bool) {
-	abortMsg := &Message{
+	h.sendAbortMessage(sccpCtx, &Message{
 		MessageType:    MsgTypeAbort,
 		DestinationTID: originalMsg.OriginatingTID,
 		AbortCause:     &cause,
 		PAbort:         pAbort,
-	}
+	})
+}
 
+// sendAbortMessage encodes an ABORT and sends it back along the incoming
+// message's addresses (swapped).
+func (h *Handler) sendAbortMessage(sccpCtx *sccp.SccpMessage, abortMsg *Message) {
 	payload, err := h.encodeTCAPMessage(abortMsg)
 	if err != nil {
 		h.logger.Error("Failed to encode ABORT", zap.Error(err))
@@ -778,6 +833,45 @@ func (h *Handler) getDialogueCount() int {
 	return len(h.dialogues)
 }
 
+// ParseWire parses a TCAP message. go-tcap's Parse reads the three octets
+// after an ABORT's DTID as a P-Abort cause unconditionally, so it cannot read
+// a TC-U-ABORT, whose dialogue portion follows the DTID directly (Q.773
+// §3.2); ABORTs go through its tag-driven BER parser instead.
+//
+// go-tcap indexes into the input without bounds checks in places (a 3-octet
+// message is enough to panic Transaction.UnmarshalBinary), and a panic in a
+// TCAP worker would take the gateway down on one malformed message from any
+// peer. A parser panic is therefore turned into an error here.
+func ParseWire(data []byte) (msg *gotcap.TCAP, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			msg, err = nil, fmt.Errorf("%w: malformed TCAP message (%v)", ErrInvalidMessage, r)
+		}
+	}()
+	if len(data) > 0 && data[0] == tagAbort {
+		msgs, err := gotcap.ParseBER(data)
+		if err != nil {
+			return nil, err
+		}
+		if len(msgs) == 0 {
+			return nil, ErrInvalidMessage
+		}
+		return msgs[0], nil
+	}
+	return gotcap.Parse(data)
+}
+
+// tagAbort is the ABORT message type tag (Q.773 §3.2, [APPLICATION 7]).
+const tagAbort = 0x67
+
+func oidString(oid []int) string {
+	s, err := canonicalOID(oid)
+	if err != nil {
+		return fmt.Sprint(oid)
+	}
+	return s
+}
+
 // parseTCAPMessage parses a raw TCAP payload (ITU-T Q.773) from the SCCP
 // data field. Returns ErrInvalidMessage on payloads too short to contain a
 // transaction tag and length octet.
@@ -786,8 +880,7 @@ func (h *Handler) parseTCAPMessage(data []byte) (*Message, error) {
 		return nil, ErrInvalidMessage
 	}
 
-	// Parse using go-tcap library
-	tcapMsg, err := gotcap.Parse(data)
+	tcapMsg, err := ParseWire(data)
 	if err != nil {
 		h.logger.Error("Failed to parse TCAP message", zap.Error(err))
 		return nil, fmt.Errorf("TCAP parse error: %w", err)
@@ -854,6 +947,12 @@ func (h *Handler) parseTCAPMessage(data []byte) (*Message, error) {
 			}
 			if ui := dlgPDU.UserInformation; ui != nil {
 				msg.DialoguePortion.UserInformation = ui.Value
+			}
+			// An AARE whose result is not "accepted" refuses the dialogue.
+			if dlgPDU.Type.Code() == gotcap.AARE {
+				if r := dlgPDU.Result; r != nil && len(r.Value) > 0 && r.Value[len(r.Value)-1] != gotcap.Accepted {
+					msg.DialoguePortion.Rejected = true
+				}
 			}
 		}
 	}
@@ -959,6 +1058,11 @@ func (h *Handler) encodeTCAPMessage(msg *Message) ([]byte, error) {
 			cause = uint8(*msg.AbortCause)
 		}
 		tcapMsg.Transaction = gotcap.NewAbort(dtid, cause, []byte{})
+		if !msg.PAbort {
+			// TC-U-ABORT: no P-Abort cause; the reason, if any, is in the
+			// dialogue portion.
+			tcapMsg.Transaction.PAbortCause = nil
+		}
 
 	default:
 		return nil, fmt.Errorf("unsupported message type: %v", msg.MessageType)
@@ -978,7 +1082,20 @@ func (h *Handler) encodeTCAPMessage(msg *Message) ([]byte, error) {
 			ctx = uint8(oid[len(oid)-2])
 			ctxver = uint8(oid[len(oid)-1])
 		}
-		tcapMsg.Dialogue = gotcap.NewDialogue(1, 1, gotcap.NewAARQ(1, ctx, ctxver), dlg.UserInformation)
+		var pdu *gotcap.DialoguePDU
+		switch {
+		case msg.MessageType == MsgTypeBegin:
+			pdu = gotcap.NewAARQ(1, ctx, ctxver)
+		case dlg.Rejected:
+			// "ApplicationContextNameNotSupplied" is go-tcap's name for
+			// dialogue-service-user diagnostic 2, which Q.773 calls
+			// application-context-name-not-supported.
+			pdu = gotcap.NewAARE(1, ctx, ctxver, gotcap.RejectPerm, gotcap.DialogueServiceUser,
+				gotcap.ApplicationContextNameNotSupplied)
+		default:
+			pdu = gotcap.NewAARE(1, ctx, ctxver, gotcap.Accepted, gotcap.DialogueServiceUser, gotcap.Null)
+		}
+		tcapMsg.Dialogue = gotcap.NewDialogue(1, 1, pdu, dlg.UserInformation)
 	}
 
 	// Build Components

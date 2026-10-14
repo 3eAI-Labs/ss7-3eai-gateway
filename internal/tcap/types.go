@@ -169,10 +169,16 @@ type Component struct {
 }
 
 // DialoguePortion represents TCAP dialogue portion
+//
+// Which dialogue PDU it encodes as follows from the message type (Q.773
+// §4.2.1): AARQ in a BEGIN, AARE (accepted) in the END or CONTINUE that first
+// answers one, and in a TC-U-ABORT an AARE whose result is reject-permanent
+// with "application-context-name-not-supported" when Rejected is set.
 type DialoguePortion struct {
 	ApplicationContext *ApplicationContext
 	UserInformation    []byte
 	ProtocolVersion    uint8
+	Rejected           bool
 }
 
 // Message represents a TCAP message
@@ -219,6 +225,11 @@ type Dialogue struct {
 	CreatedAt    time.Time
 	LastActivity time.Time
 	ExpiresAt    time.Time
+
+	// dialogueResponsePending is set when the peer opened the dialogue with
+	// an AARQ; the first END or CONTINUE we send must answer it with an AARE
+	// (Q.773 §4.2.1), after which it is cleared.
+	dialogueResponsePending atomic.Bool
 
 	// Pending operations
 	PendingInvokes map[int32]*PendingInvoke

@@ -225,3 +225,54 @@ func TestFailureSink_NoCorrelationID(t *testing.T) {
 
 	assert.Empty(t, rec.snapshot(), "no sink fire when corrID is empty")
 }
+
+// A TC-U-ABORT carries no P-Abort cause: an HLR or MSC refusing the proposed
+// application context answers with an AARE (reject-permanent) naming the one
+// it supports. It must parse, end the dialogue without a panic on the absent
+// cause, and tell the caller what the peer proposed.
+func TestFailureSink_UAbortRefusingContext(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	sccpIn, sccpOut := stubChannels()
+	h, err := NewHandler(&Config{
+		NodeID: 1, DialogueTimeout: 5 * time.Second, InvokeTimeout: 5 * time.Second,
+		IdleTimeout: 10 * time.Second, MaxDialogues: 100, MaxComponentsPerMessage: 10,
+		MaxInvokesPerDialogue: 20, ChannelBufferSize: 100, WorkerPoolSize: 1,
+		TimerResolution: 50 * time.Millisecond,
+	}, sccpIn, sccpOut, NewDispatcher(logger), logger)
+	require.NoError(t, err)
+	rec := &recordingSink{}
+	h.SetFailureSink(rec.fn())
+
+	localTID := uint32(0x01020305)
+	h.dialoguesMu.Lock()
+	h.dialogues[localTID] = &Dialogue{
+		LocalTID: localTID, State: StateInitWait, OriginatingOpCode: 45,
+		NATSCorrelationID: "nats-corr-uabort", ApplicationContext: &ACShortMsgGatewayV3,
+		CreatedAt: time.Now(), LastActivity: time.Now(), ExpiresAt: time.Now().Add(5 * time.Second),
+		PendingInvokes: map[int32]*PendingInvoke{},
+	}
+	h.dialoguesMu.Unlock()
+
+	// The peer's answer, as it arrives on the wire.
+	wire, err := h.encodeTCAPMessage(&Message{
+		MessageType:    MsgTypeAbort,
+		DestinationTID: h.encodeTID(localTID),
+		DialoguePortion: &DialoguePortion{
+			ApplicationContext: &ApplicationContext{OID: []int{0, 4, 0, 0, 1, 0, 20, 2}},
+			Rejected:           true,
+		},
+	})
+	require.NoError(t, err)
+	msg, err := h.parseTCAPMessage(wire)
+	require.NoError(t, err, "a TC-U-ABORT must parse")
+	assert.False(t, msg.PAbort)
+	assert.Nil(t, msg.AbortCause)
+
+	h.handleAbort(nil, msg)
+
+	calls := rec.snapshot()
+	require.Len(t, calls, 1)
+	assert.Equal(t, FailureAbortReceived, calls[0].reason)
+	assert.Contains(t, calls[0].detail, "U-ABORT application context refused")
+	assert.Contains(t, calls[0].detail, "peer proposes 0.4.0.0.1.0.20.2")
+}

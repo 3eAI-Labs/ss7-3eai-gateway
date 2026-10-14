@@ -6,6 +6,7 @@ package tcap
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +50,7 @@ var (
 	// application context. Caller should respond with TCAP P-Abort, cause
 	// no-common-dialogue-portion (ITU-T Q.773 §3.1.5).
 	ErrUnknownAppContext = errors.New("tcap dispatch: no handler for application context")
+	ErrHandlerPanic      = errors.New("tcap: application handler panicked")
 
 	// ErrMissingAppContext indicates the message has no DialoguePortion or no
 	// ApplicationContext within it. Caller should respond with TCAP P-Abort,
@@ -164,7 +166,7 @@ func (d *Dispatcher) Dispatch(dialogue *Dialogue, msg *Message) error {
 		return fmt.Errorf("%w: oid=%s", ErrUnknownAppContext, key)
 	}
 
-	if err := handler.HandleTCAPMessage(dialogue, msg); err != nil {
+	if err := d.invoke(handler, dialogue, msg); err != nil {
 		d.metrics.HandlerErrors.Add(1)
 		return fmt.Errorf("handler %s: %w", handler.Name(), err)
 	}
@@ -185,6 +187,63 @@ func (d *Dispatcher) LookupHandler(oid []int) AppContextHandler {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.routes[key]
+}
+
+// invoke calls an application handler, turning a panic into an error. The
+// handlers decode what peers send; a defect there must cost one message, not
+// every dialogue on the node.
+func (d *Dispatcher) invoke(handler AppContextHandler, dialogue *Dialogue, msg *Message) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			d.logger.Error("application handler panicked",
+				zap.String("handler", handler.Name()),
+				zap.Any("panic", r),
+				zap.Stack("stack"))
+			err = fmt.Errorf("%w: %v", ErrHandlerPanic, r)
+		}
+	}()
+	return handler.HandleTCAPMessage(dialogue, msg)
+}
+
+// SupportedAlternative returns the context to propose when a peer asks for
+// one we do not support: the highest registered version of the same context
+// (same arcs except the last), or the proposed context itself when we support
+// no version of it (the AARE must name some context; Q.773 §4.2.1).
+func (d *Dispatcher) SupportedAlternative(proposed []int) []int {
+	if len(proposed) < 2 {
+		return proposed
+	}
+	prefix := proposed[:len(proposed)-1]
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	best := -1
+	for key := range d.routes {
+		oid, ok := parseDottedOID(key)
+		if !ok || len(oid) != len(proposed) || !slices.Equal(oid[:len(oid)-1], prefix) {
+			continue
+		}
+		if v := oid[len(oid)-1]; v > best {
+			best = v
+		}
+	}
+	if best < 0 {
+		return proposed
+	}
+	return append(slices.Clone(prefix), best)
+}
+
+func parseDottedOID(s string) ([]int, bool) {
+	parts := strings.Split(s, ".")
+	oid := make([]int, len(parts))
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, false
+		}
+		oid[i] = n
+	}
+	return oid, true
 }
 
 // RegisteredOIDs returns the canonical dotted-string OIDs currently

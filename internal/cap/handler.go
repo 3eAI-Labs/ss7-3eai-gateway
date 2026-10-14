@@ -100,8 +100,8 @@ func (h *Handler) SetApplyChargingHandler(handler ApplyChargingHandler) {
 func (h *Handler) ProcessInitialDP(req *InitialDPRequest) error {
 	h.logger.Info("Processing InitialDP",
 		zap.Uint32("service_key", req.ServiceKey),
-		zap.String("called_party", req.CalledPartyNumber.Digits),
-		zap.String("calling_party", req.CallingPartyNumber.Digits))
+		zap.String("called_party", digitsOf(req.CalledPartyNumber)),
+		zap.String("calling_party", digitsOf(req.CallingPartyNumber)))
 
 	if h.initialDPHandler == nil {
 		h.logger.Error("InitialDP handler not set")
@@ -329,6 +329,15 @@ func (h *Handler) SendResetTimer(req *ResetTimerRequest) error {
 	h.logger.Info("ResetTimer sent successfully")
 
 	return nil
+}
+
+// digitsOf returns an optional address's digits; InitialDP's party numbers
+// are OPTIONAL (TS 29.078) and nil when absent.
+func digitsOf(a *AddressString) string {
+	if a == nil {
+		return ""
+	}
+	return a.Digits
 }
 
 // validateInitialDPRequest validates InitialDP request

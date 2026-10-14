@@ -62,7 +62,6 @@ Go client. Applications in other languages implement the same JSON contract.
 - SendRoutingInfoForSM is addressed to the configured HLR (`map.hlr_gt` / `map.hlr_pc`), not to
   the subscriber's MSISDN as a global title. It therefore does not work in networks that locate
   the HLR by number range or number portability.
-- The answer to an incoming MO-ForwardSM carries an AARQ dialogue PDU where Q.773 requires an AARE.
 - No SCCP segmentation (XUDT/LUDT): user data over 255 octets is refused.
 - An incoming UDTS is logged with its cause, but the dialogue it belongs to ends only on its
   timer. A message SCCP cannot route (no matching rule) is logged, and the caller sees `TIMEOUT`.
