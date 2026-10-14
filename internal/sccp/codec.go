@@ -38,6 +38,8 @@ func ParseSCCP(data []byte, variant NetworkVariant) (*SccpMessage, error) {
 		return parseXUDT(rest, variant)
 	case MsgTypeUDTS:
 		return parseUDTS(rest, variant)
+	case MsgTypeXUDTS:
+		return parseXUDTS(rest, variant)
 	default:
 		return nil, fmt.Errorf("unsupported SCCP message type: 0x%02X", uint8(mt))
 	}
@@ -55,6 +57,8 @@ func EncodeSCCP(msg *SccpMessage, variant NetworkVariant) ([]byte, error) {
 		return encodeXUDT(msg, variant)
 	case MsgTypeUDTS:
 		return encodeUDTS(msg, variant)
+	case MsgTypeXUDTS:
+		return encodeXUDTS(msg, variant)
 	default:
 		return nil, fmt.Errorf("unsupported SCCP message type for encoding: 0x%02X", uint8(msg.MessageType))
 	}
@@ -154,92 +158,173 @@ func encodeUDT(msg *SccpMessage, variant NetworkVariant) ([]byte, error) {
 	return buf, nil
 }
 
-// --- XUDT (Extended Unitdata) — Q.713 §4.3 -----------------------------
+// --- XUDT / XUDTS (Extended Unitdata [Service]) — Q.713 §4.18, §4.19 ----
+//
+// Layout: message type; protocol class (XUDT) or return cause (XUDTS); hop
+// counter; four pointers (called address, calling address, data, optional
+// part — 0 when there is none); the three variable parameters; then the
+// optional parameters as (code, length, value) ending with code 0.
+// Pointers follow the Q.713 §3.3 convention, as for UDT.
 
-// parseXUDT parses XUDT (Q.713 §4.3). XUDT prepends ProtocolClass (1) +
-// HopCounter (1) before the four pointer bytes (CdPA/CgPA/Data/Optional).
-// Pointers use the same Q.713 §3.3 convention as UDT: offset from the
-// pointer byte itself.
+// Optional parameter codes (Q.713 Table 2).
+const (
+	paramEndOfOptional = 0x00
+	paramSegmentation  = 0x10
+)
+
 func parseXUDT(data []byte, variant NetworkVariant) (*SccpMessage, error) {
-	if len(data) < 6 {
-		return nil, ErrInvalidMessage
+	msg, err := parseExtendedUnitdata(data, variant)
+	if err != nil {
+		return nil, err
 	}
-
-	msg := &SccpMessage{MessageType: MsgTypeXUDT}
-
+	msg.MessageType = MsgTypeXUDT
 	msg.ProtocolClass = ProtocolClass(data[0] & 0x0F)
 	msg.ReturnOnError = data[0]&returnOnErrorBit != 0
-	msg.HopCounter = data[1]
-	ptrCdPA := int(data[2])
-	ptrCgPA := int(data[3])
-	ptrData := int(data[4])
-	// data[5] = ptrOpt — optional parameters parsing omitted
-
-	if ptrCdPA > 0 {
-		addrStart := 2 + ptrCdPA
-		if addrStart < len(data) {
-			addr, _, err := parseAddress(data[addrStart:], variant)
-			if err == nil {
-				msg.CalledAddress = addr
-			}
-		}
-	}
-
-	if ptrCgPA > 0 {
-		addrStart := 3 + ptrCgPA
-		if addrStart < len(data) {
-			addr, _, err := parseAddress(data[addrStart:], variant)
-			if err == nil {
-				msg.CallingAddress = addr
-			}
-		}
-	}
-
-	if ptrData > 0 {
-		dataStart := 4 + ptrData
-		if dataStart < len(data) {
-			dataLen := int(data[dataStart])
-			dataStart++
-			if dataStart+dataLen <= len(data) {
-				msg.Data = make([]byte, dataLen)
-				copy(msg.Data, data[dataStart:dataStart+dataLen])
-			}
-		}
-	}
-
 	return msg, nil
 }
 
+func parseXUDTS(data []byte, variant NetworkVariant) (*SccpMessage, error) {
+	msg, err := parseExtendedUnitdata(data, variant)
+	if err != nil {
+		return nil, err
+	}
+	msg.MessageType = MsgTypeXUDTS
+	msg.ReturnCause = ReturnCause(data[0])
+	return msg, nil
+}
+
+// parseExtendedUnitdata reads what XUDT and XUDTS share; data starts after
+// the message type octet. Malformed variable or optional parts are errors:
+// the message may be a segment, and a misparsed segment would corrupt the
+// reassembled message.
+func parseExtendedUnitdata(data []byte, variant NetworkVariant) (*SccpMessage, error) {
+	if len(data) < 6 {
+		return nil, ErrInvalidMessage
+	}
+	msg := &SccpMessage{HopCounter: data[1]}
+
+	param := func(ptrPos int) ([]byte, error) {
+		start := ptrPos + int(data[ptrPos])
+		if data[ptrPos] == 0 || start >= len(data) {
+			return nil, ErrInvalidMessage
+		}
+		end := start + 1 + int(data[start])
+		if end > len(data) {
+			return nil, ErrInvalidMessage
+		}
+		return data[start:end], nil // including the length octet
+	}
+
+	cdpa, err := param(2)
+	if err != nil {
+		return nil, fmt.Errorf("called address: %w", err)
+	}
+	if msg.CalledAddress, _, err = parseAddress(cdpa, variant); err != nil {
+		return nil, fmt.Errorf("called address: %w", err)
+	}
+	cgpa, err := param(3)
+	if err != nil {
+		return nil, fmt.Errorf("calling address: %w", err)
+	}
+	if msg.CallingAddress, _, err = parseAddress(cgpa, variant); err != nil {
+		return nil, fmt.Errorf("calling address: %w", err)
+	}
+	ud, err := param(4)
+	if err != nil {
+		return nil, fmt.Errorf("data: %w", err)
+	}
+	msg.Data = append([]byte(nil), ud[1:]...)
+
+	if data[5] != 0 {
+		if err := parseOptionalPart(data, 5+int(data[5]), msg); err != nil {
+			return nil, err
+		}
+	}
+	return msg, nil
+}
+
+// parseOptionalPart reads (code, length, value) parameters until the end
+// marker. Unknown parameters are skipped (Q.714 §1.1.4.3); parameters may
+// come in any order (Q.713 §1.5).
+func parseOptionalPart(data []byte, i int, msg *SccpMessage) error {
+	for {
+		if i >= len(data) {
+			return fmt.Errorf("%w: optional part not terminated", ErrInvalidMessage)
+		}
+		code := data[i]
+		if code == paramEndOfOptional {
+			return nil
+		}
+		if i+1 >= len(data) || i+2+int(data[i+1]) > len(data) {
+			return fmt.Errorf("%w: optional parameter 0x%02X truncated", ErrInvalidMessage, code)
+		}
+		value := data[i+2 : i+2+int(data[i+1])]
+		if code == paramSegmentation {
+			if len(value) != 4 {
+				return fmt.Errorf("%w: segmentation parameter of %d octets", ErrInvalidMessage, len(value))
+			}
+			msg.Segmentation = &Segmentation{
+				First:     value[0]&0x80 != 0,
+				Class1:    value[0]&0x40 != 0,
+				Remaining: value[0] & 0x0F,
+				LocalRef:  uint32(value[1])<<16 | uint32(value[2])<<8 | uint32(value[3]),
+			}
+		}
+		i += 2 + int(data[i+1])
+	}
+}
+
 func encodeXUDT(msg *SccpMessage, variant NetworkVariant) ([]byte, error) {
-	if len(msg.Data) > maxUnitdataData {
-		return nil, fmt.Errorf("%w: %d octets of user data, an unsegmented XUDT carries at most %d",
-			ErrMessageTooLarge, len(msg.Data), maxUnitdataData)
+	return encodeExtendedUnitdata(MsgTypeXUDT, classOctet(msg), msg, variant)
+}
+
+func encodeXUDTS(msg *SccpMessage, variant NetworkVariant) ([]byte, error) {
+	return encodeExtendedUnitdata(MsgTypeXUDTS, byte(msg.ReturnCause), msg, variant)
+}
+
+func encodeExtendedUnitdata(mt MessageType, second byte, msg *SccpMessage, variant NetworkVariant) ([]byte, error) {
+	limit := maxUnitdataData
+	if msg.Segmentation != nil {
+		limit = maxSegmentData
+	}
+	if len(msg.Data) > limit {
+		return nil, fmt.Errorf("%w: %d octets of user data, this %s carries at most %d",
+			ErrMessageTooLarge, len(msg.Data), mt, limit)
 	}
 	buf := make([]byte, 0, MaxSCCPMessageSize)
-	buf = append(buf, byte(MsgTypeXUDT))
-	buf = append(buf, classOctet(msg))
-	buf = append(buf, msg.HopCounter)
+	buf = append(buf, byte(mt), second, msg.HopCounter)
 
 	ptrOffset := len(buf) // first of 4 pointer bytes
 	buf = append(buf, 0, 0, 0, 0)
 
-	cdPAStart := len(buf) - ptrOffset
+	buf[ptrOffset] = byte(len(buf) - ptrOffset)
 	buf = append(buf, encodeAddress(msg.CalledAddress, variant)...)
 
-	cgPAStart := len(buf) - (ptrOffset + 1)
+	buf[ptrOffset+1] = byte(len(buf) - (ptrOffset + 1))
 	buf = append(buf, encodeAddress(msg.CallingAddress, variant)...)
 
-	dataStart := len(buf) - (ptrOffset + 2)
+	buf[ptrOffset+2] = byte(len(buf) - (ptrOffset + 2))
 	buf = append(buf, byte(len(msg.Data)))
 	buf = append(buf, msg.Data...)
 
-	buf[ptrOffset] = byte(cdPAStart)
-	buf[ptrOffset+1] = byte(cgPAStart)
-	buf[ptrOffset+2] = byte(dataStart)
-	buf[ptrOffset+3] = 0 // optional parameters absent
-
+	if seg := msg.Segmentation; seg != nil {
+		buf[ptrOffset+3] = byte(len(buf) - (ptrOffset + 3))
+		first := seg.Remaining & 0x0F
+		if seg.First {
+			first |= 0x80
+		}
+		if seg.Class1 {
+			first |= 0x40
+		}
+		buf = append(buf, paramSegmentation, 4, first,
+			byte(seg.LocalRef>>16), byte(seg.LocalRef>>8), byte(seg.LocalRef), paramEndOfOptional)
+	}
 	return buf, nil
 }
+
+// maxSegmentData is the most user data an XUDT carrying the segmentation
+// parameter may hold (Q.713 Table 19, note 1).
+const maxSegmentData = 247
 
 // --- UDTS (Unitdata Service) — Q.713 §4.11 ----------------------------
 

@@ -73,10 +73,12 @@ var (
 // long-running Dispatch does not block Register (RWMutex held only during
 // map lookup, released before HandleTCAPMessage is called).
 type Dispatcher struct {
-	mu      sync.RWMutex
-	routes  map[string]AppContextHandler // key: canonical dotted OID
-	logger  *zap.Logger
-	metrics *DispatchMetrics
+	mu     sync.RWMutex
+	routes map[string]AppContextHandler // key: canonical dotted OID
+	// initiatorRoutes: see RegisterInitiatorOnly.
+	initiatorRoutes map[string]AppContextHandler
+	logger          *zap.Logger
+	metrics         *DispatchMetrics
 }
 
 // DispatchMetrics tracks dispatcher-level counters. All fields safe for
@@ -96,9 +98,10 @@ func NewDispatcher(logger *zap.Logger) *Dispatcher {
 		logger = zap.NewNop()
 	}
 	return &Dispatcher{
-		routes:  make(map[string]AppContextHandler),
-		logger:  logger,
-		metrics: &DispatchMetrics{},
+		routes:          make(map[string]AppContextHandler),
+		initiatorRoutes: make(map[string]AppContextHandler),
+		logger:          logger,
+		metrics:         &DispatchMetrics{},
 	}
 }
 
@@ -156,6 +159,9 @@ func (d *Dispatcher) Dispatch(dialogue *Dialogue, msg *Message) error {
 
 	d.mu.RLock()
 	handler, ok := d.routes[key]
+	if !ok && dialogue != nil && dialogue.initiatedLocally {
+		handler, ok = d.initiatorRoutes[key]
+	}
 	d.mu.RUnlock()
 
 	if !ok {
@@ -203,6 +209,23 @@ func (d *Dispatcher) invoke(handler AppContextHandler, dialogue *Dialogue, msg *
 		}
 	}()
 	return handler.HandleTCAPMessage(dialogue, msg)
+}
+
+// RegisterInitiatorOnly routes a context only for dialogues this node
+// opened: the answers to a lower-version retry. A peer opening a dialogue
+// under it is still refused (and SupportedAlternative never proposes it).
+func (d *Dispatcher) RegisterInitiatorOnly(oid []int, handler AppContextHandler) error {
+	if handler == nil {
+		return ErrNilHandler
+	}
+	key, err := canonicalOID(oid)
+	if err != nil {
+		return err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.initiatorRoutes[key] = handler
+	return nil
 }
 
 // SupportedAlternative returns the context to propose when a peer asks for

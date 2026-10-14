@@ -139,6 +139,8 @@ const (
 	CauseCannotReassemble        ReturnCause = 10
 	CauseSCCPFailure             ReturnCause = 11
 	CauseHopCounterViolation     ReturnCause = 12
+	CauseSegmentationUnsupported ReturnCause = 13
+	CauseSegmentationFailure     ReturnCause = 14
 )
 
 func (c ReturnCause) String() string {
@@ -156,6 +158,8 @@ func (c ReturnCause) String() string {
 		"destination cannot perform reassembly",
 		"SCCP failure",
 		"hop counter violation",
+		"segmentation not supported",
+		"segmentation failure",
 	}
 	if int(c) < len(names) {
 		return fmt.Sprintf("cause %d (%s)", uint8(c), names[c])
@@ -207,6 +211,17 @@ type SccpMessage struct {
 	HopCounter       uint8
 	Importance       uint8
 	SegmentationData []byte
+	// Segmentation is the XUDT segmentation parameter (Q.713 §3.17), nil
+	// when absent.
+	Segmentation *Segmentation
+}
+
+// Segmentation is one segment's place in a segmented message (Q.713 §3.17).
+type Segmentation struct {
+	First     bool   // F: first segment
+	Class1    bool   // C: the user asked for in-sequence delivery (class 1)
+	Remaining uint8  // segments still to come; 0 in the last
+	LocalRef  uint32 // segmentation local reference (24 bits)
 }
 
 // GTTRule represents a Global Title Translation rule
@@ -325,6 +340,9 @@ type Handler struct {
 	// Subsystem status
 	subsystems map[SubsystemNumber]*SubsystemStatus
 	ssnMu      sync.RWMutex
+
+	// reassembler holds XUDT reassembly processes (reassembly.go).
+	reassembler *reassembler
 
 	// deliveryFailureSink: see SetDeliveryFailureSink.
 	deliveryFailureSink func(msg *SccpMessage, reason string)

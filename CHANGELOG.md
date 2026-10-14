@@ -6,6 +6,34 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-10-14
+
+### Added
+
+- Version fallback (TS 29.002 §5.2.1). A peer that supports only version 2 of the short-message
+  contexts refuses the gateway's version 3 dialogue with a TC-U-ABORT whose AARE proposes version
+  2; the request failed with `ABORTED`. The gateway now starts a new dialogue under the proposed
+  version 2 context — SRI-for-SM unchanged under shortMsgGateway v2, MT delivery as forwardSM
+  (op 46) under shortMsgMT-Relay v2 — once per request; the caller sees only the final outcome.
+  The version 2 forwardSM argument is sent as MT-ForwardSM's (sm-RP-DA, sm-RP-OA, sm-RP-UI); that
+  this matches MAP v2's ForwardSM-Arg is from knowledge of MAP v2 — the v2 ASN.1 is no longer in
+  TS 29.002 and was not checked. Version 2 dialogues opened by peers are still refused.
+
+- Reassembly of segmented XUDT (Q.714 §4.1.1.2). A peer may send a long message — an HLR's answer,
+  an MSC's MO-ForwardSM — as up to 16 XUDT segments; they were not understood. They are now
+  reassembled before delivery, keyed by calling address, OPC and segmentation local reference;
+  missing segments are given up after T(reass) = 15 s; a duplicate or inconsistent segment, a
+  first segment for a busy process, a timeout, or more than 3952 octets fails the reassembly and,
+  if the sender asked, returns the message in an XUDTS with the Q.713 cause. At most 1000
+  reassemblies run at once (beyond that: XUDTS, network congestion). XUDTS is now encoded and
+  decoded; a returned XUDT is reported like a returned UDT.
+
+### Fixed
+
+- A successful MT-ForwardSM answered without a result parameter — allowed: the result is optional
+  (TS 29.002 §17.6.3), and version 2's forwardSM has none — failed to decode, and the caller timed
+  out. An empty result is now a successful delivery.
+
 ## [0.7.2] - 2026-10-14
 
 ### Security

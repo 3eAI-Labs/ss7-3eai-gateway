@@ -841,6 +841,12 @@ func encodeMtForwardSMArg(r *MtForwardSMRequest) ([]byte, error) {
 }
 
 func decodeMtForwardSMRes(b []byte) (*MtForwardSMResponse, error) {
+	// The result is optional (TS 29.002 §17.6.3, mt-ForwardSM RESULT
+	// "-- optional"), and version 2's forwardSM answers without one: a
+	// ReturnResult with no parameter is a successful delivery.
+	if len(b) == 0 {
+		return &MtForwardSMResponse{}, nil
+	}
 	var w wireForwardSMRes
 	if _, err := asn1.Unmarshal(b, &w); err != nil {
 		return nil, fmt.Errorf("MtForwardSMRes: %w", err)

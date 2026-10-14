@@ -305,6 +305,13 @@ func initializeHandlers(cfg *viper.Viper, logger *zap.Logger) (*Handlers, error)
 			return nil, fmt.Errorf("failed to register MAP for %s: %w", ac.Name, err)
 		}
 	}
+	// Answers to a version 2 retry (TS 29.002 §5.2.1) are routed for the
+	// dialogues we open; a peer cannot open one under these contexts.
+	for _, ac := range []tcap.ApplicationContext{tcap.ACShortMsgGatewayV2, tcap.ACShortMsgMTRelayV2} {
+		if err := dispatcher.RegisterInitiatorOnly(ac.OID, mapHandler); err != nil {
+			return nil, fmt.Errorf("failed to register MAP for %s: %w", ac.Name, err)
+		}
+	}
 	for _, ac := range capApplicationContexts {
 		if err := dispatcher.Register(ac.OID, capHandler); err != nil {
 			return nil, fmt.Errorf("failed to register CAP for %s: %w", ac.Name, err)
@@ -331,6 +338,8 @@ func initializeHandlers(cfg *viper.Viper, logger *zap.Logger) (*Handlers, error)
 	sccpHandler.SetDeliveryFailureSink(tcapHandler.HandleDeliveryFailure)
 	// Messages too long for one unitdata open with an empty Begin.
 	tcapHandler.SetUserDataLimit(sccpHandler.MaxUserData)
+	// A peer that refuses a version 3 context gets the request again in v2.
+	tcapHandler.SetVersionFallback(mapprotocol.VersionFallback)
 
 	// Wire MAP/CAP outbound TCAP emission. Now that tcapHandler exists,
 	// hand its application-outbound channel to MAP and CAP so their

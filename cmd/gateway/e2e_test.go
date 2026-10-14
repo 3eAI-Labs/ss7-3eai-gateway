@@ -696,6 +696,142 @@ func TestE2E_LongMT_EmptyBegin(t *testing.T) {
 	require.Equal(t, uint64(1), peer.MtForwardSMResponses())
 }
 
+// TestE2E_SegmentedAnswer: the HLR sends its answer as three XUDT segments
+// (Q.714 §4.1.1.1.2). The gateway reassembles them (§4.1.1.2) and the caller
+// gets the result.
+func TestE2E_SegmentedAnswer(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+
+	natsServer := startEmbeddedNATS(t)
+	defer natsServer.Shutdown()
+
+	peer, err := ss7peer.Start(context.Background(), ss7peer.Config{
+		SCTPAddr:         allocLoopbackSCTPPort(t),
+		PointCode:        e2ePeerPC,
+		GatewayPointCode: e2eGatewayPC,
+		NetworkIndicator: e2eNetworkIndicator,
+		NetworkVariant:   sccp.VariantANSI,
+		Logger:           logger.Named("peer"),
+		SegmentAnswers:   3,
+		OnSRI: func(*mapprotocol.SendRoutingInfoForSMRequest, string, string, uint32) (*mapprotocol.SendRoutingInfoForSMResponse, error) {
+			return &mapprotocol.SendRoutingInfoForSMResponse{
+				IMSI: mapprotocol.IMSI(e2eTestIMSI),
+				LocationInfoWithLMSI: mapprotocol.LocationInfoWithLMSI{
+					NetworkNodeNumber: &mapprotocol.AddressString{Nature: 4, NumberPlan: 1, Digits: e2eTestVMSC},
+				},
+			}, nil
+		},
+	})
+	require.NoError(t, err, "start ss7peer")
+	t.Cleanup(func() { require.Empty(t, peer.Violations(), "ss7peer conformance violations") })
+	defer peer.Stop()
+
+	cfg := buildE2EConfig(t, peer.SCTPAddr(), natsServer.ClientURL())
+	handlers, err := initializeHandlers(cfg, logger.Named("gw"))
+	require.NoError(t, err, "initializeHandlers")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, startServices(ctx, handlers, logger.Named("gw")), "startServices")
+	require.NoError(t, handlers.M3UA.WaitForActive(10*time.Second), "M3UA association")
+	t.Cleanup(func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		_ = stopServices(shutdownCtx, handlers, logger.Named("gw"))
+	})
+
+	nc, err := nats.Connect(natsServer.ClientURL(), nats.Name("e2e-segmented"))
+	require.NoError(t, err)
+	defer nc.Close()
+	client, err := ss7client.New(nc)
+	require.NoError(t, err)
+	defer client.Close()
+
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer reqCancel()
+	res, err := client.SendRoutingInfoForSM(reqCtx, ss7client.SRIRequest{
+		MSISDN:               e2eTestMSISDN,
+		ServiceCentreAddress: ss7client.E164(e2eTestSCA),
+	})
+	require.NoError(t, err, "a segmented answer is reassembled")
+	require.Equal(t, e2eTestIMSI, res.IMSI)
+	require.Equal(t, e2eTestVMSC, res.NetworkNodeNumber)
+}
+
+// TestE2E_Version2Fallback: the peer supports version 2 of the
+// short-message contexts only. It refuses the gateway's version 3 dialogues
+// with an AARE proposing version 2; the gateway starts a new dialogue under
+// it (TS 29.002 §5.2.1) — MT delivery as forwardSM — and the caller gets the
+// result as if nothing happened.
+func TestE2E_Version2Fallback(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+
+	natsServer := startEmbeddedNATS(t)
+	defer natsServer.Shutdown()
+
+	peer, err := ss7peer.Start(context.Background(), ss7peer.Config{
+		SCTPAddr:         allocLoopbackSCTPPort(t),
+		PointCode:        e2ePeerPC,
+		GatewayPointCode: e2eGatewayPC,
+		NetworkIndicator: e2eNetworkIndicator,
+		NetworkVariant:   sccp.VariantANSI,
+		Logger:           logger.Named("peer"),
+		OnlyVersion2:     true,
+		OnSRI: func(*mapprotocol.SendRoutingInfoForSMRequest, string, string, uint32) (*mapprotocol.SendRoutingInfoForSMResponse, error) {
+			return &mapprotocol.SendRoutingInfoForSMResponse{
+				IMSI: mapprotocol.IMSI(e2eTestIMSI),
+				LocationInfoWithLMSI: mapprotocol.LocationInfoWithLMSI{
+					NetworkNodeNumber: &mapprotocol.AddressString{Nature: 4, NumberPlan: 1, Digits: e2eTestVMSC},
+				},
+			}, nil
+		},
+		OnMtForwardSM: func(req *mapprotocol.MtForwardSMRequest, _, _ string, _ uint32) (*mapprotocol.MtForwardSMResponse, error) {
+			require.Equal(t, e2eFakeTPDU, req.SMRPUI)
+			return &mapprotocol.MtForwardSMResponse{}, nil
+		},
+	})
+	require.NoError(t, err, "start ss7peer")
+	t.Cleanup(func() { require.Empty(t, peer.Violations(), "ss7peer conformance violations") })
+	defer peer.Stop()
+
+	cfg := buildE2EConfig(t, peer.SCTPAddr(), natsServer.ClientURL())
+	handlers, err := initializeHandlers(cfg, logger.Named("gw"))
+	require.NoError(t, err, "initializeHandlers")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, startServices(ctx, handlers, logger.Named("gw")), "startServices")
+	require.NoError(t, handlers.M3UA.WaitForActive(10*time.Second), "M3UA association")
+	t.Cleanup(func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		_ = stopServices(shutdownCtx, handlers, logger.Named("gw"))
+	})
+
+	nc, err := nats.Connect(natsServer.ClientURL(), nats.Name("e2e-v2-fallback"))
+	require.NoError(t, err)
+	defer nc.Close()
+	client, err := ss7client.New(nc)
+	require.NoError(t, err)
+	defer client.Close()
+
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer reqCancel()
+	sri, err := client.SendRoutingInfoForSM(reqCtx, ss7client.SRIRequest{
+		MSISDN:               e2eTestMSISDN,
+		ServiceCentreAddress: ss7client.E164(e2eTestSCA),
+	})
+	require.NoError(t, err, "SRI-for-SM succeeds after falling back to version 2")
+	require.Equal(t, e2eTestIMSI, sri.IMSI)
+
+	_, err = client.MTForwardSM(reqCtx, ss7client.MTRequest{
+		IMSI:                 e2eTestIMSI,
+		NetworkNodeNumber:    ss7client.E164(e2eTestVMSC),
+		ServiceCentreAddress: ss7client.E164(e2eTestSCA),
+		TPDU:                 e2eFakeTPDU,
+	})
+	require.NoError(t, err, "MT delivery succeeds as forwardSM in version 2")
+	require.Equal(t, uint64(2), peer.V2Dialogues())
+}
+
 // startEmbeddedNATS boots an in-process NATS server on a random port.
 // JetStream not enabled — the gateway uses NATS pub/sub for the SS7
 // bridge subjects, and JetStream KV for ConfigStore. ConfigStore can

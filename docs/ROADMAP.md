@@ -39,7 +39,7 @@ An area counts as delivered only with all of these:
 | 0.7.0 | SMS core | SendRoutingInfoForSM, MT-ForwardSM, MO-ForwardSM | released |
 | 0.7.1 | Security fix | Remote denial of service | released |
 | 0.7.2 | SMS completion, part 1 + security fix | SRI-for-SM addressed to the subscriber's MSISDN; non-delivery reported at once; long messages by TCAP "empty Begin" (TS 29.002 §C.2.1) in both directions; dialogue-table exhaustion fixed | released |
-| 0.7.3 | SMS completion, part 2 | Reassembly of incoming XUDT segments; fallback to version 2 contexts | planned |
+| 0.7.3 | SMS completion, part 2 | Reassembly of incoming XUDT segments; fallback to version 2 when a peer refuses version 3 (accepting version 2 dialogues opened by peers is not included) | released |
 | 0.7.4 | Location | AnyTimeInterrogation (op 71) towards the HLR; ProvideSubscriberInfo (op 70) | planned |
 | 0.7.5 | Call routing | SendRoutingInfo (op 22) towards the HLR | planned |
 | 0.7.6 | USSD | processUnstructuredSS-Request (op 59), unstructuredSS-Request (60), unstructuredSS-Notify (61) | planned |

@@ -6,6 +6,7 @@ package mapprotocol
 import (
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/tcap"
 	"go.uber.org/zap"
@@ -470,4 +471,27 @@ func bumpPerOpCounter(m *Metrics, op OperationCode) {
 	case OpMoForwardSM:
 		m.MoForwardSMCount.Add(1)
 	}
+}
+
+// VersionFallback is the TCAP version-fallback table for the operations
+// this gateway originates (TS 29.002 §5.2.1): when a peer refuses a version 3
+// short-message context and proposes version 2 of the same context, the
+// request is sent again under it.
+//   - shortMsgGateway v3 → v2: SendRoutingInfoForSM, unchanged.
+//   - shortMsgMT-Relay v3 → v2: the operation is forwardSM (op 46) in
+//     version 2 (§17.2.2.22, §17.2.2.24). Its argument is sent as encoded for
+//     MT-ForwardSM: sm-RP-DA, sm-RP-OA, sm-RP-UI. That this matches
+//     version 2's ForwardSM-Arg is from knowledge of MAP v2; the v2 ASN.1 is
+//     no longer in TS 29.002 and was not checked.
+func VersionFallback(refused []int, logicalOp int32, proposed []int) (*tcap.ApplicationContext, int32, bool) {
+	is := func(ac tcap.ApplicationContext, oid []int) bool { return slices.Equal(ac.OID, oid) }
+	switch {
+	case is(tcap.ACShortMsgGatewayV3, refused) && is(tcap.ACShortMsgGatewayV2, proposed) &&
+		logicalOp == int32(OpSendRoutingInfoForSM):
+		return &tcap.ACShortMsgGatewayV2, logicalOp, true
+	case is(tcap.ACShortMsgMTRelayV3, refused) && is(tcap.ACShortMsgMTRelayV2, proposed) &&
+		logicalOp == int32(OpMtForwardSM):
+		return &tcap.ACShortMsgMTRelayV2, int32(OpMoForwardSM), true // op 46 = forwardSM in v2
+	}
+	return nil, 0, false
 }

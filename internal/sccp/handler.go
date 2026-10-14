@@ -71,6 +71,7 @@ func NewHandler(
 		errorCh:        make(chan error, 10),
 		shutdownCh:     make(chan struct{}),
 		subsystems:     make(map[SubsystemNumber]*SubsystemStatus),
+		reassembler:    newReassembler(),
 		metrics:        &Metrics{},
 		logger:         logger,
 	}
@@ -187,7 +188,7 @@ func (h *Handler) handleIncomingMessage(mtp3Msg *m3ua.MTP3Message) {
 		zap.Uint8("protocol_class", uint8(sccpMsg.ProtocolClass)),
 		zap.Int("data_len", len(sccpMsg.Data)))
 
-	if sccpMsg.MessageType == MsgTypeUDTS {
+	if sccpMsg.MessageType == MsgTypeUDTS || sccpMsg.MessageType == MsgTypeXUDTS {
 		// One of our messages could not be delivered; the UDTS returns it.
 		h.metrics.Errors.Add(1)
 		h.logger.Warn("SCCP UDTS: a message from this node was not delivered",
@@ -209,6 +210,22 @@ func (h *Handler) handleIncomingMessage(mtp3Msg *m3ua.MTP3Message) {
 		h.metrics.Errors.Add(1)
 		h.sendUDTS(sccpMsg, CauseNoTranslationForAddress, mtp3Msg.OPC)
 		return
+	}
+	if sccpMsg.MessageType == MsgTypeXUDT && sccpMsg.Segmentation != nil {
+		whole, failure := h.reassemble(sccpMsg, mtp3Msg.OPC)
+		if failure != nil {
+			h.metrics.Errors.Add(1)
+			h.logger.Warn("SCCP reassembly failed", zap.Stringer("cause", failure.cause))
+			if failure.msg != nil {
+				failure.msg.ReturnOnError = true
+				h.sendUDTS(failure.msg, failure.cause, mtp3Msg.OPC)
+			}
+			return
+		}
+		if whole == nil {
+			return // more segments to come
+		}
+		sccpMsg = whole
 	}
 	if err := h.deliverLocal(sccpMsg); err != nil {
 		h.logger.Error("Failed to deliver message", zap.Error(err))
@@ -514,11 +531,17 @@ func (h *Handler) selectSLS(msg *SccpMessage) uint8 {
 // never for a UDTS. It goes back to the node that handed it to us (the MTP3
 // OPC), which routes it on the swapped called address.
 func (h *Handler) sendUDTS(orig *SccpMessage, cause ReturnCause, toPC uint32) {
-	if !orig.ReturnOnError || orig.MessageType == MsgTypeUDTS || orig.CallingAddress == nil || toPC == 0 {
+	if !orig.ReturnOnError || orig.MessageType == MsgTypeUDTS || orig.MessageType == MsgTypeXUDTS ||
+		orig.CallingAddress == nil || toPC == 0 {
 		return
 	}
+	returned := MsgTypeUDTS
+	if orig.MessageType == MsgTypeXUDT {
+		returned = MsgTypeXUDTS // an XUDT is returned in an XUDTS (Q.714 §4.2)
+	}
 	udts := &SccpMessage{
-		MessageType:    MsgTypeUDTS,
+		MessageType:    returned,
+		HopCounter:     h.config.MaxHopCounter,
 		ReturnCause:    cause,
 		CalledAddress:  orig.CallingAddress,
 		CallingAddress: orig.CalledAddress,

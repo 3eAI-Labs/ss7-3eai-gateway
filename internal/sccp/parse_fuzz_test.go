@@ -23,6 +23,11 @@ func FuzzParseSCCP(f *testing.F) {
 			}
 		}
 	}
+	msg.MessageType = MsgTypeXUDT
+	msg.Segmentation = &Segmentation{First: true, Remaining: 2, LocalRef: 7}
+	if b, err := EncodeSCCP(msg, VariantITU); err == nil {
+		f.Add(b, uint8(VariantITU))
+	}
 	f.Fuzz(func(t *testing.T, data []byte, v uint8) {
 		_, _ = ParseSCCP(data, NetworkVariant(v%2))
 	})

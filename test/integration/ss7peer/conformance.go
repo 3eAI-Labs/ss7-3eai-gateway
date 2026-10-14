@@ -40,6 +40,13 @@ var expectedACByOp = map[int32][]byte{
 	int32(mapprotocol.OpMtForwardSM):          acOID(25, 3), // shortMsgMT-RelayContext-v3
 }
 
+// Version 2 equivalents (TS 29.002 §17.3.2.21, §17.3.2.26; forwardSM is
+// op 46 in version 2's shortMsgRelayPackage-v2).
+var expectedV2ACByOp = map[int32][]byte{
+	int32(mapprotocol.OpSendRoutingInfoForSM): acOID(20, 2),
+	int32(mapprotocol.OpMoForwardSM):          acOID(25, 2),
+}
+
 func acOID(context, version byte) []byte {
 	return []byte{0x06, 0x07, 0x04, 0x00, 0x00, 0x01, 0x00, context, version}
 }

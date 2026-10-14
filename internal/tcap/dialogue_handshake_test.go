@@ -310,3 +310,64 @@ func TestEmptyBegin_Bounded(t *testing.T) {
 	h.removeDialogue(tid)
 	assert.Equal(t, int64(0), h.pendingEmptyBegins.Load())
 }
+
+// A peer refusing our context with an AARE proposing another gets the same
+// request in a new dialogue under it (TS 29.002 §5.2.1) — once.
+func TestVersionFallback_RetriesOnce(t *testing.T) {
+	h, in, out, _ := startHandshakeHandler(t)
+	rec := &recordingSink{}
+	h.SetFailureSink(rec.fn())
+	h.SetVersionFallback(func(refused []int, op int32, proposed []int) (*ApplicationContext, int32, bool) {
+		if refused[len(refused)-1] == 3 && proposed[len(proposed)-1] == 2 {
+			return &ApplicationContext{OID: proposed}, 46, true
+		}
+		return nil, 0, false
+	})
+
+	called := &sccp.SccpAddress{PointCode: 2, SubsystemNumber: sccp.SSNMSC}
+	calling := &sccp.SccpAddress{PointCode: 1, SubsystemNumber: sccp.SSNMSC}
+	first, err := h.Originate(&ACShortMsgMTRelayV3, called, calling, 44, []byte{0x30, 0x00}, "corr-v2")
+	require.NoError(t, err)
+	nextSent(t, out) // the v3 BEGIN
+
+	refuse := func(tid uint32, proposed []int) {
+		wire, err := h.encodeTCAPMessage(&Message{
+			MessageType: MsgTypeAbort, DestinationTID: h.encodeTID(tid),
+			DialoguePortion: &DialoguePortion{ApplicationContext: &ApplicationContext{OID: proposed}, Rejected: true},
+		})
+		require.NoError(t, err)
+		in <- &sccp.SccpMessage{MessageType: sccp.MsgTypeUDT, Data: wire, CalledAddress: calling, CallingAddress: called}
+	}
+	refuse(first.LocalTID, ACShortMsgMTRelayV2.OID)
+
+	retry := nextSent(t, out)
+	assert.Equal(t, int(gotcap.Begin), int(retry.Transaction.Type.Code()))
+	assert.Equal(t, []byte{0x06, 0x07, 0x04, 0x00, 0x00, 0x01, 0x00, 25, 2}, retry.Dialogue.DialoguePDU.ApplicationContextName.Value)
+	require.NotNil(t, retry.Components)
+	assert.Equal(t, []byte{46}, retry.Components.Component[0].OperationCode.Value, "op sent under v2")
+	assert.Empty(t, rec.snapshot(), "the caller is not told about the first refusal")
+
+	// The retry is refused too: no third attempt, the caller hears ABORTED.
+	var retryTID uint32
+	for _, b := range retry.Transaction.OrigTransactionID.Value {
+		retryTID = retryTID<<8 | uint32(b)
+	}
+	refuse(retryTID, ACShortMsgMTRelayV2.OID)
+	require.Eventually(t, func() bool { return len(rec.snapshot()) == 1 }, time.Second, 10*time.Millisecond)
+	assert.Equal(t, FailureAbortReceived, rec.snapshot()[0].reason)
+	assert.Equal(t, int32(44), rec.snapshot()[0].opCode, "reported as the operation the caller asked for")
+	assert.Equal(t, 0, h.getDialogueCount())
+}
+
+// A context registered for our own dialogues only is not accepted from a peer.
+func TestDispatcher_InitiatorOnlyRoutes(t *testing.T) {
+	d := NewDispatcher(zaptest.NewLogger(t))
+	app := newFakeHandler("map")
+	require.NoError(t, d.RegisterInitiatorOnly(ACShortMsgMTRelayV2.OID, app))
+
+	peerOpened := &Dialogue{}
+	assert.ErrorIs(t, d.Dispatch(peerOpened, dialogueMsgWithAC(ACShortMsgMTRelayV2.OID)), ErrUnknownAppContext)
+	ours := &Dialogue{initiatedLocally: true}
+	assert.NoError(t, d.Dispatch(ours, dialogueMsgWithAC(ACShortMsgMTRelayV2.OID)))
+	assert.Nil(t, d.LookupHandler(ACShortMsgMTRelayV2.OID), "never accepted on an incoming BEGIN")
+}

@@ -60,11 +60,13 @@ What is planned for each of these is in the [roadmap](docs/ROADMAP.md).
 
 **Protocol:**
 - Only the three operations above. Other MAP operations, and dialogues under other application
-  contexts, are refused. Only version 3 contexts are offered or accepted; there is no fallback to v2.
+  contexts, are refused. The gateway offers version 3 and falls back to version 2 when a peer
+  refuses it (TS 29.002 §5.2.1); dialogues a peer opens under version 2 (an old MSC's forwardSM)
+  are refused with an AARE proposing version 3.
 - A message too long for one SCCP unitdata (a full-length SMS, for instance) is sent with a TCAP
-  "empty Begin" (TS 29.002 §C.2.1), and accepted that way from peers. Incoming XUDT segments are
-  not reassembled yet, and the gateway never segments with XUDT itself (not every transit node
-  carries XUDT, §C.1). LUDT is not supported.
+  "empty Begin" (TS 29.002 §C.2.1), and accepted that way from peers. Segmented XUDT from a peer
+  is reassembled; the gateway never segments with XUDT itself (not every transit node carries
+  XUDT, §C.1). LUDT is not supported.
 - ANSI SCCP addresses use the ITU address-indicator layout; this is not verified against
   ANSI T1.112.
 - CAP: an incoming InitialDP gets no answer, and CAP origination needs pre-encoded BER. The CAP

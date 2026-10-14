@@ -154,6 +154,17 @@ var (
 		OID:  []int{0, 4, 0, 0, 1, 0, 25, 3},
 		Name: "shortMsgMT-RelayContext-v3",
 	}
+
+	// Version 2 equivalents (TS 29.002 §17.3.2.21, §17.3.2.26), used only
+	// to fall back when a peer refuses version 3 (§5.2.1).
+	ACShortMsgGatewayV2 = ApplicationContext{
+		OID:  []int{0, 4, 0, 0, 1, 0, 20, 2},
+		Name: "shortMsgGatewayContext-v2",
+	}
+	ACShortMsgMTRelayV2 = ApplicationContext{
+		OID:  []int{0, 4, 0, 0, 1, 0, 25, 2},
+		Name: "shortMsgMT-RelayContext-v2",
+	}
 	ACCapV2 = ApplicationContext{
 		OID:  []int{0, 4, 0, 0, 1, 0, 50, 1},
 		Name: "cap-ac-gsmSCF-gsmSSF-v2",
@@ -163,6 +174,12 @@ var (
 		Name: "cap-ac-gsmSCF-gsmSSF-v3",
 	}
 )
+
+// VersionFallback picks the retry for an originated dialogue whose context
+// the peer refused, proposing another (TS 29.002 §5.2.1): the context to
+// use and the operation code to send under it (an operation may differ
+// between versions). ok is false when no fallback applies.
+type VersionFallback func(refused []int, logicalOp int32, proposed []int) (ac *ApplicationContext, wireOp int32, ok bool)
 
 // Component represents a TCAP component
 type Component struct {
@@ -251,6 +268,12 @@ type Dialogue struct {
 	// bounded (count and lifetime; see handleBegin).
 	awaitingContinuation atomic.Bool
 
+	// initiatedLocally marks a dialogue this node opened (Originate).
+	initiatedLocally bool
+	// versionFallbackUsed marks a dialogue that is already the lower-version
+	// retry of a refused one; it is not retried again.
+	versionFallbackUsed bool
+
 	// Pending operations
 	PendingInvokes map[int32]*PendingInvoke
 	invokesMu      sync.RWMutex
@@ -310,6 +333,10 @@ type Handler struct {
 	// between two addresses (see SetUserDataLimit); nil means the 255-octet
 	// data parameter limit.
 	maxUserData func(called, calling *sccp.SccpAddress) int
+
+	// versionFallback chooses the lower-version retry of a refused dialogue
+	// (see SetVersionFallback); nil disables fallback.
+	versionFallback VersionFallback
 
 	// pendingEmptyBegins counts dialogues with awaitingContinuation set.
 	pendingEmptyBegins atomic.Int64

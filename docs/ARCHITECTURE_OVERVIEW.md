@@ -75,6 +75,15 @@ Every originated dialogue ends with exactly one publish on its response subject:
 A request the bridge rejects before a dialogue starts gets no response. The client validates the
 same fields before publishing and bounds every call with a deadline.
 
+## Version negotiation
+
+The gateway proposes version 3 of each short-message context. A peer that supports only version 2
+refuses it with a TC-U-ABORT whose AARE proposes version 2; the gateway then sends the same
+request in a new dialogue under version 2 (TS 29.002 §5.2.1) — MT delivery becomes forwardSM
+there — once, and the caller sees only the final outcome. Answers to such a dialogue are routed
+by a registration that applies only to dialogues the gateway opened, so peers cannot open
+version 2 dialogues with it.
+
 ## An MO short message
 
 An MSC opens a dialogue under `shortMsgMO-RelayContext-v3`, addressed to the cluster GT. The STP
@@ -93,6 +102,9 @@ The gateway is an SCCP end node, not a relay.
 - An incoming UDTS returns one of our messages: the dialogue that message belonged to is ended at
   once and its caller told the return cause. It is never passed up as data.
 - Global title translation applies only to messages this node originates.
+- A peer's segmented XUDT is reassembled before delivery (Q.714 §4.1.1.2): segments are matched by
+  calling address, OPC and local reference, wait at most T(reass) = 15 s, and a failure is
+  returned in an XUDTS when the sender asked for it.
 
 ## High availability
 

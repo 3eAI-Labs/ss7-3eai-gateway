@@ -182,6 +182,22 @@ func (h *Handler) Originate(
 	parameter []byte,
 	natsCorrelationID string,
 ) (*Dialogue, error) {
+	return h.originate(ac, called, calling, opCode, opCode, parameter, natsCorrelationID, false)
+}
+
+// originate opens a dialogue. logicalOp is the operation the caller asked
+// for (it selects the answer's decoder and the reply subject); wireOp is the
+// code sent, which differs only when a lower version names the operation
+// differently (MT-ForwardSM is forwardSM in version 2).
+func (h *Handler) originate(
+	ac *ApplicationContext,
+	called, calling *sccp.SccpAddress,
+	logicalOp, wireOp int32,
+	parameter []byte,
+	natsCorrelationID string,
+	isFallback bool,
+) (*Dialogue, error) {
+	opCode := wireOp
 	if ac == nil {
 		return nil, errors.New("Originate: application context required")
 	}
@@ -197,16 +213,18 @@ func (h *Handler) Originate(
 	invokeID := int32(1)
 
 	dialogue := &Dialogue{
-		LocalTID:           localTID,
-		State:              StateInitWait,
-		ApplicationContext: ac,
-		LocalAddress:       calling,
-		RemoteAddress:      called,
-		NATSCorrelationID:  natsCorrelationID,
-		OriginatingOpCode:  opCode,
-		CreatedAt:          time.Now(),
-		LastActivity:       time.Now(),
-		ExpiresAt:          time.Now().Add(h.config.DialogueTimeout),
+		LocalTID:            localTID,
+		State:               StateInitWait,
+		ApplicationContext:  ac,
+		LocalAddress:        calling,
+		RemoteAddress:       called,
+		NATSCorrelationID:   natsCorrelationID,
+		OriginatingOpCode:   logicalOp,
+		initiatedLocally:    true,
+		versionFallbackUsed: isFallback,
+		CreatedAt:           time.Now(),
+		LastActivity:        time.Now(),
+		ExpiresAt:           time.Now().Add(h.config.DialogueTimeout),
 		PendingInvokes: map[int32]*PendingInvoke{
 			invokeID: {
 				InvokeID:      invokeID,
@@ -521,6 +539,11 @@ func (h *Handler) handleAbort(sccpCtx *sccp.SccpMessage, msg *Message) {
 	corrID := dialogue.NATSCorrelationID
 	opCode := dialogue.OriginatingOpCode
 
+	if h.retryUnderLowerVersion(dialogue, msg) {
+		h.removeDialogue(localTID)
+		return
+	}
+
 	// ABORT is terminal regardless of dispatch outcome.
 	h.dispatchToApplication(sccpCtx, dialogue, msg)
 	h.removeDialogue(localTID)
@@ -773,6 +796,49 @@ func (h *Handler) HandleDeliveryFailure(msg *sccp.SccpMessage, reason string) {
 	if h.failureSink != nil && corrID != "" {
 		h.failureSink(corrID, opCode, FailureNotDelivered, reason)
 	}
+}
+
+// SetVersionFallback enables retrying an originated dialogue under the
+// context the peer proposes when it refuses ours. Set before Start.
+func (h *Handler) SetVersionFallback(f VersionFallback) {
+	h.versionFallback = f
+}
+
+// retryUnderLowerVersion handles a TC-U-ABORT whose AARE refuses the
+// context of a dialogue we opened and proposes another: if the fallback
+// table maps it, the same request is sent again in a new dialogue under the
+// proposed context (TS 29.002 §5.2.1: "the initiating user needs to start a
+// new dialogue"). Once per request.
+func (h *Handler) retryUnderLowerVersion(dialogue *Dialogue, abort *Message) bool {
+	if h.versionFallback == nil || !dialogue.initiatedLocally || dialogue.versionFallbackUsed ||
+		abort.DialoguePortion == nil || !abort.DialoguePortion.Rejected ||
+		abort.DialoguePortion.ApplicationContext == nil || dialogue.ApplicationContext == nil {
+		return false
+	}
+	ac, wireOp, ok := h.versionFallback(dialogue.ApplicationContext.OID, dialogue.OriginatingOpCode,
+		abort.DialoguePortion.ApplicationContext.OID)
+	if !ok {
+		return false
+	}
+
+	var parameter []byte
+	dialogue.invokesMu.RLock()
+	if inv := dialogue.PendingInvokes[1]; inv != nil {
+		parameter = inv.Parameter
+	}
+	dialogue.invokesMu.RUnlock()
+
+	retry, err := h.originate(ac, dialogue.RemoteAddress, dialogue.LocalAddress,
+		dialogue.OriginatingOpCode, wireOp, parameter, dialogue.NATSCorrelationID, true)
+	if err != nil {
+		h.logger.Warn("Version fallback failed to start", zap.Error(err))
+		return false
+	}
+	h.logger.Info("Peer refused the application context: retrying under the version it proposed",
+		zap.String("refused", oidString(dialogue.ApplicationContext.OID)),
+		zap.String("retry", ac.Name),
+		zap.Uint32("new_local_tid", retry.LocalTID))
+	return true
 }
 
 // SetUserDataLimit tells TCAP how much data one SCCP unitdata can carry

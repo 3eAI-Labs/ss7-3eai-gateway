@@ -168,6 +168,18 @@ type Config struct {
 	ReturnUDTS bool
 	UDTSCause  sccp.ReturnCause
 
+	// OnlyVersion2 makes the peer behave like a node that supports version 2
+	// of the short-message contexts only: a version 3 BEGIN is refused with
+	// an AARE proposing version 2 (TS 29.002 §5.2.1); a version 2 BEGIN is
+	// served — SRI-for-SM under shortMsgGateway v2, and MT delivery as
+	// forwardSM (op 46) under shortMsgMT-Relay v2, answered without a result
+	// parameter.
+	OnlyVersion2 bool
+
+	// SegmentAnswers > 1 makes the peer send each answer as that many XUDT
+	// segments (Q.714 §4.1.1.1.2), as a node with a long answer may.
+	SegmentAnswers int
+
 	// AcceptTimeout bounds how long Listen.Accept will wait for an ASP
 	// before tearing down. Default 5s if zero.
 	AcceptTimeout time.Duration
@@ -221,6 +233,8 @@ type Peer struct {
 	// gateway's OTID, waiting for the CONTINUE with the components.
 	openDialogues sync.Map // uint32 → emptyBeginDialogue
 	emptyBegins   atomic.Uint64
+	segmentRef    atomic.Uint32
+	v2Dialogues   atomic.Uint64
 }
 
 // Start binds SCTP, builds the M3UA listener, and accepts the first
@@ -525,6 +539,25 @@ func (p *Peer) handleMTP3(conn *m3ua.Conn, pd *params.ProtocolDataPayload) {
 		}
 
 		otid := bytesToUint32(otidValue.Value)
+		if p.cfg.OnlyVersion2 {
+			if len(acValue) >= 2 && acValue[len(acValue)-1] == 3 {
+				p.sendACNotSupported(conn, pd, sccpMsg, otidValue.Value, acOID(acValue[len(acValue)-2], 2))
+				return
+			}
+			want, known := expectedV2ACByOp[int32(opCode)]
+			if !known || !bytes.Equal(want, acValue) {
+				p.violate("op %d sent under % X in a version 2 dialogue", opCode, acValue)
+				p.sendACNotSupported(conn, pd, sccpMsg, otidValue.Value, acOID(20, 2))
+				return
+			}
+			p.v2Dialogues.Add(1)
+			if int32(opCode) == int32(mapprotocol.OpMoForwardSM) { // forwardSM: MT delivery in v2
+				p.handleMtForwardSMInvoke(conn, pd, sccpMsg, tcapMsg, otidValue.Value, invokeID, paramBytes, otid)
+				return
+			}
+			p.handleSRIInvoke(conn, pd, sccpMsg, tcapMsg, otidValue.Value, invokeID, paramBytes, otid)
+			return
+		}
 		if p.cfg.RefuseContexts {
 			if want, known := expectedACByOp[int32(opCode)]; known {
 				p.sendACNotSupported(conn, pd, sccpMsg, otidValue.Value, acOID(want[len(want)-2], 2))
@@ -662,9 +695,12 @@ func (p *Peer) handleMtForwardSMInvoke(
 		p.sendAbort(conn, pd, sccpReq, otidBytes)
 		return
 	}
+	op := int32(mapprotocol.OpMtForwardSM)
+	if p.cfg.OnlyVersion2 {
+		op, respParam = int32(mapprotocol.OpMoForwardSM), nil // forwardSM: no result parameter
+	}
 
-	p.sendEndReturnResult(conn, pd, sccpReq, tcapReq, otidBytes, invokeID,
-		int32(mapprotocol.OpMtForwardSM), respParam)
+	p.sendEndReturnResult(conn, pd, sccpReq, tcapReq, otidBytes, invokeID, op, respParam)
 	p.mtFwdResponses.Add(1)
 }
 
@@ -800,6 +836,22 @@ func (p *Peer) writeSCCPResponse(
 	sccpReq *sccp.SccpMessage,
 	tcapBytes []byte,
 ) {
+	if n := p.cfg.SegmentAnswers; n > 1 {
+		ref := p.segmentRef.Add(1) & 0xFFFFFF
+		size := (len(tcapBytes) + n - 1) / n
+		for i := 0; i < n; i++ {
+			p.writeSCCP(conn, pd, &sccp.SccpMessage{
+				MessageType:    sccp.MsgTypeXUDT,
+				ProtocolClass:  sccp.ClassInSequenceConnectionless, // segments travel as class 1
+				HopCounter:     15,
+				CalledAddress:  sccpReq.CallingAddress,
+				CallingAddress: sccpReq.CalledAddress,
+				Data:           tcapBytes[i*size : min((i+1)*size, len(tcapBytes))],
+				Segmentation:   &sccp.Segmentation{First: i == 0, Remaining: uint8(n - 1 - i), LocalRef: ref},
+			})
+		}
+		return
+	}
 	p.writeSCCP(conn, pd, &sccp.SccpMessage{
 		MessageType:    sccp.MsgTypeUDT,
 		ProtocolClass:  sccpReq.ProtocolClass,
@@ -1050,3 +1102,7 @@ func (p *Peer) continueAfterEmptyBegin(tcapMsg *gotcap.TCAP, otid []byte) ([]byt
 	}
 	return d.acValue, true
 }
+
+// V2Dialogues returns how many version 2 dialogues the peer served
+// (OnlyVersion2).
+func (p *Peer) V2Dialogues() uint64 { return p.v2Dialogues.Load() }
