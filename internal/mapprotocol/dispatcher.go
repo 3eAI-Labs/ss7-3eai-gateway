@@ -163,7 +163,31 @@ func (h *Handler) handleReturnResult(dialogue *tcap.Dialogue, comp *tcap.Compone
 		zap.Uint32("tid", tid),
 		zap.String("nats_correlation_id", corrID))
 
-	resp, err := decodeReturnResult(op, comp.Parameter)
+	// A result may come in segments: Return Result Not Last components, each
+	// in a TC-CONTINUE, then a Return Result Last (TS 29.002 §C.2.3). They
+	// make one confirmation (table 7.5/4 note 4), so the segments are held
+	// until the last one.
+	if comp.NotLast {
+		if !dialogue.AddResultSegment(comp.Parameter) {
+			h.logger.Warn("MAP segmented result over the bounds; segments dropped",
+				zap.Int32("op_code", int32(op)), zap.Uint32("tid", tid))
+		}
+		return
+	}
+	segments, overflow := dialogue.TakeResultSegments()
+	if overflow {
+		h.metrics.Errors.Add(1)
+		h.reportRemoteError(dialogue, 0, fmt.Sprintf("segmented result over %d segments or %d octets",
+			tcap.MaxResultSegments, tcap.MaxResultSegmentOctets))
+		return
+	}
+	var resp any
+	var err error
+	if len(segments) == 0 {
+		resp, err = decodeReturnResult(op, comp.Parameter)
+	} else {
+		resp, err = decodeSegmentedResult(op, append(segments, comp.Parameter))
+	}
 	if err != nil {
 		h.metrics.Errors.Add(1)
 		h.logger.Warn("MAP ReturnResult decode failed",
@@ -209,8 +233,21 @@ func decodeReturnResult(op OperationCode, param []byte) (any, error) {
 		return DecodeAnyTimeInterrogationRes(param)
 	case OpProvideSubscriberInfo:
 		return DecodeProvideSubscriberInfoRes(param)
+	case OpSendRoutingInfo:
+		return DecodeSendRoutingInfoResult([][]byte{param})
 	}
 	return nil, nil
+}
+
+// decodeSegmentedResult decodes a result that came in several segments.
+// Of the results the gateway reads, TS 29.002 Annex C (AC version 3 table)
+// recommends TC-Result-NL for SendRoutingInfoRes only; ProvideSubscriberInfoRes
+// "not recommended", the others not applicable.
+func decodeSegmentedResult(op OperationCode, params [][]byte) (any, error) {
+	if op != OpSendRoutingInfo {
+		return nil, fmt.Errorf("op %d result in %d segments: not supported", op, len(params))
+	}
+	return DecodeSendRoutingInfoResult(params)
 }
 
 // processInvoke decodes the parameter bytes for op, runs the registered
@@ -249,24 +286,6 @@ func (h *Handler) processInvoke(op OperationCode, param []byte, tid uint32) (res
 			return nil, ec, perr
 		}
 		out, eerr := encodeCancelLocationRes(resp)
-		if eerr != nil {
-			return nil, nil, eerr
-		}
-		return out, nil, nil
-
-	case OpSendRoutingInfo:
-		req, derr := decodeSendRoutingInfoArg(param)
-		if derr != nil {
-			h.metrics.Errors.Add(1)
-			h.logger.Warn("MAP SendRoutingInfo decode failed",
-				zap.Error(derr), zap.Uint32("tid", tid))
-			return nil, nil, fmt.Errorf("%w: %v", errCodecDecode, derr)
-		}
-		resp, ec, perr := h.ProcessSendRoutingInfo(req)
-		if perr != nil || resp == nil {
-			return nil, ec, perr
-		}
-		out, eerr := encodeSendRoutingInfoRes(resp)
 		if eerr != nil {
 			return nil, nil, eerr
 		}

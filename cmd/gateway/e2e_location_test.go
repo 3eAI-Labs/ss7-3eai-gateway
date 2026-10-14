@@ -24,11 +24,18 @@ import (
 // one gateway through the production boot path, and a client.
 func startLocationE2E(t *testing.T, onATI ss7peer.ATICallback, onPSI ss7peer.PSICallback) (*ss7peer.Peer, *ss7client.Client) {
 	t.Helper()
+	return startInterrogationE2E(t, func(c *ss7peer.Config) { c.OnATI, c.OnPSI = onATI, onPSI })
+}
+
+// startInterrogationE2E boots the strict peer, configured by configure, one
+// gateway through the production boot path, and a client.
+func startInterrogationE2E(t *testing.T, configure func(*ss7peer.Config)) (*ss7peer.Peer, *ss7client.Client) {
+	t.Helper()
 	logger := zaptest.NewLogger(t)
 	natsServer := startEmbeddedNATS(t)
 	t.Cleanup(natsServer.Shutdown)
 
-	peer, err := ss7peer.Start(context.Background(), ss7peer.Config{
+	cfg := ss7peer.Config{
 		SCTPAddr:         allocLoopbackSCTPPort(t),
 		PointCode:        e2ePeerPC,
 		GatewayPointCode: e2eGatewayPC,
@@ -39,9 +46,9 @@ func startLocationE2E(t *testing.T, onATI ss7peer.ATICallback, onPSI ss7peer.PSI
 			t.Error("no SRI-for-SM expected")
 			return nil, nil
 		},
-		OnATI: onATI,
-		OnPSI: onPSI,
-	})
+	}
+	configure(&cfg)
+	peer, err := ss7peer.Start(context.Background(), cfg)
 	require.NoError(t, err, "start ss7peer")
 	t.Cleanup(peer.Stop)
 	t.Cleanup(func() { require.Empty(t, peer.Violations(), "ss7peer conformance violations") })

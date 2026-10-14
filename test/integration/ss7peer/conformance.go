@@ -40,6 +40,7 @@ var expectedACByOp = map[int32][]byte{
 	int32(mapprotocol.OpMtForwardSM):           acOID(25, 3), // shortMsgMT-RelayContext-v3
 	int32(mapprotocol.OpProvideSubscriberInfo): acOID(28, 3), // subscriberInfoEnquiryContext-v3
 	int32(mapprotocol.OpAnyTimeInterrogation):  acOID(29, 3), // anyTimeInfoEnquiryContext-v3
+	int32(mapprotocol.OpSendRoutingInfo):       acOID(5, 3),  // locationInfoRetrievalContext-v3
 }
 
 // Subsystem numbers (TS 23.003 §8): the called address names the node the
@@ -57,11 +58,13 @@ var expectedCalledSSNByOp = map[int32]uint8{
 	int32(mapprotocol.OpMtForwardSM):           ssnMSC,
 	int32(mapprotocol.OpAnyTimeInterrogation):  ssnHLR,
 	int32(mapprotocol.OpProvideSubscriberInfo): ssnVLR,
+	int32(mapprotocol.OpSendRoutingInfo):       ssnHLR,
 }
 
 var expectedCallingSSNByOp = map[int32]uint8{
 	int32(mapprotocol.OpAnyTimeInterrogation):  ssnGSMSCF,
 	int32(mapprotocol.OpProvideSubscriberInfo): ssnHLR,
+	int32(mapprotocol.OpSendRoutingInfo):       ssnMSC, // the GMSC
 }
 
 // checkSubsystems validates the SSNs of an operation's SCCP addresses.

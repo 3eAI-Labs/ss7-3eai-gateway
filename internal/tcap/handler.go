@@ -5,9 +5,11 @@ package tcap
 
 import (
 	"context"
+	"encoding/asn1"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"time"
 
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
@@ -108,11 +110,17 @@ func (h *Handler) Start(ctx context.Context) error {
 		zap.Duration("dialogue_timeout", h.config.DialogueTimeout))
 
 	// Track workers + timer manager so Stop can wait for graceful drain.
-	h.wg.Add(h.config.WorkerPoolSize + 1)
+	h.wg.Add(h.config.WorkerPoolSize + 2)
 
-	for i := 0; i < h.config.WorkerPoolSize; i++ {
+	// Each worker has its own inbound queue, fed by distributeInbound, so
+	// that the messages of one transaction keep their order (see
+	// transactionShard).
+	h.workerIn = make([]chan *sccp.SccpMessage, h.config.WorkerPoolSize)
+	for i := range h.workerIn {
+		h.workerIn[i] = make(chan *sccp.SccpMessage, h.config.ChannelBufferSize)
 		go h.worker(ctx, i)
 	}
+	go h.distributeInbound(ctx)
 	go h.timerManager.run(ctx)
 
 	h.logger.Info("TCAP handler started successfully",
@@ -291,12 +299,78 @@ func (h *Handler) worker(ctx context.Context, id int) {
 			return
 		case <-ctx.Done():
 			return
-		case sccpMsg := <-h.sccpIncomingCh:
+		case sccpMsg := <-h.workerIn[id]:
 			h.handleIncomingMessage(sccpMsg)
 		case appMsg := <-h.appOutgoingCh:
 			h.handleOutgoingMessage(appMsg)
 		}
 	}
+}
+
+// distributeInbound hands each message from SCCP to the worker its
+// transaction maps to.
+func (h *Handler) distributeInbound(ctx context.Context) {
+	defer h.wg.Done()
+	for {
+		select {
+		case <-h.shutdownCh:
+			return
+		case <-ctx.Done():
+			return
+		case m := <-h.sccpIncomingCh:
+			var shard int
+			if m != nil {
+				shard = transactionShard(m.Data, len(h.workerIn))
+			}
+			select {
+			case h.workerIn[shard] <- m:
+			case <-h.shutdownCh:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// transactionShard maps a TCAP message to a worker by its transaction: the
+// destination transaction ID — this node's ID for the transaction — when
+// the message has one (CONTINUE, END, ABORT), else the origination ID
+// (BEGIN). The messages of one transaction are then handled in the order
+// SCCP delivered them; a TC-Result-NL segment in a CONTINUE is not
+// overtaken by the END with the last one (TS 29.002 §C.2.3). Unparsable
+// input goes to worker 0, where parsing rejects it.
+func transactionShard(data []byte, workers int) int {
+	if workers <= 1 {
+		return 0
+	}
+	var msg asn1.RawValue
+	if _, err := asn1.Unmarshal(data, &msg); err != nil || msg.Class != asn1.ClassApplication {
+		return 0
+	}
+	var otid, dtid []byte
+	for rest := msg.Bytes; len(rest) > 0 && dtid == nil; {
+		var f asn1.RawValue
+		var err error
+		if rest, err = asn1.Unmarshal(rest, &f); err != nil {
+			break
+		}
+		if f.Class == asn1.ClassApplication && !f.IsCompound {
+			switch f.Tag {
+			case 8: // Originating Transaction ID, [APPLICATION 8] (Q.773)
+				otid = f.Bytes
+			case 9: // Destination Transaction ID, [APPLICATION 9]
+				dtid = f.Bytes
+			}
+		}
+	}
+	id := dtid
+	if id == nil {
+		id = otid
+	}
+	h := fnv.New32a()
+	_, _ = h.Write(id)
+	return int(h.Sum32() % uint32(workers))
 }
 
 // handleIncomingMessage processes a TCAP-bearing SCCP UDT/XUDT delivered by

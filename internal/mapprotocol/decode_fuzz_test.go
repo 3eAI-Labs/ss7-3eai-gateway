@@ -15,7 +15,7 @@ func FuzzDecoders(f *testing.F) {
 		f.Add(b)
 	}
 	f.Add([]byte{0x30, 0x03, 0x80, 0x01, 0x09})
-	for _, seed := range locationSeeds() {
+	for _, seed := range append(locationSeeds(), routingSeeds()...) {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, b []byte) {
@@ -24,7 +24,8 @@ func FuzzDecoders(f *testing.F) {
 		_, _ = decodeIMSI(b)
 		_, _ = decodeUpdateLocationArg(b)
 		_, _ = decodeCancelLocationArg(b)
-		_, _ = decodeSendRoutingInfoArg(b)
+		_, _ = DecodeSendRoutingInfoArg(b)
+		_, _ = DecodeSendRoutingInfoRes(b)
 		_, _ = decodeProvideRoamingNumberArg(b)
 		_, _ = DecodeAnyTimeInterrogationRes(b)
 		_, _ = DecodeProvideSubscriberInfoRes(b)

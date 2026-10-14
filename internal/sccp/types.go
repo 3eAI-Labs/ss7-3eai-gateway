@@ -326,6 +326,8 @@ type Handler struct {
 	// Q.713/RFC 4666 layering: SCCP rides on MTP3 SI=3.
 	m3uaIncomingCh <-chan *m3ua.MTP3Message
 	m3uaOutgoingCh chan<- *m3ua.MTP3Message
+	// workerIn are the workers' inbound queues (see inboundShard).
+	workerIn []chan *m3ua.MTP3Message
 
 	// TCAP integration. Owner: sccp.Handler. tcapIncomingCh fans messages
 	// out to TCAP after GTT/local-delivery routing; tcapOutgoingCh receives

@@ -21,17 +21,19 @@ import (
 // NATS subjects of the MAP interfaces (contract: ss7client).
 const (
 	// Inbound: application → gateway
-	SubjectMTSmsRequest = ss7client.SubjectMTSMSRequest
-	SubjectSRIRequest   = ss7client.SubjectSRIRequest
-	SubjectATIRequest   = ss7client.SubjectATIRequest
-	SubjectPSIRequest   = ss7client.SubjectPSIRequest
+	SubjectMTSmsRequest   = ss7client.SubjectMTSMSRequest
+	SubjectSRIRequest     = ss7client.SubjectSRIRequest
+	SubjectATIRequest     = ss7client.SubjectATIRequest
+	SubjectPSIRequest     = ss7client.SubjectPSIRequest
+	SubjectRoutingRequest = ss7client.SubjectRoutingRequest
 
 	// Outbound: gateway → application
-	SubjectMOSms         = ss7client.SubjectMOSMS
-	SubjectMTSmsResponse = ss7client.SubjectMTSMSResponse
-	SubjectSRIResponse   = ss7client.SubjectSRIResponse
-	SubjectATIResponse   = ss7client.SubjectATIResponse
-	SubjectPSIResponse   = ss7client.SubjectPSIResponse
+	SubjectMOSms           = ss7client.SubjectMOSMS
+	SubjectMTSmsResponse   = ss7client.SubjectMTSMSResponse
+	SubjectSRIResponse     = ss7client.SubjectSRIResponse
+	SubjectATIResponse     = ss7client.SubjectATIResponse
+	SubjectPSIResponse     = ss7client.SubjectPSIResponse
+	SubjectRoutingResponse = ss7client.SubjectRoutingResponse
 )
 
 // Server-private subjects: CAP/INAP are bound but not part of the published
@@ -55,11 +57,12 @@ type MessageType = ss7client.MessageType
 
 const (
 	// MAP Message Types (contract: ss7client)
-	MsgTypeMAPMTSms = ss7client.MsgTypeMAPMTSMS
-	MsgTypeMAPMOSms = ss7client.MsgTypeMAPMOSMS
-	MsgTypeMAPSRI   = ss7client.MsgTypeMAPSRI
-	MsgTypeMAPATI   = ss7client.MsgTypeMAPATI
-	MsgTypeMAPPSI   = ss7client.MsgTypeMAPPSI
+	MsgTypeMAPMTSms   = ss7client.MsgTypeMAPMTSMS
+	MsgTypeMAPMOSms   = ss7client.MsgTypeMAPMOSMS
+	MsgTypeMAPSRI     = ss7client.MsgTypeMAPSRI
+	MsgTypeMAPATI     = ss7client.MsgTypeMAPATI
+	MsgTypeMAPPSI     = ss7client.MsgTypeMAPPSI
+	MsgTypeMAPRouting = ss7client.MsgTypeMAPRouting
 
 	// Server-private message types
 	MsgTypeMAPUpdateLocation MessageType = "MAP_UL"
@@ -131,12 +134,13 @@ type Handler struct {
 	subscriptions []*nats.Subscription
 
 	// Message handlers (callbacks)
-	onMTSmsRequest  func(*NatsMessage) error
-	onSRIRequest    func(*NatsMessage) error
-	onATIRequest    func(*NatsMessage) error
-	onPSIRequest    func(*NatsMessage) error
-	onCAPInitialDP  func(*NatsMessage) error
-	onINAPInitialDP func(*NatsMessage) error
+	onMTSmsRequest   func(*NatsMessage) error
+	onSRIRequest     func(*NatsMessage) error
+	onATIRequest     func(*NatsMessage) error
+	onPSIRequest     func(*NatsMessage) error
+	onRoutingRequest func(*NatsMessage) error
+	onCAPInitialDP   func(*NatsMessage) error
+	onINAPInitialDP  func(*NatsMessage) error
 
 	// Channels
 	incomingCh chan *NatsMessage
@@ -167,13 +171,14 @@ type Metrics struct {
 	BytesReceived     atomic.Uint64
 
 	// Per-subject counters
-	MTSmsRequestCount  atomic.Uint64
-	MOSmsPublishCount  atomic.Uint64
-	SRIRequestCount    atomic.Uint64
-	ATIRequestCount    atomic.Uint64
-	PSIRequestCount    atomic.Uint64
-	CAPInitialDPCount  atomic.Uint64
-	INAPInitialDPCount atomic.Uint64
+	MTSmsRequestCount   atomic.Uint64
+	MOSmsPublishCount   atomic.Uint64
+	SRIRequestCount     atomic.Uint64
+	ATIRequestCount     atomic.Uint64
+	PSIRequestCount     atomic.Uint64
+	RoutingRequestCount atomic.Uint64
+	CAPInitialDPCount   atomic.Uint64
+	INAPInitialDPCount  atomic.Uint64
 
 	// Errors
 	PublishErrors    atomic.Uint64

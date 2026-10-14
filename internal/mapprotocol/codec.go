@@ -306,63 +306,6 @@ func encodeCancelLocationRes(_ *CancelLocationResponse) ([]byte, error) {
 	return asn1.Marshal(struct{}{})
 }
 
-// ----- SendRoutingInfoArg / Res --------------------------------------------
-//
-// SendRoutingInfoArg ::= SEQUENCE {
-//   msisdn        [0] ISDN-AddressString,
-//   cug-CheckInfo [1] CUG-CheckInfo OPTIONAL,
-//   numberOfForwarding [2] NumberOfForwarding OPTIONAL,
-//   interrogationType [3] InterrogationType,
-//   ...
-// }
-//
-// SendRoutingInfoRes ::= SEQUENCE {
-//   imsi          IMSI OPTIONAL,
-//   ...
-//   -- the v3 form returns extendedRoutingInfo etc. We emit imsi + msisdn
-//   -- only; richer responses are covered when the carrier persistence
-//   -- layer lands.
-// }
-
-type wireSendRoutingInfoArg struct {
-	MSISDN             []byte          `asn1:"tag:0,implicit"`
-	CUGCheckInfo       asn1.RawValue   `asn1:"tag:1,optional"`
-	NumberOfForwarding asn1.RawValue   `asn1:"tag:2,optional"`
-	InterrogationType  int             `asn1:"tag:3,implicit"`
-	Rest               []asn1.RawValue `asn1:"optional"`
-}
-
-type wireSendRoutingInfoRes struct {
-	IMSI []byte
-	Rest []asn1.RawValue `asn1:"optional"`
-}
-
-func decodeSendRoutingInfoArg(b []byte) (*SendRoutingInfoRequest, error) {
-	var w wireSendRoutingInfoArg
-	if _, err := asn1.Unmarshal(b, &w); err != nil {
-		return nil, fmt.Errorf("SendRoutingInfoArg: %w", err)
-	}
-	addr, err := decodeAddressString(w.MSISDN)
-	if err != nil {
-		return nil, fmt.Errorf("msisdn: %w", err)
-	}
-	return &SendRoutingInfoRequest{
-		MSISDN:            MSISDN(addr.Digits),
-		InterrogationType: InterrogationType(w.InterrogationType),
-	}, nil
-}
-
-func encodeSendRoutingInfoRes(r *SendRoutingInfoResponse) ([]byte, error) {
-	if r == nil || r.IMSI == nil {
-		return nil, errors.New("SendRoutingInfoRes: imsi required")
-	}
-	imsi, err := encodeIMSI(*r.IMSI)
-	if err != nil {
-		return nil, err
-	}
-	return asn1.Marshal(wireSendRoutingInfoRes{IMSI: imsi})
-}
-
 // ----- ProvideRoamingNumberArg / Res ---------------------------------------
 //
 // ProvideRoamingNumberArg ::= SEQUENCE {

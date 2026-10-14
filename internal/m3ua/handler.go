@@ -8,12 +8,16 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"syscall"
 	"time"
 
 	"github.com/ishidawataru/sctp"
 	"github.com/wmnsk/go-m3ua"
 	"go.uber.org/zap"
 )
+
+// eisconnRetries bounds the immediate re-dials after EISCONN (connectSCTP).
+const eisconnRetries = 3
 
 var (
 	ErrNotConnected    = errors.New("M3UA: not connected to SGW")
@@ -146,7 +150,21 @@ func (h *Handler) connectSCTP(ctx context.Context) error {
 	// monitor closes the connection when it ends. It is cancelled only by
 	// closeConnection, never by the dial's own completion.
 	connCtx, connCancel := context.WithCancel(ctx)
-	conn, err := m3ua.Dial(connCtx, "m3ua", localAddr, remoteAddr, m3uaConfig)
+	var conn *m3ua.Conn
+	var err error
+	// A blocking SCTP connect interrupted by a signal is restarted by the
+	// kernel on the same socket; if the association came up meanwhile, the
+	// restarted call reports EISCONN and the SCTP library closes the socket
+	// — an association lost on the way in (our reading of one CI failure,
+	// not reproduced locally). The attempt is repeated at once rather than
+	// after the reconnect interval.
+	for attempt := 1; ; attempt++ {
+		conn, err = m3ua.Dial(connCtx, "m3ua", localAddr, remoteAddr, m3uaConfig)
+		if err == nil || !errors.Is(err, syscall.EISCONN) || attempt == eisconnRetries {
+			break
+		}
+		h.logger.Warn("M3UA dial: association reported as already connected; dialling again", zap.Int("attempt", attempt))
+	}
 	if err != nil {
 		connCancel()
 		h.metrics.Errors.Add(1)

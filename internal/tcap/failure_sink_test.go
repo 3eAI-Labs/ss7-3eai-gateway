@@ -380,3 +380,66 @@ func TestFailureSink_NoTimeoutAfterOutcome(t *testing.T) {
 		"the dialogue still times out")
 	assert.Empty(t, rec.snapshot(), "but its originator hears nothing more")
 }
+
+// A Return Result Not Last keeps its kind through the handler both ways
+// (Q.773 §3.1: returnResultNotLast [7]), and a Last stays a Last.
+func TestReturnResultNotLastRoundTrip(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	sccpIn, sccpOut := stubChannels()
+	h, err := NewHandler(&Config{
+		NodeID: 1, DialogueTimeout: 30 * time.Second, InvokeTimeout: 30 * time.Second,
+		IdleTimeout: 30 * time.Second, MaxDialogues: 100, MaxComponentsPerMessage: 10,
+		MaxInvokesPerDialogue: 20, ChannelBufferSize: 100, WorkerPoolSize: 1,
+	}, sccpIn, sccpOut, NewDispatcher(logger), logger)
+	require.NoError(t, err)
+	invID := int32(1)
+	for _, notLast := range []bool{true, false} {
+		wire, err := h.encodeTCAPMessage(&Message{
+			MessageType:    MsgTypeContinue,
+			OriginatingTID: h.encodeTID(9),
+			DestinationTID: h.encodeTID(8),
+			Components: []*Component{{
+				Type: CompTypeReturnResult, InvokeID: &invID, OperationCode: ptrInt32(22), Parameter: []byte{0xA3, 0x00}, NotLast: notLast,
+			}},
+		})
+		require.NoError(t, err)
+		msg, err := h.parseTCAPMessage(wire)
+		require.NoError(t, err)
+		require.Len(t, msg.Components, 1)
+		assert.Equal(t, CompTypeReturnResult, msg.Components[0].Type)
+		assert.Equal(t, notLast, msg.Components[0].NotLast)
+	}
+}
+
+// The messages of one transaction go to one worker: a CONTINUE and the END
+// after it carry this node's transaction ID as destination, whatever the
+// peer's ID; a BEGIN is keyed by its origination ID.
+func TestTransactionShard(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	sccpIn, sccpOut := stubChannels()
+	h, err := NewHandler(&Config{
+		NodeID: 1, DialogueTimeout: 30 * time.Second, InvokeTimeout: 30 * time.Second,
+		IdleTimeout: 30 * time.Second, MaxDialogues: 100, MaxComponentsPerMessage: 10,
+		MaxInvokesPerDialogue: 20, ChannelBufferSize: 100, WorkerPoolSize: 1,
+	}, sccpIn, sccpOut, NewDispatcher(logger), logger)
+	require.NoError(t, err)
+	encode := func(m *Message) []byte {
+		b, err := h.encodeTCAPMessage(m)
+		require.NoError(t, err)
+		return b
+	}
+	const workers = 64
+	spread := map[int]bool{}
+	for local := uint32(1); local <= 32; local++ {
+		cont := transactionShard(encode(&Message{MessageType: MsgTypeContinue,
+			OriginatingTID: h.encodeTID(0xAAAA0000 + local), DestinationTID: h.encodeTID(local)}), workers)
+		end := transactionShard(encode(&Message{MessageType: MsgTypeEnd, DestinationTID: h.encodeTID(local)}), workers)
+		begin := transactionShard(encode(&Message{MessageType: MsgTypeBegin, OriginatingTID: h.encodeTID(local)}), workers)
+		assert.Equal(t, cont, end, "CONTINUE and END of transaction %d", local)
+		assert.Equal(t, end, begin, "keyed by the same ID")
+		spread[end] = true
+	}
+	assert.Greater(t, len(spread), 8, "transactions spread over the workers")
+	assert.Equal(t, 0, transactionShard([]byte{0xFF, 0x00}, workers))
+	assert.Equal(t, 0, transactionShard(nil, workers))
+}

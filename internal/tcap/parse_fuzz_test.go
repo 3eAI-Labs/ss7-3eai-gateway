@@ -26,5 +26,6 @@ func FuzzParseTCAPMessage(f *testing.F) {
 	h := &Handler{logger: zap.NewNop()}
 	f.Fuzz(func(t *testing.T, data []byte) {
 		_, _ = h.parseTCAPMessage(data)
+		_ = transactionShard(data, 4)
 	})
 }

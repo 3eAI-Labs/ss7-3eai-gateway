@@ -176,6 +176,13 @@ var (
 		OID:  []int{0, 4, 0, 0, 1, 0, 29, 3},
 		Name: "anyTimeInfoEnquiryContext-v3",
 	}
+	// Call routing, TS 29.002 §17.3.2.6: SendRoutingInfo (GMSC → HLR)
+	// under locationInfoRetrieval. Versions 1 and 2 exist; the gateway uses
+	// 3 only — the version 2 ASN.1 is no longer in TS 29.002.
+	ACLocationInfoRetrievalV3 = ApplicationContext{
+		OID:  []int{0, 4, 0, 0, 1, 0, 5, 3},
+		Name: "locationInfoRetrievalContext-v3",
+	}
 	ACCapV2 = ApplicationContext{
 		OID:  []int{0, 4, 0, 0, 1, 0, 50, 1},
 		Name: "cap-ac-gsmSCF-gsmSSF-v2",
@@ -313,6 +320,14 @@ type Dialogue struct {
 	// exactly one (see MarkAnswered).
 	answered atomic.Bool
 
+	// resultSegments are the parameters of the Return Result Not Last
+	// components received so far (TS 29.002 §C.2.3), held for the
+	// application until the Return Result Last; resultOverflow records that
+	// they went past the bounds and were dropped. Guarded by invokesMu.
+	resultSegments      [][]byte
+	resultSegmentOctets int
+	resultOverflow      bool
+
 	// Pending operations
 	PendingInvokes map[int32]*PendingInvoke
 	invokesMu      sync.RWMutex
@@ -370,6 +385,8 @@ type Handler struct {
 	// already routed to a local subsystem (Q.714 deliverLocal). sccpOutgoingCh
 	// receives wrapped TCAP responses for forwarding back via M3UA.
 	sccpIncomingCh <-chan *sccp.SccpMessage
+	// workerIn are the workers' inbound queues (see transactionShard).
+	workerIn       []chan *sccp.SccpMessage
 	sccpOutgoingCh chan<- *sccp.SccpMessage
 
 	// Application layer integration (MAP/CAP/INAP) — routed by AC OID via Dispatcher.
@@ -509,4 +526,41 @@ type DialogueInfo struct {
 	MessagesReceived   uint64    `json:"messages_received"`
 	MessagesSent       uint64    `json:"messages_sent"`
 	PendingInvokes     int       `json:"pending_invokes"`
+}
+
+// Bounds on a segmented result (Return Result Not Last components) held for
+// one dialogue. A real result is a few segments of at most one TCAP message
+// each; the bounds keep a peer from holding memory with an endless stream.
+const (
+	MaxResultSegments      = 16
+	MaxResultSegmentOctets = 16 * 1024
+)
+
+// AddResultSegment holds the parameter of a Return Result Not Last
+// component until the Return Result Last. It reports false, and holds
+// nothing more, once the bounds are exceeded.
+func (d *Dialogue) AddResultSegment(param []byte) bool {
+	d.invokesMu.Lock()
+	defer d.invokesMu.Unlock()
+	if d.resultOverflow {
+		return false
+	}
+	if len(d.resultSegments) >= MaxResultSegments || d.resultSegmentOctets+len(param) > MaxResultSegmentOctets {
+		d.resultOverflow = true
+		d.resultSegments, d.resultSegmentOctets = nil, 0
+		return false
+	}
+	d.resultSegments = append(d.resultSegments, param)
+	d.resultSegmentOctets += len(param)
+	return true
+}
+
+// TakeResultSegments returns, and forgets, the segments held by
+// AddResultSegment; overflow reports that some were dropped.
+func (d *Dialogue) TakeResultSegments() (segments [][]byte, overflow bool) {
+	d.invokesMu.Lock()
+	defer d.invokesMu.Unlock()
+	segments, overflow = d.resultSegments, d.resultOverflow
+	d.resultSegments, d.resultSegmentOctets, d.resultOverflow = nil, 0, false
+	return segments, overflow
 }

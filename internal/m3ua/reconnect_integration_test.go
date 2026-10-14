@@ -38,11 +38,17 @@ func startSGW(t *testing.T, port int) *sgw {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &sgw{listener: l, conns: make(chan *gom3ua.Conn, 4), cancel: cancel}
+	// One acceptor (go-m3ua's Accept is not safe for concurrent use). An
+	// association the ASP gave up on fails its handshake after go-m3ua's
+	// fixed 10 s; the acceptor carries on with the next instead of stopping.
 	go func() {
 		for {
 			c, err := l.Accept(ctx)
 			if err != nil {
-				return
+				if ctx.Err() != nil {
+					return
+				}
+				continue
 			}
 			s.conns <- c
 		}
@@ -61,7 +67,8 @@ func (s *sgw) accept(t *testing.T) *gom3ua.Conn {
 	select {
 	case c := <-s.conns:
 		return c
-	case <-time.After(15 * time.Second):
+	// Room for one association the SGW holds 10 s before giving up on it.
+	case <-time.After(30 * time.Second):
 		t.Fatal("no association reached the SGW")
 		return nil
 	}
@@ -113,7 +120,7 @@ func TestM3UA_StartWithoutSGWThenSGWAppears(t *testing.T) {
 
 	s := startSGW(t, port)
 	s.accept(t)
-	require.NoError(t, h.WaitForActive(10*time.Second))
+	require.NoError(t, h.WaitForActive(30*time.Second))
 }
 
 // The SGW drops the association. The gateway must re-establish it, and keep

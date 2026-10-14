@@ -227,6 +227,7 @@ func (h *Handler) subscribeAll() error {
 		{SubjectSRIRequest, h.handleSRIRequest},
 		{SubjectATIRequest, h.handleATIRequest},
 		{SubjectPSIRequest, h.handlePSIRequest},
+		{SubjectRoutingRequest, h.handleRoutingRequest},
 		{SubjectCAPInitialDP, h.handleCAPInitialDP},
 		{SubjectINAPInitialDP, h.handleINAPInitialDP},
 	}
@@ -276,6 +277,11 @@ func (h *Handler) handleATIRequest(msg *nats.Msg) {
 func (h *Handler) handlePSIRequest(msg *nats.Msg) {
 	h.metrics.PSIRequestCount.Add(1)
 	h.processIncomingMessage(msg, h.onPSIRequest)
+}
+
+func (h *Handler) handleRoutingRequest(msg *nats.Msg) {
+	h.metrics.RoutingRequestCount.Add(1)
+	h.processIncomingMessage(msg, h.onRoutingRequest)
 }
 
 func (h *Handler) handleCAPInitialDP(msg *nats.Msg) {
@@ -333,10 +339,11 @@ func (h *Handler) processIncomingMessage(msg *nats.Msg, handler func(*NatsMessag
 // responseTypeBySubject is the response message type of each request subject
 // of the contract.
 var responseTypeBySubject = map[string]MessageType{
-	SubjectSRIRequest:   MsgTypeMAPSRI,
-	SubjectMTSmsRequest: MsgTypeMAPMTSms,
-	SubjectATIRequest:   MsgTypeMAPATI,
-	SubjectPSIRequest:   MsgTypeMAPPSI,
+	SubjectSRIRequest:     MsgTypeMAPSRI,
+	SubjectMTSmsRequest:   MsgTypeMAPMTSms,
+	SubjectATIRequest:     MsgTypeMAPATI,
+	SubjectPSIRequest:     MsgTypeMAPPSI,
+	SubjectRoutingRequest: MsgTypeMAPRouting,
 }
 
 // publishRejection answers a request refused before a dialogue started —
@@ -457,6 +464,8 @@ func (h *Handler) getSubjectForMessage(msg *NatsMessage) string {
 		return SubjectATIResponse
 	case MsgTypeMAPPSI:
 		return SubjectPSIResponse
+	case MsgTypeMAPRouting:
+		return SubjectRoutingResponse
 	case MsgTypeCAPEventReport:
 		return SubjectCAPEventReport
 	case MsgTypeINAPEventReport:
@@ -615,6 +624,23 @@ func (h *Handler) PublishSubscriberInfo(msgType MessageType, correlationID strin
 	})
 }
 
+// PublishRoutingInfo publishes a successful SendRoutingInfo answer: the
+// IMSI, the routing information and, when the HLR returned it, the
+// subscriber's location and state.
+func (h *Handler) PublishRoutingInfo(correlationID, imsi string, routing *ss7client.RoutingInfo, info *ss7client.SubscriberInfo) error {
+	return h.enqueue(&NatsMessage{
+		MessageID:      uuid.New().String(),
+		CorrelationID:  correlationID,
+		MessageType:    MsgTypeMAPRouting,
+		Direction:      DirectionOutbound,
+		Timestamp:      time.Now(),
+		IMSI:           imsi,
+		RoutingInfo:    routing,
+		SubscriberInfo: info,
+		NodeID:         h.config.NodeID,
+	})
+}
+
 func (h *Handler) enqueue(msg *NatsMessage) error {
 	select {
 	case h.outgoingCh <- msg:
@@ -640,6 +666,10 @@ func (h *Handler) OnATIRequest(handler func(*NatsMessage) error) {
 
 func (h *Handler) OnPSIRequest(handler func(*NatsMessage) error) {
 	h.onPSIRequest = handler
+}
+
+func (h *Handler) OnRoutingRequest(handler func(*NatsMessage) error) {
+	h.onRoutingRequest = handler
 }
 
 func (h *Handler) OnCAPInitialDP(handler func(*NatsMessage) error) {

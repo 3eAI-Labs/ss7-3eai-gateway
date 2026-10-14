@@ -1,7 +1,7 @@
 # ss7-3eai-gateway
 
-An SS7 signalling gateway that lets applications send and receive SMS, and ask where a subscriber
-is, over MAP without speaking SS7 themselves. Applications talk to it over [NATS](https://nats.io); it talks to the
+An SS7 signalling gateway that lets applications send and receive SMS, ask where a subscriber
+is, and ask how to route a call to them, over MAP without speaking SS7 themselves. Applications talk to it over [NATS](https://nats.io); it talks to the
 signalling network over SIGTRAN (M3UA over SCTP) as an application server process behind a
 signalling gateway (SG) or STP.
 
@@ -12,6 +12,7 @@ signalling gateway (SG) or STP.
   map.mt.sms.request ───────►│                              │◄────────────│          │
   map.ati.request    ───────►│                              │             │          │
   map.psi.request    ───────►│                              │             │          │
+  map.routing.request ──────►│                              │             │          │
   map.*.response     ◄───────│                              │             └──────────┘
   map.mo.sms         ◄───────└──────────────────────────────┘
 ```
@@ -37,6 +38,7 @@ real SS7 networks.
 | MO-ForwardSM (op 46) | MSC → gateway | published on `map.mo.sms` | shortMsgMO-RelayContext-v3 |
 | AnyTimeInterrogation (op 71) | gateway (as gsmSCF) → HLR | `map.ati.request` → `map.ati.response` | anyTimeInfoEnquiryContext-v3 |
 | ProvideSubscriberInfo (op 70) | gateway (in the HLR's role) → VLR | `map.psi.request` → `map.psi.response` | subscriberInfoEnquiryContext-v3 |
+| SendRoutingInfo (op 22) | gateway (as GMSC) → HLR | `map.routing.request` → `map.routing.response` | locationInfoRetrievalContext-v3 |
 
 - **Every outcome is answered.** The response subject carries the result, or a failure:
   `REMOTE_ERROR` with the MAP error code (e.g. `absentSubscriberSM` vs `unknownSubscriber`, which
@@ -46,10 +48,15 @@ real SS7 networks.
   area or location area, the serving VLR/MSC or SGSN, the age of the location (or a fresh one, by
   paging), the subscriber state, the EPS location, IMEI, MS classmark and number portability
   information, decoded into JSON.
+- **Call routing.** SendRoutingInfo, a basic call interrogation, returns the IMSI and the roaming
+  number (MSRN) to route the call on, or the forwarded-to number and forwarding options, with the
+  serving MSC, number portability status, basic service and active supplementary services. An
+  answer the HLR splits into TC-Result-NL segments is reassembled into one.
 - **Signalling transport.** M3UA ASP over SCTP (optionally multi-homed), with override or
   loadshare traffic mode. Each message carries its own MTP3 routing label. A lost association is
   re-established automatically, including when the SG is not reachable at start-up.
-- **SCCP.** Connectionless (UDT, protocol class 0), ITU (14-bit) or ANSI (24-bit) point codes. Called
+- **SCCP.** Connectionless (UDT; protocol class 0 sent, the in-sequence delivery of class 1
+  kept on receipt), ITU (14-bit) or ANSI (24-bit) point codes. Called
   addresses route on DPC/SSN or on global title. GT-routed messages are translated by configured
   rules, usually to the STP, which translates again.
 - **Active-active cluster.** Nodes share a NATS queue group and a cluster GT. Each node has its own
@@ -70,8 +77,13 @@ What is planned for each of these is in the [roadmap](docs/ROADMAP.md).
 **Protocol:**
 - Only the operations above. Other MAP operations, and dialogues under other application
   contexts, are refused; an Invoke of an operation the gateway does not serve is rejected
-  (unrecognizedOperation). The gateway only asks AnyTimeInterrogation and ProvideSubscriberInfo:
-  peers cannot open those contexts with it.
+  (unrecognizedOperation). The gateway only asks AnyTimeInterrogation, ProvideSubscriberInfo and
+  SendRoutingInfo: peers cannot open those contexts with it.
+- SendRoutingInfo is a basic call interrogation from a GMSC that does not offer CAMEL, OR, CUG,
+  pre-paging or a second service (SCUDIF); interrogation for forwarding is not offered. Version 3
+  only: there is no fallback to locationInfoRetrieval version 2. A result in TC-Result-NL
+  segments is reassembled for SendRoutingInfo only; for other operations it is answered with
+  `REMOTE_ERROR`.
 - Of a location answer, the GPRS MS class, T-ADS data, time zone, 5GS location, CSG and LSA
   information and PDP context lists are not decoded. E-UTRAN cell and tracking area identities,
   routing area identity and geographical / geodetic information are passed through as hex. The gateway offers version 3 and falls back to version 2 when a peer
@@ -89,10 +101,12 @@ What is planned for each of these is in the [roadmap](docs/ROADMAP.md).
 - CAP: an incoming InitialDP gets no answer, and CAP origination needs pre-encoded BER. The CAP
   application context names have not been verified. INAP is not supported.
 
-**Access:** whoever may publish on `map.ati.request` and `map.psi.request` can locate any
-subscriber the network will answer for. The gateway does not authorise requests; restrict those
-subjects with NATS permissions. (It does fix the gsmSCF-Address itself, so a publisher cannot pass
-as another gsmSCF.)
+**Access:** whoever may publish on `map.ati.request`, `map.psi.request` or `map.routing.request`
+can locate any subscriber the network will answer for, or learn their IMSI and serving MSC. The
+gateway does not authorise requests; restrict those subjects with NATS permissions, and remember
+that `map.*.request` or `map.>` grants all of them. Response subjects are broadcast, so subscribe
+rights on them show every requester's answers. (The gateway does fix the gsmSCF and GMSC
+addresses itself, so a publisher cannot pass as another gsmSCF or GMSC.)
 
 **Management plane:**
 - **Not implemented on the message path:** the SS7 firewall (`internal/firewall`) and transaction

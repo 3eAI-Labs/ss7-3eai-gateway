@@ -101,11 +101,6 @@ func (h *Handler) SetUpdateLocationHandler(handler UpdateLocationHandler) {
 	h.updateLocationHandler = handler
 }
 
-// SetSendRoutingInfoHandler sets the handler for SendRoutingInfo operations
-func (h *Handler) SetSendRoutingInfoHandler(handler SendRoutingInfoHandler) {
-	h.sendRoutingInfoHandler = handler
-}
-
 // SetProvideRoamingNumberHandler sets the handler for ProvideRoamingNumber operations
 func (h *Handler) SetProvideRoamingNumberHandler(handler ProvideRoamingNumberHandler) {
 	h.provideRoamingNumHandler = handler
@@ -200,42 +195,6 @@ func (h *Handler) ProcessCancelLocation(req *CancelLocationRequest) (*CancelLoca
 
 	h.logger.Info("CancelLocation successful",
 		zap.String("imsi", string(req.IMSI)))
-
-	return resp, nil, nil
-}
-
-// ProcessSendRoutingInfo handles SendRoutingInfo request. Per-op counter is
-// bumped at the dispatch entry point (routeInvoke).
-func (h *Handler) ProcessSendRoutingInfo(req *SendRoutingInfoRequest) (*SendRoutingInfoResponse, *ErrorCode, error) {
-	h.logger.Info("Processing SendRoutingInfo",
-		zap.String("msisdn", string(req.MSISDN)),
-		zap.Uint8("interrogation_type", uint8(req.InterrogationType)))
-
-	if h.sendRoutingInfoHandler == nil {
-		h.logger.Error("SendRoutingInfo handler not set")
-		h.metrics.Errors.Add(1)
-		return nil, nil, ErrHandlerNotSet
-	}
-
-	// Validate request
-	if req.MSISDN == "" {
-		h.logger.Error("Invalid SendRoutingInfo request: MSISDN missing")
-		h.metrics.Errors.Add(1)
-		errCode := ErrDataMissing
-		return nil, &errCode, ErrInvalidRequest
-	}
-
-	// Call handler
-	resp, errCode, err := h.sendRoutingInfoHandler.HandleSendRoutingInfo(req)
-	if err != nil {
-		h.logger.Error("SendRoutingInfo failed", zap.Error(err))
-		h.metrics.Errors.Add(1)
-		h.updateErrorMetrics(errCode)
-		return nil, errCode, err
-	}
-
-	h.logger.Info("SendRoutingInfo successful",
-		zap.String("msisdn", string(req.MSISDN)))
 
 	return resp, nil, nil
 }
@@ -451,18 +410,6 @@ func validateConfig(cfg *Config) error {
 func NewUpdateLocationResponse(hlrNumber *AddressString) *UpdateLocationResponse {
 	return &UpdateLocationResponse{
 		HLRNumber: hlrNumber,
-	}
-}
-
-// NewSendRoutingInfoResponse creates a successful SendRoutingInfo response
-func NewSendRoutingInfoResponse(imsi IMSI, roamingNumber *AddressString) *SendRoutingInfoResponse {
-	return &SendRoutingInfoResponse{
-		IMSI: &imsi,
-		ExtendedRoutingInfo: &ExtendedRoutingInfo{
-			RoutingInfo: &RoutingInfo{
-				RoamingNumber: roamingNumber,
-			},
-		},
 	}
 }
 

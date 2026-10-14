@@ -15,6 +15,11 @@
         "capability": "ss7-map-location",
         "subscribes": ["map.ati.request", "map.psi.request"],
         "responds": ["map.ati.response", "map.psi.response"]
+      },
+      {
+        "capability": "ss7-map-call-routing",
+        "subscribes": ["map.routing.request"],
+        "responds": ["map.routing.response"]
       }
     ]
   },

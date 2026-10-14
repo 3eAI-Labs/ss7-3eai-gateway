@@ -42,7 +42,7 @@ An area counts as delivered only with all of these:
 | 0.7.3 | SMS completion, part 2 | Reassembly of incoming XUDT segments; fallback to version 2 when a peer refuses version 3 (accepting version 2 dialogues opened by peers is not included) | released |
 | 0.7.4 | Location | AnyTimeInterrogation (op 71) towards the HLR; ProvideSubscriberInfo (op 70) | released |
 | 0.7.5 | TCAP encoding fix | ITU-T Q.773 encoding done here instead of by a library that wrapped every parameter in an extra SEQUENCE and wrote long lengths in one octet; one outcome per request | released |
-| 0.7.6 | Call routing | SendRoutingInfo (op 22) towards the HLR | planned |
+| 0.7.6 | Call routing | SendRoutingInfo (op 22) towards the HLR, basic call interrogation; results segmented with TC-Result-NL reassembled; per-transaction message order | released |
 | 0.7.7 | USSD | processUnstructuredSS-Request (op 59), unstructuredSS-Request (60), unstructuredSS-Notify (61) | planned |
 | 0.7.8 | Mobility and subscriber data | UpdateLocation (2), CancelLocation (3), ProvideRoamingNumber (4) — the gateway's role in these, application or network-node emulation, is decided when the area starts | planned |
 

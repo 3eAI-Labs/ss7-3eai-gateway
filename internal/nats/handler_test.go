@@ -218,6 +218,7 @@ func TestRefusedRequestIsAnsweredRejected(t *testing.T) {
 	h.OnMTSmsRequest(refuse)
 	h.OnATIRequest(refuse)
 	h.OnPSIRequest(refuse)
+	h.OnRoutingRequest(refuse)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	require.NoError(t, h.Start(ctx))
@@ -229,6 +230,7 @@ func TestRefusedRequestIsAnsweredRejected(t *testing.T) {
 	for req, resp := range map[string]string{
 		SubjectSRIRequest: SubjectSRIResponse, SubjectMTSmsRequest: SubjectMTSmsResponse,
 		SubjectATIRequest: SubjectATIResponse, SubjectPSIRequest: SubjectPSIResponse,
+		SubjectRoutingRequest: SubjectRoutingResponse,
 	} {
 		sub, err := nc.SubscribeSync(resp)
 		require.NoError(t, err)

@@ -83,6 +83,10 @@ const (
 	ErrSystemFailure               ErrorCode = 34
 	ErrDataMissing                 ErrorCode = 35
 	ErrUnexpectedDataValue         ErrorCode = 36
+	ErrNumberChanged               ErrorCode = 44
+	ErrBusySubscriber              ErrorCode = 45
+	ErrNoSubscriberReply           ErrorCode = 46
+	ErrORNotAllowed                ErrorCode = 48
 	ErrATINotAllowed               ErrorCode = 49
 	ErrResourceLimitation          ErrorCode = 51
 )
@@ -115,6 +119,10 @@ var errorCodeNames = map[ErrorCode]string{
 	ErrSystemFailure:               "systemFailure",
 	ErrDataMissing:                 "dataMissing",
 	ErrUnexpectedDataValue:         "unexpectedDataValue",
+	ErrNumberChanged:               "numberChanged",
+	ErrBusySubscriber:              "busySubscriber",
+	ErrNoSubscriberReply:           "noSubscriberReply",
+	ErrORNotAllowed:                "or-NotAllowed",
 	ErrATINotAllowed:               "ati-NotAllowed",
 	ErrResourceLimitation:          "resourceLimitation",
 }
@@ -312,164 +320,6 @@ type MoForwardSMResponse struct {
 	ExtensionContainer []byte
 }
 
-// SendRoutingInfoRequest (3GPP TS 29.002)
-type SendRoutingInfoRequest struct {
-	MSISDN                          MSISDN
-	CUGCheckInfo                    *CUGCheckInfo
-	NumberOfForwarding              *int32
-	InterrogationType               InterrogationType
-	ORInterrogation                 bool
-	ORCapability                    *int32
-	GMSCOrGSMSCFAddress             *AddressString
-	CallReferenceNumber             []byte
-	ForwardingReason                *ForwardingReason
-	BasicServiceGroup               *BasicServiceGroup
-	NetworkSignalInfo               []byte
-	CamelInfo                       *CamelInfo
-	SuppressMTSS                    bool
-	ExtensionContainer              []byte
-	AlertingPattern                 []byte
-	CCBSCall                        bool
-	SupportedCCBSPhase              *int32
-	AdditionalSignalInfo            []byte
-	ISTSupportIndicator             bool
-	PrePagingSupported              bool
-	CallDiversionTreatmentIndicator []byte
-	LongFTNSupported                bool
-	SuppressVTCSI                   bool
-	SuppressIncomingCallBarring     bool
-	GsmSCFInitiatedCall             bool
-	BasicServiceGroup2              *BasicServiceGroup
-	NetworkSignalInfo2              []byte
-	SuppressMTSSModification        bool
-}
-
-// SendRoutingInfoResponse
-type SendRoutingInfoResponse struct {
-	IMSI                            *IMSI
-	ExtendedRoutingInfo             *ExtendedRoutingInfo
-	CUGCheckInfo                    *CUGCheckInfo
-	CUGSubscriptionFlag             bool
-	SubscriberInfo                  *SubscriberInfo
-	SSList                          []byte
-	BasicService                    *BasicServiceGroup
-	ForwardingInterrogationRequired bool
-	VMSCAddress                     *AddressString
-	ExtensionContainer              []byte
-	NAEAPreferredCI                 []byte
-	CCBSIndicators                  []byte
-	MSISDN                          *MSISDN
-	NumberPortabilityStatus         *NumberPortabilityStatus
-	ISTAlertTimer                   *int32
-	SupportedCamelPhasesInVMSC      []byte
-	OfferedCamel4CSIs               []byte
-	RoutingInfo2                    *ExtendedRoutingInfo
-	SSList2                         []byte
-	BasicService2                   *BasicServiceGroup
-	AllowedServices                 []byte
-	UnavailabilityCause             *UnavailabilityCause
-	ReleaseResourcesSupported       bool
-	GSMSCF2Address                  *AddressString
-}
-
-// InterrogationType
-type InterrogationType uint8
-
-const (
-	InterrogationTypeBasicCall  InterrogationType = 0
-	InterrogationTypeForwarding InterrogationType = 1
-)
-
-// ForwardingReason
-type ForwardingReason uint8
-
-const (
-	ForwardingReasonMSNotReachable ForwardingReason = 0
-	ForwardingReasonMSBusy         ForwardingReason = 1
-	ForwardingReasonNoReply        ForwardingReason = 2
-	ForwardingReasonUnconditional  ForwardingReason = 3
-)
-
-// BasicServiceGroup
-type BasicServiceGroup struct {
-	TeleserviceCode   *uint8
-	BearerServiceCode *uint8
-}
-
-// CUGCheckInfo
-type CUGCheckInfo struct {
-	CUGInterlock       []byte
-	CUGOutgoingAccess  bool
-	ExtensionContainer []byte
-}
-
-// CamelInfo
-type CamelInfo struct {
-	SupportedCamelPhases []byte
-	SuppressTCSI         bool
-	ExtensionContainer   []byte
-	OfferedCamel4CSIs    []byte
-}
-
-// ExtendedRoutingInfo
-type ExtendedRoutingInfo struct {
-	RoutingInfo      *RoutingInfo
-	CamelRoutingInfo *CamelRoutingInfo
-}
-
-// RoutingInfo
-type RoutingInfo struct {
-	RoamingNumber  *AddressString
-	ForwardingData *ForwardingData
-}
-
-// ForwardingData
-type ForwardingData struct {
-	ForwardedToNumber     *AddressString
-	ForwardedToSubaddress []byte
-	ForwardingOptions     []byte
-	ExtensionContainer    []byte
-	LongForwardedToNumber *AddressString
-}
-
-// CamelRoutingInfo
-type CamelRoutingInfo struct {
-	ForwardingData            *ForwardingData
-	GMSCCamelSubscriptionInfo *GMSCCamelSubscriptionInfo
-}
-
-// GMSCCamelSubscriptionInfo
-type GMSCCamelSubscriptionInfo struct {
-	TCSI               []byte
-	OCSI               []byte
-	ExtensionContainer []byte
-	OCSI2              []byte
-	DCSI2              []byte
-	TCSI2              []byte
-}
-
-// NumberPortabilityStatus
-type NumberPortabilityStatus uint8
-
-const (
-	NPStatusNotKnownToBePorted                  NumberPortabilityStatus = 0
-	NPStatusOwnNumberPortedOut                  NumberPortabilityStatus = 1
-	NPStatusForeignNumberPortedToForeignNetwork NumberPortabilityStatus = 2
-	NPStatusOwnNumberNotPortedOut               NumberPortabilityStatus = 4
-)
-
-// UnavailabilityCause
-type UnavailabilityCause uint8
-
-const (
-	UnavailableBearerServiceNotProvisioned UnavailabilityCause = 1
-	UnavailableTeleserviceNotProvisioned   UnavailabilityCause = 2
-	UnavailableAbsentSubscriber            UnavailabilityCause = 3
-	UnavailableBusySubscriber              UnavailabilityCause = 4
-	UnavailableCallBarred                  UnavailabilityCause = 5
-	UnavailableCUGReject                   UnavailabilityCause = 6
-)
-
 // ProvideRoamingNumberRequest (3GPP TS 29.002)
 type ProvideRoamingNumberRequest struct {
 	IMSI                                    IMSI
@@ -529,7 +379,6 @@ type Handler struct {
 
 	// Operation handlers
 	updateLocationHandler       UpdateLocationHandler
-	sendRoutingInfoHandler      SendRoutingInfoHandler
 	provideRoamingNumHandler    ProvideRoamingNumberHandler
 	cancelLocationHandler       CancelLocationHandler
 	sendRoutingInfoForSMHandler SendRoutingInfoForSMHandler
@@ -547,10 +396,6 @@ type Handler struct {
 // Operation handler interfaces
 type UpdateLocationHandler interface {
 	HandleUpdateLocation(req *UpdateLocationRequest) (*UpdateLocationResponse, *ErrorCode, error)
-}
-
-type SendRoutingInfoHandler interface {
-	HandleSendRoutingInfo(req *SendRoutingInfoRequest) (*SendRoutingInfoResponse, *ErrorCode, error)
 }
 
 type ProvideRoamingNumberHandler interface {

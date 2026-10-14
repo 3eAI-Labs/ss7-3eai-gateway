@@ -185,6 +185,58 @@ func TestMap_LocationResultsReachResponseSink(t *testing.T) {
 	}
 }
 
+// A SendRoutingInfo result in Return Result Not Last segments, each in a
+// TC-CONTINUE, then a Return Result Last in the TC-END, reaches the sink
+// once, merged (TS 29.002 §C.2.3).
+func TestMap_SegmentedResultMerged(t *testing.T) {
+	h := newTestHandler(t)
+	var got []any
+	h.SetResponseSink(func(_ string, _ mapprotocol.OperationCode, resp any) error { got = append(got, resp); return nil })
+	invID := int32(1)
+	dlg := &tcap.Dialogue{LocalTID: 6, NATSCorrelationID: "c", OriginatingOpCode: int32(mapprotocol.OpSendRoutingInfo)}
+	// [3] { imsi [9] 286010000000123 }, then [3] { roamingNumber 905329990001 }
+	imsi := []byte{0xA3, 0x0A, 0x89, 0x08, 0x82, 0x06, 0x01, 0x00, 0x00, 0x00, 0x21, 0xF3}
+	msrn := []byte{0xA3, 0x09, 0x04, 0x07, 0x91, 0x09, 0x35, 0x92, 0x99, 0x00, 0x10}
+	notLast := &tcap.Component{Type: tcap.CompTypeReturnResult, InvokeID: &invID, Parameter: imsi, NotLast: true}
+	if err := h.HandleTCAPMessage(dlg, &tcap.Message{MessageType: tcap.MsgTypeContinue, Components: []*tcap.Component{notLast}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("a Not Last segment reached the sink: %+v", got)
+	}
+	last := &tcap.Component{Type: tcap.CompTypeReturnResult, InvokeID: &invID, Parameter: msrn}
+	if err := h.HandleTCAPMessage(dlg, endWith(last)); err != nil {
+		t.Fatal(err)
+	}
+	r, ok := got[0].(*mapprotocol.SendRoutingInfoResponse)
+	if len(got) != 1 || !ok || r.IMSI != "286010000000123" || r.RoamingNumber == nil || r.RoamingNumber.Digits != "905329990001" {
+		t.Fatalf("sink got %#v", got)
+	}
+}
+
+// Past the bounds, the segments are dropped and the caller told, once.
+func TestMap_SegmentedResultOverflow(t *testing.T) {
+	h := newTestHandler(t)
+	var results, errs int
+	h.SetResponseSink(func(string, mapprotocol.OperationCode, any) error { results++; return nil })
+	h.SetErrorSink(func(string, mapprotocol.OperationCode, mapprotocol.ErrorCode, string) { errs++ })
+	invID := int32(1)
+	dlg := &tcap.Dialogue{LocalTID: 7, NATSCorrelationID: "c", OriginatingOpCode: int32(mapprotocol.OpSendRoutingInfo)}
+	seg := []byte{0xA3, 0x03, 0x84, 0x01, 0x00}
+	for i := 0; i <= tcap.MaxResultSegments; i++ {
+		c := &tcap.Component{Type: tcap.CompTypeReturnResult, InvokeID: &invID, Parameter: seg, NotLast: true}
+		if err := h.HandleTCAPMessage(dlg, &tcap.Message{MessageType: tcap.MsgTypeContinue, Components: []*tcap.Component{c}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.HandleTCAPMessage(dlg, endWith(&tcap.Component{Type: tcap.CompTypeReturnResult, InvokeID: &invID, Parameter: seg})); err != nil {
+		t.Fatal(err)
+	}
+	if results != 0 || errs != 1 {
+		t.Fatalf("results %d, errors %d; want 0 and 1", results, errs)
+	}
+}
+
 func TestMap_HandleTCAPMessage_ReturnError(t *testing.T) {
 	h := newTestHandler(t)
 	invID := int32(1)

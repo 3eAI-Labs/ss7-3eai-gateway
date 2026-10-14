@@ -306,11 +306,13 @@ func initializeHandlers(cfg *viper.Viper, logger *zap.Logger) (*Handlers, error)
 		}
 	}
 	// Contexts only this node opens: answers to a version 2 retry (TS 29.002
-	// §5.2.1), and the location enquiries it sends as gsmSCF (to an HLR) or as
-	// HLR (to a VLR). A peer cannot open a dialogue under them.
+	// §5.2.1), the location enquiries it sends as gsmSCF (to an HLR) or as
+	// HLR (to a VLR), and the call routing interrogation it sends as GMSC.
+	// A peer cannot open a dialogue under them.
 	for _, ac := range []tcap.ApplicationContext{
 		tcap.ACShortMsgGatewayV2, tcap.ACShortMsgMTRelayV2,
 		tcap.ACAnyTimeInfoEnquiryV3, tcap.ACSubscriberInfoEnquiryV3,
+		tcap.ACLocationInfoRetrievalV3,
 	} {
 		if err := dispatcher.RegisterInitiatorOnly(ac.OID, mapHandler); err != nil {
 			return nil, fmt.Errorf("failed to register MAP for %s: %w", ac.Name, err)

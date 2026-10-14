@@ -101,10 +101,15 @@ func (h *Handler) Start(ctx context.Context) error {
 		zap.Int("subsystems", len(h.config.LocalSubsystems)),
 		zap.Bool("gtt_enabled", h.config.GTTEnabled))
 
-	// Start worker pool
-	for i := 0; i < h.config.WorkerPoolSize; i++ {
+	// Start worker pool. Each worker has its own inbound queue, fed by
+	// distributeInbound, so that the messages of one signalling relation
+	// keep their order (see inboundShard).
+	h.workerIn = make([]chan *m3ua.MTP3Message, h.config.WorkerPoolSize)
+	for i := range h.workerIn {
+		h.workerIn[i] = make(chan *m3ua.MTP3Message, h.config.ChannelBufferSize)
 		go h.worker(ctx, i)
 	}
+	go h.distributeInbound(ctx)
 
 	h.logger.Info("SCCP handler started successfully",
 		zap.Int("workers", h.config.WorkerPoolSize))
@@ -136,6 +141,40 @@ func (h *Handler) Stop(ctx context.Context) error {
 	return nil
 }
 
+// distributeInbound hands each message from M3UA to the worker its
+// signalling relation maps to.
+func (h *Handler) distributeInbound(ctx context.Context) {
+	for {
+		select {
+		case <-h.shutdownCh:
+			return
+		case <-ctx.Done():
+			return
+		case m := <-h.m3uaIncomingCh:
+			select {
+			case h.workerIn[inboundShard(m, len(h.workerIn))] <- m:
+			case <-h.shutdownCh:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// inboundShard maps a message to a worker by its originating point code and
+// SLS. MTP delivers the messages of one OPC and SLS in sequence, which is
+// what SCCP protocol class 1 relies on for in-sequence delivery (Q.714
+// §1.1.2.2) — and what a result segmented into TC-Result-NL components
+// needs (TS 29.002 §C.2.3). Spreading such messages over a shared pool
+// would undo it; one worker per relation keeps it.
+func inboundShard(m *m3ua.MTP3Message, workers int) int {
+	if m == nil || workers <= 1 {
+		return 0
+	}
+	return int((uint64(m.OPC)<<4 | uint64(m.SLS&0x0F)) % uint64(workers))
+}
+
 // worker processes both directions:
 //   - m3uaIncomingCh: MTP3-wrapped SCCP messages from M3UA → parse → route → tcapIncomingCh / m3uaOutgoingCh
 //   - tcapOutgoingCh: SCCP messages from TCAP → encode → m3uaOutgoingCh
@@ -149,7 +188,7 @@ func (h *Handler) worker(ctx context.Context, id int) {
 			return
 		case <-ctx.Done():
 			return
-		case mtp3Msg := <-h.m3uaIncomingCh:
+		case mtp3Msg := <-h.workerIn[id]:
 			h.handleIncomingMessage(mtp3Msg)
 		case outMsg := <-h.tcapOutgoingCh:
 			if err := h.SendMessage(outMsg); err != nil {

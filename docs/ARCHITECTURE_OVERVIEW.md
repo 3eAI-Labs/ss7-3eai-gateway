@@ -111,6 +111,36 @@ location area; VLR, MSC or SGSN number; age; whether it was obtained by paging),
 subscriber state, EPS location, IMEI, MS classmark 2 and number portability. Octet strings whose
 layout another specification defines are passed through as hex.
 
+## Call routing
+
+SendRoutingInfo (TS 29.002 §10.1, `map.routing.request`) is originated only. The gateway acts as
+a GMSC and asks the subscriber's HLR under `locationInfoRetrievalContext-v3`, addressed as for
+SendRoutingInfoForSM, with calling SSN 8 (MSC, TS 23.003 §8.2). It sends a basic call
+interrogation whose GMSC address is the cluster GT, else the node's GT — never the request's. It
+offers no CAMEL, OR, CUG or pre-paging support, so an HLR answers as to a plain GMSC.
+
+The answer is decoded into `routing_info` — the roaming number, or the forwarding data with its
+decoded options, or CAMEL routing information passed through — with the IMSI in `imsi` and any
+subscriber information in `subscriber_info`.
+
+An HLR may split the answer: Return Result Not Last components, each in a TC-CONTINUE, then a
+Return Result Last in the TC-END (TS 29.002 §C.2.3). The MAP layer holds the segments on the
+dialogue, at most 16 of them and 16 KiB, and confirms once with them merged: a field comes from
+the first segment that has it, and the ss-Lists are joined.
+
+## Message order
+
+SCCP and TCAP each run a pool of workers. Neither shares one queue among them:
+- SCCP gives an incoming message to a worker chosen by its OPC and SLS. MTP delivers one OPC and
+  SLS in sequence, which is what protocol class 1 relies on (Q.714 §1.1.2.2).
+- TCAP chooses by transaction: the destination transaction ID, or for a BEGIN the origination ID.
+
+The messages of one transaction are therefore handled in the order they arrived. A segment in a
+TC-CONTINUE is not overtaken by the TC-END that follows it, as long as MTP delivers them in order.
+That holds when the peer sends them with one SLS (protocol class 1, which TS 29.002 §C.2.3
+recommends for TC-Result-NL), but not when it rotates the SLS. A SendRoutingInfo result whose
+IMSI was lost that way is reported as incomplete (`REMOTE_ERROR`), not passed on as an answer.
+
 ## An MO short message
 
 An MSC opens a dialogue under `shortMsgMO-RelayContext-v3`, addressed to the cluster GT. The STP

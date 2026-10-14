@@ -153,6 +153,8 @@ type Config struct {
 	// drops them.
 	OnATI ATICallback
 	OnPSI PSICallback
+	// OnRouting answers SendRoutingInfo (op 22) as an HLR; nil drops it.
+	OnRouting RoutingCallback
 
 	// OnSRIPreDrop is consulted before OnSRI is invoked. When it returns
 	// true, the peer drops the SRI Invoke silently (no ReturnResult, no
@@ -234,6 +236,7 @@ type Peer struct {
 	moFwdOriginated atomic.Uint64
 	atiRequests     atomic.Uint64
 	psiRequests     atomic.Uint64
+	routingRequests atomic.Uint64
 	connsAccepted   atomic.Uint64
 
 	violationsMu sync.Mutex
@@ -569,6 +572,8 @@ func (p *Peer) handleMTP3(conn *m3ua.Conn, pd *params.ProtocolDataPayload) {
 		switch int32(opCode) {
 		case int32(mapprotocol.OpAnyTimeInterrogation), int32(mapprotocol.OpProvideSubscriberInfo):
 			p.handleLocationInvoke(conn, pd, sccpMsg, tcapMsg, otidBytes, invokeID, int32(opCode), paramBytes, otid)
+		case int32(mapprotocol.OpSendRoutingInfo):
+			p.handleRoutingInvoke(conn, pd, sccpMsg, tcapMsg, otidBytes, invokeID, paramBytes, otid)
 		case int32(mapprotocol.OpSendRoutingInfoForSM):
 			if p.cfg.OnSRIPreDrop != nil && p.cfg.OnSRIPreDrop(otid) {
 				p.sriRequests.Add(1)

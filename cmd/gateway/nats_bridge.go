@@ -60,6 +60,7 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 	handlers.NATS.OnMTSmsRequest(bridge.onMTSmsRequest)
 	handlers.NATS.OnATIRequest(bridge.onATIRequest)
 	handlers.NATS.OnPSIRequest(bridge.onPSIRequest)
+	handlers.NATS.OnRoutingRequest(bridge.onRoutingRequest)
 	handlers.NATS.OnCAPInitialDP(bridge.onCAPInitialDP)
 	handlers.NATS.OnINAPInitialDP(bridge.onINAPInitialDP)
 
@@ -80,6 +81,7 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 			natsbridge.SubjectSRIRequest,
 			natsbridge.SubjectATIRequest,
 			natsbridge.SubjectPSIRequest,
+			natsbridge.SubjectRoutingRequest,
 			natsbridge.SubjectCAPInitialDP,
 			natsbridge.SubjectINAPInitialDP,
 		}))
@@ -262,6 +264,9 @@ func (b *natsBridge) publishMAPResponse(corrID string, op mapprotocol.OperationC
 	case *mapprotocol.ProvideSubscriberInfoResponse:
 		return b.natsHandler.PublishSubscriberInfo(natsbridge.MsgTypeMAPPSI, corrID, subscriberInfoWire(&r.SubscriberInfo))
 
+	case *mapprotocol.SendRoutingInfoResponse:
+		return b.publishRoutingResponse(corrID, r)
+
 	case *mapprotocol.MoForwardSMResponse:
 		// MO response from VMSC — not part of the SMSC inbound flow today;
 		// log for trace and treat as success.
@@ -314,6 +319,7 @@ var responseTypeByOp = map[mapprotocol.OperationCode]natsbridge.MessageType{
 	mapprotocol.OpMtForwardSM:           natsbridge.MsgTypeMAPMTSms,
 	mapprotocol.OpAnyTimeInterrogation:  natsbridge.MsgTypeMAPATI,
 	mapprotocol.OpProvideSubscriberInfo: natsbridge.MsgTypeMAPPSI,
+	mapprotocol.OpSendRoutingInfo:       natsbridge.MsgTypeMAPRouting,
 }
 
 func (b *natsBridge) publishFailure(corrID string, op mapprotocol.OperationCode, status string, errCode int32, detail string) {

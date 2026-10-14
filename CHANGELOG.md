@@ -6,6 +6,57 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-10-14
+
+### Added
+
+- **Call routing** (TS 29.002 §10.1), with client module v0.3.0: SendRoutingInfo (op 22) on
+  `map.routing.request` → `map.routing.response`.
+  - The gateway acts as a GMSC and asks the subscriber's HLR under
+    `locationInfoRetrievalContext-v3`. It addresses the HLR like SendRoutingInfoForSM, with calling
+    SSN 8.
+  - It sends a basic call interrogation. The GMSC address is the cluster GT, else the node's GT;
+    a request cannot set it.
+  - The answer is decoded into `routing_info`: the roaming number, or the forwarded-to number with
+    decoded forwarding options, or CAMEL routing information passed through. It also carries the
+    VMSC address, basic MSISDN, number portability status, basic service and SS codes. The IMSI
+    goes in `imsi` and any subscriber information in `subscriber_info`.
+  - The decoder is fuzzed, and both directions are checked against octets built by hand from the
+    ASN.1. Received ISDN addresses are accepted up to 20 octets (an NPLR's routing number plus
+    MSISDN can exceed the type's 9); the gateway sends at most 9.
+  - Peers cannot open the context with the gateway.
+- **Segmented results** (TS 29.002 §C.2.3). An HLR may send its answer as Return Result Not Last
+  components in TC-CONTINUEs, followed by a Return Result Last in the TC-END.
+  - TCAP now tells the two apart; it used to take the first segment as the whole result.
+  - The segments are merged into one answer for SendRoutingInfo.
+  - Beyond 16 segments or 16 KiB, the caller gets `REMOTE_ERROR`.
+  - A SendRoutingInfo result without the IMSI is incomplete (TS 29.002: present in the result or
+    in one of its segments) and is reported as `REMOTE_ERROR`. This also catches a segment
+    overtaken by the last one when a peer rotates the SLS.
+- MAP error names for numberChanged (44), busySubscriber (45), noSubscriberReply (46) and
+  or-NotAllowed (48).
+- Helm chart: capability `ss7-map-call-routing` in `arinna-capabilities.provides`.
+
+### Fixed
+
+- **M3UA reconnect after EISCONN.** A dial whose SCTP association came up while the connect call was
+  being restarted after a signal returned EISCONN, and the SCTP library closed the association.
+  The gateway then waited a full reconnect interval and the SGW was left holding a dead
+  association. It now dials again at once (up to 3 times). This was seen once in CI; the cause is
+  our reading of it and could not be reproduced locally. The test SGW also no longer stops
+  accepting after one failed handshake.
+
+- **Message order within a transaction.** SCCP and TCAP each handed incoming messages to a pool
+  of workers through one shared queue, so two messages of one transaction could be processed in
+  either order. A TC-CONTINUE carrying a result segment could be overtaken by the TC-END that
+  completes it. SCCP now picks the worker by OPC and SLS, which MTP keeps in sequence (Q.714
+  §1.1.2.2 — protocol class 1), and TCAP by transaction ID.
+
+### Removed
+
+- The unused inbound SendRoutingInfo handler skeleton (an HLR role the gateway does not have).
+  Its result encoder lacked the `[3]` tag of SendRoutingInfoRes.
+
 ## [0.7.5] - 2026-10-14
 
 ### Fixed
