@@ -6,6 +6,69 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-10-15
+
+### Added
+
+- **Location management, as HLR** (TS 29.002 §8.1, §8.8.1, §10.2), with client module v0.5.0.
+  The application is the HLR's location management (TS 23.012); the gateway is its MAP side.
+  - **Location updates.** A VLR's updateLocation (op 2) under `networkLocUpContext-v3` is
+    accepted. The node holding the dialogue asks the application on `map.ul`, as a NATS request,
+    at each decision of TS 29.002 figure 19.1.1/13: after the VLR's request, and after each
+    insertSubscriberData (op 7) the gateway sent in the dialogue.
+    - The application answers: insert subscriber data, accept (updateLocation's result, with
+      `map.hlr_number`, else the cluster GT, else the node GT), or reject with one of
+      updateLocation's errors.
+    - Subscriber data that does not fit one message is sent in several insertSubscriberData,
+      one at a time: the subscriber's own data first, no service list divided. Their results go
+      back as one.
+    - The application has `map.hlr_answer_timeout` per decision (1–10 s, default 5 s). No answer,
+      no application (refused at once) or an answer the gateway cannot carry out: systemFailure.
+    - The VLR's error to the data, or data the gateway cannot send, goes back to the application
+      to decide. The VLR's silence (timer m, 30 s), abort or END, a TCAP timeout and node shutdown
+      end the update with an `end` turn.
+  - **Subscriber data** (circuit-switched): MSISDN, category, status, bearer and teleservices,
+    call forwarding, call barring, other SS data, operator determined barring, regional
+    subscription, network access mode, access restriction. Written in declaration order, which
+    for the extension fields is not tag order.
+  - **Towards a VLR:** cancelLocation (op 3) on `map.cl.request`, provideRoamingNumber (op 4) on
+    `map.prn.request`, and a stand-alone insertSubscriberData on `map.isd.request`. Each is
+    addressed to the VLR's number (SSN 7) or a point code, answered to SSN 6, under
+    `locationCancellationContext-v3`, `roamingNumberEnquiryContext-v3` and
+    `subscriberDataMngtContext-v3`.
+  - Codecs checked against frames built by hand from the ASN.1; every decoder of peer input is
+    fuzzed. The strict peer plays the VLR. A three-node cluster test shows each location update
+    finishing on the node that took its BEGIN.
+  - MAP error noRoamingNumberAvailable (39).
+- **SCCP routing per Q.714 §2.2.1.** A message routed on GT whose translation here gives this
+  node's point code is accepted, with the rule's SSN. A `sccp.gtt_rules` entry naming
+  `sccp.local_point_code` thus makes a GT range the gateway's own, as an HLR's E.214 range. A
+  message this node sends to such a GT is delivered locally.
+- `sccp.gtt_rules[].numbering_plan` limits a rule to one numbering plan. A rule naming the local
+  point code must set it — an E.214 range begins with the digits of the network's own E.164
+  numbers, so without it SRI-for-SM to an MSISDN of the range would be delivered to the gateway
+  itself. The gateway refuses such a rule at start-up.
+- Helm chart: `map.hlr_number`, `map.hlr_answer_timeout`; capability `ss7-map-mobility`.
+
+### Fixed
+
+- **Cluster:** the answers to a dialogue a peer opened carried the called address of its BEGIN —
+  the cluster GT — as calling address. The peer then sent the rest of the dialogue to the
+  cluster GT, which the SG may load-share to another node, one that does not hold the dialogue.
+  The three-node location update test fails that way without the fix. USSD sessions a subscriber
+  starts (0.7.7) take the same code path, so in a cluster they could lose their continuation once
+  they ran past one exchange; that is read from the code, not run in a cluster test. With
+  `sccp.local_global_title` set, these answers now carry the node's own GT (TS 29.002 §7.3.1:
+  responding address).
+- SCCP: a message routed on SSN that MTP delivered to our point code is accepted whatever point
+  code its called address carries, instead of being refused (Q.714 §2.2.1: the receiving node is
+  the destination).
+- MAP: a BEGIN with a USSD request (or now updateLocation) and a second Invoke rejected the second
+  in an END, ending the dialogue under the session it had just opened. The Reject now goes in a
+  CONTINUE when a session lives, and nothing in a message runs after a Reject that ended the
+  dialogue.
+- SCCP: numbering plan 7 is ISDN/mobile (E.214), not "private" (Q.713 §3.4.2.3.3).
+
 ## [0.7.7] - 2026-10-15
 
 ### Added

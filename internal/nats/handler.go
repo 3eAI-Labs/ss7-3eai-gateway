@@ -229,6 +229,9 @@ func (h *Handler) subscribeAll() error {
 		{SubjectPSIRequest, h.handlePSIRequest},
 		{SubjectRoutingRequest, h.handleRoutingRequest},
 		{SubjectUSSDStart, h.handleUSSDStart},
+		{SubjectCLRequest, h.handleCLRequest},
+		{SubjectPRNRequest, h.handlePRNRequest},
+		{SubjectISDRequest, h.handleISDRequest},
 		{SubjectCAPInitialDP, h.handleCAPInitialDP},
 		{SubjectINAPInitialDP, h.handleINAPInitialDP},
 	}
@@ -307,6 +310,21 @@ func (h *Handler) handleUSSDCommand(msg *nats.Msg) {
 	h.processIncomingMessage(msg, h.onUSSDCommand)
 }
 
+func (h *Handler) handleCLRequest(msg *nats.Msg) {
+	h.metrics.CLRequestCount.Add(1)
+	h.processIncomingMessage(msg, h.onCLRequest)
+}
+
+func (h *Handler) handlePRNRequest(msg *nats.Msg) {
+	h.metrics.PRNRequestCount.Add(1)
+	h.processIncomingMessage(msg, h.onPRNRequest)
+}
+
+func (h *Handler) handleISDRequest(msg *nats.Msg) {
+	h.metrics.ISDRequestCount.Add(1)
+	h.processIncomingMessage(msg, h.onISDRequest)
+}
+
 func (h *Handler) handleCAPInitialDP(msg *nats.Msg) {
 	h.metrics.CAPInitialDPCount.Add(1)
 	h.processIncomingMessage(msg, h.onCAPInitialDP)
@@ -369,6 +387,9 @@ var responseTypeBySubject = map[string]MessageType{
 	SubjectRoutingRequest: MsgTypeMAPRouting,
 	SubjectUSSDStart:      MsgTypeMAPUSSD,
 	SubjectUSSDCommand:    MsgTypeMAPUSSD,
+	SubjectCLRequest:      MsgTypeMAPCL,
+	SubjectPRNRequest:     MsgTypeMAPPRN,
+	SubjectISDRequest:     MsgTypeMAPISD,
 }
 
 // publishRejection answers a request refused before a dialogue started —
@@ -495,6 +516,12 @@ func (h *Handler) getSubjectForMessage(msg *NatsMessage) string {
 		return SubjectRoutingResponse
 	case MsgTypeMAPUSSD:
 		return SubjectUSSDResponse
+	case MsgTypeMAPCL:
+		return SubjectCLResponse
+	case MsgTypeMAPPRN:
+		return SubjectPRNResponse
+	case MsgTypeMAPISD:
+		return SubjectISDResponse
 	case MsgTypeCAPEventReport:
 		return SubjectCAPEventReport
 	case MsgTypeINAPEventReport:
@@ -681,6 +708,62 @@ func (h *Handler) PublishUSSDEvent(route string, msg *NatsMessage) error {
 	return h.enqueueOn(SubjectUSSDEventPrefix+route, msg)
 }
 
+// PublishAnswer publishes a successful answer on its message type's
+// response subject; the envelope is filled in here.
+func (h *Handler) PublishAnswer(msg *NatsMessage) error {
+	msg.MessageID = uuid.New().String()
+	msg.Direction = DirectionOutbound
+	msg.Timestamp = time.Now()
+	msg.NodeID = h.config.NodeID
+	return h.enqueue(msg)
+}
+
+// ErrNoResponder: no application serves the subject asked.
+var ErrNoResponder = errors.New("no application is serving the subject")
+
+// RequestLocationUpdate asks the HLR application about a location update
+// and waits for its answer until ctx ends. It blocks: call it off the
+// TCAP workers.
+func (h *Handler) RequestLocationUpdate(ctx context.Context, msg *NatsMessage) (*NatsMessage, error) {
+	h.fillTurn(msg)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	nc := h.nc
+	if nc == nil {
+		return nil, ErrNotConnected
+	}
+	h.metrics.LocationUpdateTurns.Add(1)
+	reply, err := nc.RequestWithContext(ctx, SubjectLocationUpdate, data)
+	if errors.Is(err, nats.ErrNoResponders) {
+		return nil, ErrNoResponder
+	}
+	if err != nil {
+		return nil, err
+	}
+	var answer NatsMessage
+	if err := json.Unmarshal(reply.Data, &answer); err != nil {
+		return nil, fmt.Errorf("the answer is not a message: %w", err)
+	}
+	return &answer, nil
+}
+
+// PublishLocationUpdateEnd tells the HLR application a location update
+// ended without its answer: a publish, not a request — it is not answered.
+func (h *Handler) PublishLocationUpdateEnd(msg *NatsMessage) error {
+	h.fillTurn(msg)
+	return h.enqueueOn(SubjectLocationUpdate, msg)
+}
+
+func (h *Handler) fillTurn(msg *NatsMessage) {
+	msg.MessageID = uuid.New().String()
+	msg.MessageType = MsgTypeMAPUL
+	msg.Direction = DirectionOutbound
+	msg.Timestamp = time.Now()
+	msg.NodeID = h.config.NodeID
+}
+
 // NodeID is this node's identity (nats.node_id).
 func (h *Handler) NodeID() string { return h.config.NodeID }
 
@@ -729,6 +812,10 @@ func (h *Handler) OnUSSDStart(handler func(*NatsMessage) error) {
 func (h *Handler) OnUSSDCommand(handler func(*NatsMessage) error) {
 	h.onUSSDCommand = handler
 }
+
+func (h *Handler) OnCLRequest(handler func(*NatsMessage) error)  { h.onCLRequest = handler }
+func (h *Handler) OnPRNRequest(handler func(*NatsMessage) error) { h.onPRNRequest = handler }
+func (h *Handler) OnISDRequest(handler func(*NatsMessage) error) { h.onISDRequest = handler }
 
 func (h *Handler) OnCAPInitialDP(handler func(*NatsMessage) error) {
 	h.onCAPInitialDP = handler

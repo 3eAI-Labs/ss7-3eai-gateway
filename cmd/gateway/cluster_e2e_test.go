@@ -646,8 +646,12 @@ func buildClusterE2EConfig(
 	v.Set("sccp.cluster_global_title.address", clusterE2EClusterGT)
 	v.Set("sccp.gtt_enabled", true)
 	// GT-routed messages (MT-Forward-SM to the VMSC GT) go to the peer, as
-	// they would to an STP that translates again.
-	v.Set("sccp.gtt_rules", []map[string]any{{"pattern": "*", "point_code": int(e2ePeerPC)}})
+	// they would to an STP that translates again; the HLR's E.214 range is
+	// the cluster's own (location updates).
+	v.Set("sccp.gtt_rules", []map[string]any{
+		{"pattern": ss7peer.MGTPrefix + "*", "numbering_plan": 7, "point_code": int(e2eGatewayPC), "ssn": 6, "priority": 10},
+		{"pattern": "*", "point_code": int(e2ePeerPC)},
+	})
 	v.Set("sccp.max_hop_counter", 15)
 	v.Set("sccp.channel_buffer_size", 1000)
 	v.Set("sccp.worker_pool_size", 4)

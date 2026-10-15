@@ -116,9 +116,10 @@ type Handlers struct {
 	HA       *ha.Handler
 	API      *api.Handler
 	Drain    *opstrigger.DrainState
-	// USSD holds the node's USSD sessions (nil until the NATS bridge is
-	// bound).
-	USSD *ussdSessions
+	// USSD holds the node's USSD sessions, LocationUpdates its location
+	// updates as HLR (nil until the NATS bridge is bound).
+	USSD            *ussdSessions
+	LocationUpdates *locationUpdates
 }
 
 func initLogger(level string) (*zap.Logger, error) {
@@ -206,16 +207,17 @@ func loadConfig(configFile string) (*viper.Viper, error) {
 }
 
 // mapApplicationContexts are the MAP contexts a peer may open with the
-// gateway: the three short-message contexts, and USSD (the HLR's
+// gateway: the three short-message contexts; USSD (the HLR's
 // processUnstructuredSS-Request to the gateway as gsmSCF), which the gateway
-// also opens. A BEGIN under any other context (location
-// update, …) is refused by the dispatcher instead of reaching a handler that
-// would answer systemFailure.
+// also opens; location updating (a VLR's updateLocation to the gateway as
+// HLR). A BEGIN under any other context is refused by the dispatcher
+// instead of reaching a handler that would answer systemFailure.
 var mapApplicationContexts = []tcap.ApplicationContext{
 	tcap.ACShortMsgGatewayV3,
 	tcap.ACShortMsgMORelayV3,
 	tcap.ACShortMsgMTRelayV3,
 	tcap.ACNetworkUnstructuredSsV2,
+	tcap.ACNetworkLocUpV3,
 }
 
 var capApplicationContexts = []tcap.ApplicationContext{tcap.ACCapV2, tcap.ACCapV3}
@@ -316,12 +318,15 @@ func initializeHandlers(cfg *viper.Viper, logger *zap.Logger) (*Handlers, error)
 	}
 	// Contexts only this node opens: answers to a version 2 retry (TS 29.002
 	// §5.2.1), the location enquiries it sends as gsmSCF (to an HLR) or as
-	// HLR (to a VLR), and the call routing interrogation it sends as GMSC.
-	// A peer cannot open a dialogue under them.
+	// HLR (to a VLR), the call routing interrogation it sends as GMSC, and
+	// the HLR's location cancellation, roaming number enquiry and
+	// subscriber data management towards a VLR. A peer cannot open a
+	// dialogue under them.
 	for _, ac := range []tcap.ApplicationContext{
 		tcap.ACShortMsgGatewayV2, tcap.ACShortMsgMTRelayV2,
 		tcap.ACAnyTimeInfoEnquiryV3, tcap.ACSubscriberInfoEnquiryV3,
 		tcap.ACLocationInfoRetrievalV3,
+		tcap.ACLocationCancellationV3, tcap.ACRoamingNumberEnquiryV3, tcap.ACSubscriberDataMngtV3,
 	} {
 		if err := dispatcher.RegisterInitiatorOnly(ac.OID, mapHandler); err != nil {
 			return nil, fmt.Errorf("failed to register MAP for %s: %w", ac.Name, err)
@@ -355,6 +360,15 @@ func initializeHandlers(cfg *viper.Viper, logger *zap.Logger) (*Handlers, error)
 	tcapHandler.SetUserDataLimit(sccpHandler.MaxUserData)
 	// A peer that refuses a version 3 context gets the request again in v2.
 	tcapHandler.SetVersionFallback(mapprotocol.VersionFallback)
+	// A peer continues a dialogue it opened by sending to the calling
+	// address of our answers: this node's GT, so that in a cluster its next
+	// message comes back to this node rather than to whichever node the
+	// cluster GT, or the subscriber's E.214 GT an HLR is called by, reaches.
+	if sccpCfg.BuildLocalGT() != nil {
+		tcapHandler.SetRespondingAddress(func(called *sccp.SccpAddress) *sccp.SccpAddress {
+			return nodeAddress(sccpCfg, called.SubsystemNumber)
+		})
+	}
 
 	// Wire MAP/CAP outbound TCAP emission. Now that tcapHandler exists,
 	// hand its application-outbound channel to MAP and CAP so their
@@ -391,7 +405,8 @@ func initializeHandlers(cfg *viper.Viper, logger *zap.Logger) (*Handlers, error)
 	// startServices) so callbacks are armed before any of the lifecycle
 	// goroutines could fire — NATS subscribeAll happens in NATS.Start
 	// downstream.
-	handlers.USSD = bindNATSBridge(handlers, mapCfg, sccpCfg, logger).ussd
+	bridge := bindNATSBridge(handlers, mapCfg, sccpCfg, logger)
+	handlers.USSD, handlers.LocationUpdates = bridge.ussd, bridge.locationUpdates
 
 	// ConfigStore will be initialized after NATS is started (in startServices)
 
@@ -621,9 +636,13 @@ func stopServices(ctx context.Context, handlers *Handlers, logger *zap.Logger) e
 	if err := handlers.API.Stop(ctx); err != nil {
 		logger.Error("Failed to stop API", zap.Error(err))
 	}
-	// Open USSD sessions are aborted while the stack can still send.
+	// Open USSD sessions and location updates are aborted while the stack
+	// can still send.
 	if handlers.USSD != nil {
 		handlers.USSD.close()
+	}
+	if handlers.LocationUpdates != nil {
+		handlers.LocationUpdates.close()
 	}
 	if err := handlers.TCAP.Stop(ctx); err != nil {
 		logger.Error("Failed to stop TCAP", zap.Error(err))
@@ -798,6 +817,8 @@ func buildMAPConfig(cfg *viper.Viper) (*mapprotocol.Config, error) {
 		GSMSCFAddress:      cfg.GetString("map.gsmscf_address"),
 		USSDSessionTimeout: cfg.GetDuration("map.ussd_session_timeout"),
 		USSDRoutes:         routes,
+		HLRNumber:          cfg.GetString("map.hlr_number"),
+		HLRAnswerTimeout:   cfg.GetDuration("map.hlr_answer_timeout"),
 		ChannelBufferSize:  cfg.GetInt("map.channel_buffer_size"),
 		WorkerPoolSize:     cfg.GetInt("map.worker_pool_size"),
 		OperationTimeout:   cfg.GetDuration("map.operation_timeout"),

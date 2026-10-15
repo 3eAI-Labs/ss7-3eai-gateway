@@ -203,6 +203,112 @@ func TestIncoming_ForUsIsDelivered(t *testing.T) {
 	}
 }
 
+// Route on SSN: the receiving node is the destination; a point code in the
+// called address is not used (Q.714 §2.2.1).
+func TestIncoming_RouteOnSSNIsForUs(t *testing.T) {
+	for name, called := range map[string]*SccpAddress{
+		"without a point code": {AddressIndicator: AISSNPresent | AIRouteOnSSN, SubsystemNumber: SSNMSC},
+		"with another point code": {AddressIndicator: AISSNPresent | AIPCPresent | AIRouteOnSSN,
+			PointCode: mscPC, SubsystemNumber: SSNMSC},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRoutingRig(t, false)
+			payload, err := EncodeSCCP(udt(called, gtAddr("905304445566", SSNMSC)), VariantITU)
+			require.NoError(t, err)
+			r.h.handleIncomingMessage(&m3ua.MTP3Message{OPC: stpPC, DPC: ourPC, SI: 3, PayloadData: payload})
+			select {
+			case <-r.h.TcapIncomingChannel():
+			case <-time.After(time.Second):
+				t.Fatal("not delivered")
+			}
+			r.nothingSent(t)
+		})
+	}
+	// MTP delivered it elsewhere (a misrouting SG): not ours.
+	r := newRoutingRig(t, false)
+	m := udt(&SccpAddress{AddressIndicator: AISSNPresent | AIRouteOnSSN, SubsystemNumber: SSNMSC}, gtAddr("905304445566", SSNMSC))
+	m.ReturnOnError = true
+	payload, err := EncodeSCCP(m, VariantITU)
+	require.NoError(t, err)
+	r.h.handleIncomingMessage(&m3ua.MTP3Message{OPC: stpPC, DPC: mscPC, SI: 3, PayloadData: payload})
+	_, udts := r.sent(t)
+	assert.Equal(t, CauseNoTranslationForAddress, udts.ReturnCause)
+}
+
+// A VLR addresses the HLR by the E.214 global title of the subscriber's
+// IMSI; a rule translating it to our own point code makes it ours, and the
+// rule's SSN is the subsystem it is delivered to.
+func TestIncoming_GTTranslatedToUsIsDelivered(t *testing.T) {
+	e214 := uint8(NPISDNMobile)
+	r := newRoutingRig(t, true,
+		GTTRuleConfig{Pattern: "*", PointCode: stpPC},
+		GTTRuleConfig{Pattern: "9053*", PointCode: ourPC, SSN: uint8(SSNMSC), Priority: 10, NumberingPlan: &e214},
+	)
+	called := gtAddr("905301234567890", 0)
+	called.GlobalTitle.NumberingPlan = NPISDNMobile
+	payload, err := EncodeSCCP(udt(called, gtAddr("905304445566", SSNMSC)), VariantITU)
+	require.NoError(t, err)
+	r.h.handleIncomingMessage(&m3ua.MTP3Message{OPC: stpPC, DPC: ourPC, SI: 3, PayloadData: payload})
+	select {
+	case m := <-r.h.TcapIncomingChannel():
+		assert.Equal(t, SSNMSC, m.CalledAddress.SubsystemNumber, "the final translation's SSN")
+		assert.Equal(t, "905301234567890", m.CalledAddress.GlobalTitle.Address)
+	case <-time.After(time.Second):
+		t.Fatal("not delivered")
+	}
+	r.nothingSent(t)
+
+	// A GT the rules send elsewhere is still not ours: refused, not relayed.
+	foreign := udt(gtAddr("447700900000", SSNMSC), gtAddr("905304445566", SSNMSC))
+	foreign.ReturnOnError = true
+	payload, err = EncodeSCCP(foreign, VariantITU)
+	require.NoError(t, err)
+	r.h.handleIncomingMessage(&m3ua.MTP3Message{OPC: stpPC, DPC: ourPC, SI: 3, PayloadData: payload})
+	_, udts := r.sent(t)
+	assert.Equal(t, CauseNoTranslationForAddress, udts.ReturnCause)
+
+	// An E.164 number with the same digits — an MSISDN, a VLR number — is
+	// not the E.214 range: refused inbound.
+	msisdn := udt(gtAddr("905301234567890", SSNMSC), gtAddr("905304445566", SSNMSC))
+	msisdn.ReturnOnError = true
+	payload, err = EncodeSCCP(msisdn, VariantITU)
+	require.NoError(t, err)
+	r.h.handleIncomingMessage(&m3ua.MTP3Message{OPC: stpPC, DPC: ourPC, SI: 3, PayloadData: payload})
+	_, udts = r.sent(t)
+	assert.Equal(t, CauseNoTranslationForAddress, udts.ReturnCause)
+}
+
+// A message this node sends to a GT that translates to itself is delivered
+// here rather than sent to the network; one to an E.164 number of the
+// same digits goes to the network.
+func TestRouteOutbound_GTTranslatedToUsIsLocal(t *testing.T) {
+	e214 := uint8(NPISDNMobile)
+	r := newRoutingRig(t, true,
+		GTTRuleConfig{Pattern: "9053*", PointCode: ourPC, SSN: uint8(SSNMSC), NumberingPlan: &e214, Priority: 10},
+		GTTRuleConfig{Pattern: "*", PointCode: stpPC})
+	mgt := gtAddr("905301234567890", SSNMSC)
+	mgt.GlobalTitle.NumberingPlan = NPISDNMobile
+	require.NoError(t, r.h.SendMessage(udt(mgt, ourAddr())))
+	select {
+	case <-r.h.TcapIncomingChannel():
+	case <-time.After(time.Second):
+		t.Fatal("not delivered")
+	}
+	r.nothingSent(t)
+
+	require.NoError(t, r.h.SendMessage(udt(gtAddr("905301234567890", SSNMSC), ourAddr())))
+	label, _ := r.sent(t)
+	assert.Equal(t, uint32(stpPC), label.DPC, "the E.164 number goes to the STP")
+}
+
+// A rule making GTs our own must name a numbering plan.
+func TestOwnRangeRuleNeedsNumberingPlan(t *testing.T) {
+	_, err := NewHandler(&Config{LocalPointCode: ourPC, LocalSubsystems: []SubsystemNumber{SSNHLR}, GTTEnabled: true,
+		GTTRules: []GTTRuleConfig{{Pattern: "9053*", PointCode: ourPC, SSN: 6}}},
+		make(chan *m3ua.MTP3Message), make(chan *m3ua.MTP3Message), zap.NewNop())
+	assert.ErrorContains(t, err, "numbering_plan")
+}
+
 func TestValidateGTTRule(t *testing.T) {
 	for _, ok := range []GTTRuleConfig{
 		{Pattern: "*", PointCode: 1},

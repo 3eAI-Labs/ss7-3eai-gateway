@@ -189,6 +189,28 @@ var (
 		OID:  []int{0, 4, 0, 0, 1, 0, 19, 2},
 		Name: "networkUnstructuredSsContext-v2",
 	}
+	// Location management with the gateway as HLR, TS 29.002 §17.3.2.2–4
+	// and §17.3.2.17: a VLR opens networkLocUp (updateLocation, the HLR's
+	// insertSubscriberData in the same dialogue); the HLR opens
+	// locationCancellation (cancelLocation), roamingNumberEnquiry
+	// (provideRoamingNumber) and subscriberDataMngt (insertSubscriberData
+	// alone). Version 3 only. ACNetworkLocUpV3 has ACMapV3's OID.
+	ACNetworkLocUpV3 = ApplicationContext{
+		OID:  []int{0, 4, 0, 0, 1, 0, 1, 3},
+		Name: "networkLocUpContext-v3",
+	}
+	ACLocationCancellationV3 = ApplicationContext{
+		OID:  []int{0, 4, 0, 0, 1, 0, 2, 3},
+		Name: "locationCancellationContext-v3",
+	}
+	ACRoamingNumberEnquiryV3 = ApplicationContext{
+		OID:  []int{0, 4, 0, 0, 1, 0, 3, 3},
+		Name: "roamingNumberEnquiryContext-v3",
+	}
+	ACSubscriberDataMngtV3 = ApplicationContext{
+		OID:  []int{0, 4, 0, 0, 1, 0, 16, 3},
+		Name: "subscriberDataMngtContext-v3",
+	}
 	ACCapV2 = ApplicationContext{
 		OID:  []int{0, 4, 0, 0, 1, 0, 50, 1},
 		Name: "cap-ac-gsmSCF-gsmSSF-v2",
@@ -458,6 +480,10 @@ type Handler struct {
 	// lostSink is told of any dialogue TCAP ends on its own (timeout,
 	// non-delivery), whoever opened it.
 	lostSink func(d *Dialogue, reason FailureReason, detail string)
+
+	// respondingAddress gives the calling address of this end of a dialogue
+	// a peer opened, from the called address its BEGIN came to.
+	respondingAddress func(called *sccp.SccpAddress) *sccp.SccpAddress
 }
 
 // Config holds TCAP handler configuration

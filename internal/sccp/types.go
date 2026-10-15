@@ -55,17 +55,19 @@ const (
 	NAIInternational NatureOfAddressIndicator = 0x04
 )
 
-// NumberingPlan (ITU-T Q.713)
+// NumberingPlan (ITU-T Q.713 §3.4.2.3.3)
 type NumberingPlan uint8
 
 const (
-	NPUnknown  NumberingPlan = 0x00
-	NPISDN     NumberingPlan = 0x01 // E.164
-	NPData     NumberingPlan = 0x03 // X.121
-	NPTelex    NumberingPlan = 0x04
-	NPMaritime NumberingPlan = 0x05
-	NPLand     NumberingPlan = 0x06
-	NPPrivate  NumberingPlan = 0x07
+	NPUnknown    NumberingPlan = 0x00
+	NPISDN       NumberingPlan = 0x01 // E.164
+	NPGeneric    NumberingPlan = 0x02
+	NPData       NumberingPlan = 0x03 // X.121
+	NPTelex      NumberingPlan = 0x04 // F.69
+	NPMaritime   NumberingPlan = 0x05 // E.210, E.211
+	NPLand       NumberingPlan = 0x06 // E.212
+	NPISDNMobile NumberingPlan = 0x07 // E.214: an HLR's subscribers are addressed by it (TS 23.003 §3.2)
+	NPPrivate    NumberingPlan = 0x0E
 )
 
 // EncodingScheme represents digit encoding
@@ -258,11 +260,16 @@ type GTTRule struct {
 //     PointCode + SSN.
 type GTTRuleConfig struct {
 	// Pattern is a GT digit string, a digit prefix followed by "*", or "*".
-	Pattern     string `yaml:"pattern" json:"pattern" mapstructure:"pattern"`
-	Priority    int    `yaml:"priority" json:"priority,omitempty" mapstructure:"priority"`
-	PointCode   uint32 `yaml:"point_code" json:"point_code" mapstructure:"point_code"`
-	SSN         uint8  `yaml:"ssn" json:"ssn,omitempty" mapstructure:"ssn"`
-	Description string `yaml:"description" json:"description,omitempty" mapstructure:"description"`
+	Pattern   string `yaml:"pattern" json:"pattern" mapstructure:"pattern"`
+	Priority  int    `yaml:"priority" json:"priority,omitempty" mapstructure:"priority"`
+	PointCode uint32 `yaml:"point_code" json:"point_code" mapstructure:"point_code"`
+	SSN       uint8  `yaml:"ssn" json:"ssn,omitempty" mapstructure:"ssn"`
+	// NumberingPlan, when set, limits the rule to GTs of that numbering
+	// plan (Q.713 §3.4.2.3.3: 1 E.164, 7 E.214). A rule naming
+	// local_point_code must set it: an E.214 range begins with the same
+	// digits as the network's own E.164 numbers (TS 23.003 §3.2).
+	NumberingPlan *uint8 `yaml:"numbering_plan" json:"numbering_plan,omitempty" mapstructure:"numbering_plan"`
+	Description   string `yaml:"description" json:"description,omitempty" mapstructure:"description"`
 }
 
 // LoadBalanceMode defines load balancing algorithm

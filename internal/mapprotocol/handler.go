@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/tcap"
@@ -97,21 +98,6 @@ func (h *Handler) Stop(_ context.Context) error {
 	return nil
 }
 
-// SetUpdateLocationHandler sets the handler for UpdateLocation operations
-func (h *Handler) SetUpdateLocationHandler(handler UpdateLocationHandler) {
-	h.updateLocationHandler = handler
-}
-
-// SetProvideRoamingNumberHandler sets the handler for ProvideRoamingNumber operations
-func (h *Handler) SetProvideRoamingNumberHandler(handler ProvideRoamingNumberHandler) {
-	h.provideRoamingNumHandler = handler
-}
-
-// SetCancelLocationHandler sets the handler for CancelLocation operations
-func (h *Handler) SetCancelLocationHandler(handler CancelLocationHandler) {
-	h.cancelLocationHandler = handler
-}
-
 // SetSendRoutingInfoForSMHandler installs the SRI-for-SM (op 45) handler.
 func (h *Handler) SetSendRoutingInfoForSMHandler(handler SendRoutingInfoForSMHandler) {
 	h.sendRoutingInfoForSMHandler = handler
@@ -125,116 +111,6 @@ func (h *Handler) SetMtForwardSMHandler(handler MtForwardSMHandler) {
 // SetMoForwardSMHandler installs the MO-Forward-SM (op 46) handler.
 func (h *Handler) SetMoForwardSMHandler(handler MoForwardSMHandler) {
 	h.moForwardSMHandler = handler
-}
-
-// ProcessUpdateLocation handles UpdateLocation request. Per-op counter is
-// bumped at the dispatch entry point (routeInvoke) so malformed parameters
-// still register in op-traffic reports; this method only counts errors.
-func (h *Handler) ProcessUpdateLocation(req *UpdateLocationRequest) (*UpdateLocationResponse, *ErrorCode, error) {
-	h.logger.Info("Processing UpdateLocation",
-		zap.String("imsi", string(req.IMSI)),
-		zap.String("vlr", req.VLRNumber.Digits))
-
-	if h.updateLocationHandler == nil {
-		h.logger.Error("UpdateLocation handler not set")
-		h.metrics.Errors.Add(1)
-		return nil, nil, ErrHandlerNotSet
-	}
-
-	// Validate request
-	if err := h.validateUpdateLocationRequest(req); err != nil {
-		h.logger.Error("Invalid UpdateLocation request", zap.Error(err))
-		h.metrics.Errors.Add(1)
-		errCode := ErrDataMissing
-		return nil, &errCode, err
-	}
-
-	// Call handler
-	resp, errCode, err := h.updateLocationHandler.HandleUpdateLocation(req)
-	if err != nil {
-		h.logger.Error("UpdateLocation failed", zap.Error(err))
-		h.metrics.Errors.Add(1)
-		h.updateErrorMetrics(errCode)
-		return nil, errCode, err
-	}
-
-	h.logger.Info("UpdateLocation successful",
-		zap.String("imsi", string(req.IMSI)))
-
-	return resp, nil, nil
-}
-
-// ProcessCancelLocation handles CancelLocation request. Per-op counter is
-// bumped at the dispatch entry point (routeInvoke).
-func (h *Handler) ProcessCancelLocation(req *CancelLocationRequest) (*CancelLocationResponse, *ErrorCode, error) {
-	h.logger.Info("Processing CancelLocation",
-		zap.String("imsi", string(req.IMSI)),
-		zap.Uint8("cancellation_type", uint8(req.CancellationType)))
-
-	if h.cancelLocationHandler == nil {
-		h.logger.Error("CancelLocation handler not set")
-		h.metrics.Errors.Add(1)
-		return nil, nil, ErrHandlerNotSet
-	}
-
-	// Validate request
-	if req.IMSI == "" {
-		h.logger.Error("Invalid CancelLocation request: IMSI missing")
-		h.metrics.Errors.Add(1)
-		errCode := ErrDataMissing
-		return nil, &errCode, ErrInvalidRequest
-	}
-
-	// Call handler
-	resp, errCode, err := h.cancelLocationHandler.HandleCancelLocation(req)
-	if err != nil {
-		h.logger.Error("CancelLocation failed", zap.Error(err))
-		h.metrics.Errors.Add(1)
-		h.updateErrorMetrics(errCode)
-		return nil, errCode, err
-	}
-
-	h.logger.Info("CancelLocation successful",
-		zap.String("imsi", string(req.IMSI)))
-
-	return resp, nil, nil
-}
-
-// ProcessProvideRoamingNumber handles ProvideRoamingNumber request. Per-op
-// counter is bumped at the dispatch entry point (routeInvoke).
-func (h *Handler) ProcessProvideRoamingNumber(req *ProvideRoamingNumberRequest) (*ProvideRoamingNumberResponse, *ErrorCode, error) {
-	h.logger.Info("Processing ProvideRoamingNumber",
-		zap.String("imsi", string(req.IMSI)),
-		zap.String("msc", req.MSCNumber.Digits))
-
-	if h.provideRoamingNumHandler == nil {
-		h.logger.Error("ProvideRoamingNumber handler not set")
-		h.metrics.Errors.Add(1)
-		return nil, nil, ErrHandlerNotSet
-	}
-
-	// Validate request
-	if err := h.validateProvideRoamingNumberRequest(req); err != nil {
-		h.logger.Error("Invalid ProvideRoamingNumber request", zap.Error(err))
-		h.metrics.Errors.Add(1)
-		errCode := ErrDataMissing
-		return nil, &errCode, err
-	}
-
-	// Call handler
-	resp, errCode, err := h.provideRoamingNumHandler.HandleProvideRoamingNumber(req)
-	if err != nil {
-		h.logger.Error("ProvideRoamingNumber failed", zap.Error(err))
-		h.metrics.Errors.Add(1)
-		h.updateErrorMetrics(errCode)
-		return nil, errCode, err
-	}
-
-	h.logger.Info("ProvideRoamingNumber successful",
-		zap.String("imsi", string(req.IMSI)),
-		zap.String("roaming_number", resp.RoamingNumber.Digits))
-
-	return resp, nil, nil
 }
 
 // ProcessSendRoutingInfoForSM handles SRI-for-SM (op 45). Per-op counter is
@@ -317,31 +193,6 @@ func (h *Handler) ProcessMoForwardSM(req *MoForwardSMRequest) (*MoForwardSMRespo
 	return resp, nil, nil
 }
 
-// validateUpdateLocationRequest validates UpdateLocation request
-func (h *Handler) validateUpdateLocationRequest(req *UpdateLocationRequest) error {
-	if req.IMSI == "" {
-		return fmt.Errorf("IMSI is required")
-	}
-	if req.MSCNumber == nil {
-		return fmt.Errorf("MSC number is required")
-	}
-	if req.VLRNumber == nil {
-		return fmt.Errorf("VLR number is required")
-	}
-	return nil
-}
-
-// validateProvideRoamingNumberRequest validates ProvideRoamingNumber request
-func (h *Handler) validateProvideRoamingNumberRequest(req *ProvideRoamingNumberRequest) error {
-	if req.IMSI == "" {
-		return fmt.Errorf("IMSI is required")
-	}
-	if req.MSCNumber == nil {
-		return fmt.Errorf("MSC number is required")
-	}
-	return nil
-}
-
 // updateErrorMetrics updates error-specific metrics
 func (h *Handler) updateErrorMetrics(errCode *ErrorCode) {
 	if errCode == nil {
@@ -403,6 +254,15 @@ func validateConfig(cfg *Config) error {
 	case t < MinUSSDSessionTimeout || t > MaxUSSDSessionTimeout:
 		return fmt.Errorf("ussd_session_timeout %s is outside %s..%s (TS 29.002 timer ml)", t, MinUSSDSessionTimeout, MaxUSSDSessionTimeout)
 	}
+	switch t := cfg.HLRAnswerTimeout; {
+	case t == 0:
+		cfg.HLRAnswerTimeout = DefaultHLRAnswerTimeout
+	case t < MinHLRAnswerTimeout || t > MaxHLRAnswerTimeout:
+		return fmt.Errorf("hlr_answer_timeout %s is outside %s..%s", t, MinHLRAnswerTimeout, MaxHLRAnswerTimeout)
+	}
+	if n := cfg.HLRNumber; n != "" && (len(n) > 15 || strings.Trim(n, "0123456789") != "") {
+		return fmt.Errorf("hlr_number %q is not E.164 digits (at most 15)", n)
+	}
 	seen := make(map[string]bool, len(cfg.USSDRoutes))
 	for i, r := range cfg.USSDRoutes {
 		if r.Prefix == "" || len(r.Prefix) > 182 {
@@ -426,27 +286,6 @@ func validateConfig(cfg *Config) error {
 		cfg.OperationTimeout = DefaultOperationTimeout
 	}
 	return nil
-}
-
-// Helper functions for creating common responses
-
-// NewUpdateLocationResponse creates a successful UpdateLocation response
-func NewUpdateLocationResponse(hlrNumber *AddressString) *UpdateLocationResponse {
-	return &UpdateLocationResponse{
-		HLRNumber: hlrNumber,
-	}
-}
-
-// NewProvideRoamingNumberResponse creates a successful ProvideRoamingNumber response
-func NewProvideRoamingNumberResponse(roamingNumber AddressString) *ProvideRoamingNumberResponse {
-	return &ProvideRoamingNumberResponse{
-		RoamingNumber: roamingNumber,
-	}
-}
-
-// NewCancelLocationResponse creates a successful CancelLocation response
-func NewCancelLocationResponse() *CancelLocationResponse {
-	return &CancelLocationResponse{}
 }
 
 // Error helper functions

@@ -18,11 +18,12 @@ type OperationCode int32
 
 const (
 	// Location Management (3GPP TS 29.002 v17)
-	OpUpdateLocation     OperationCode = 2
-	OpCancelLocation     OperationCode = 3
-	OpSendIdentification OperationCode = 55
-	OpUpdateGprsLocation OperationCode = 23
-	OpPurgeMSRequest     OperationCode = 67
+	OpUpdateLocation       OperationCode = 2
+	OpCancelLocation       OperationCode = 3
+	OpInsertSubscriberData OperationCode = 7
+	OpSendIdentification   OperationCode = 55
+	OpUpdateGprsLocation   OperationCode = 23
+	OpPurgeMSRequest       OperationCode = 67
 
 	// Subscriber Information
 	OpProvideSubscriberInfo  OperationCode = 70
@@ -181,75 +182,6 @@ const NumberingPlanISDN uint8 = 1
 // destination reference.
 const NumberingPlanLandMobile uint8 = 6
 
-// UpdateLocationRequest (3GPP TS 29.002 - MAP-MS-DataTypes)
-type UpdateLocationRequest struct {
-	IMSI                         IMSI
-	MSCNumber                    *AddressString // HLR->MSC
-	VLRNumber                    *AddressString // Current VLR
-	LMSI                         []byte         // Local MSI
-	VLRCapability                *VLRCapability
-	InformPreviousNetworkEntity  bool
-	CSGSubscriptionDataRequested bool
-	SkipSubscriberDataUpdate     bool
-	ExtensionContainer           []byte
-}
-
-// UpdateLocationResponse
-type UpdateLocationResponse struct {
-	HLRNumber          *AddressString
-	ExtensionContainer []byte
-}
-
-// VLRCapability represents VLR capabilities
-type VLRCapability struct {
-	SupportedCamelPhases  []byte
-	ExtensionContainer    []byte
-	SolsaSupportIndicator bool
-	ISTSupportIndicator   bool
-	SuperChargerSupported bool
-	LongFTNSupported      bool
-}
-
-// CancelLocationRequest (3GPP TS 29.002)
-type CancelLocationRequest struct {
-	IMSI                          IMSI
-	IMSIWithLMSI                  *IMSIWithLMSI
-	CancellationType              CancellationType
-	ExtensionContainer            []byte
-	TypeOfUpdate                  *TypeOfUpdate
-	MTRFSupportedAndAuthorized    bool
-	MTRFSupportedAndNotAuthorized bool
-	NewMSCNumber                  *AddressString
-	NewVLRNumber                  *AddressString
-}
-
-// CancelLocationResponse
-type CancelLocationResponse struct {
-	ExtensionContainer []byte
-}
-
-// CancellationType
-type CancellationType uint8
-
-const (
-	CancelTypeUpdateProcedure      CancellationType = 0
-	CancelTypeSubscriptionWithdraw CancellationType = 1
-)
-
-// TypeOfUpdate
-type TypeOfUpdate uint8
-
-const (
-	UpdateTypeSGSNAttach TypeOfUpdate = 0
-	UpdateTypeMMEAttach  TypeOfUpdate = 1
-)
-
-// IMSIWithLMSI
-type IMSIWithLMSI struct {
-	IMSI IMSI
-	LMSI []byte
-}
-
 // SMS types (3GPP TS 29.002 v17 §17.7.13 / §17.7.5 / §17.7.10).
 //
 // SM-RP-DA / SM-RP-OA are CHOICEs on the wire. The Go side carries one
@@ -329,43 +261,6 @@ type MoForwardSMResponse struct {
 	ExtensionContainer []byte
 }
 
-// ProvideRoamingNumberRequest (3GPP TS 29.002)
-type ProvideRoamingNumberRequest struct {
-	IMSI                                    IMSI
-	MSCNumber                               *AddressString
-	MSISDN                                  *MSISDN
-	LMSI                                    []byte
-	GSMBearerCapability                     []byte
-	NetworkSignalInfo                       []byte
-	SuppressMTSS                            bool
-	MTRoamingForwardingSupported            bool
-	CallReferenceNumber                     []byte
-	ExtensionContainer                      []byte
-	AlertingPattern                         []byte
-	CCBSCall                                bool
-	SupportedCamelPhasesInInterrogatingNode []byte
-	AdditionalSignalInfo                    []byte
-	ORInterrogation                         bool
-	ORCapability                            *int32
-	ISTSupportIndicator                     bool
-	PrePagingSupported                      bool
-	LongFTNSupported                        bool
-	SuppressVTCSI                           bool
-	OfferedCamel4CSIs                       []byte
-	MTRoamingRetrySupported                 bool
-	PagingArea                              []byte
-	EPS_Info                                []byte
-	CSG_ID                                  []byte
-}
-
-// ProvideRoamingNumberResponse
-type ProvideRoamingNumberResponse struct {
-	RoamingNumber             AddressString
-	ExtensionContainer        []byte
-	ReleaseResourcesSupported bool
-	VMSCAddress               *AddressString
-}
-
 // Handler manages MAP protocol operations
 type Handler struct {
 	config *Config
@@ -390,10 +285,11 @@ type Handler struct {
 	// like any other context without a handler.
 	ussd USSDSessionHandler
 
+	// locationUpdate serves location updating dialogues
+	// (mobility_session.go); nil: they are refused.
+	locationUpdate LocationUpdateHandler
+
 	// Operation handlers
-	updateLocationHandler       UpdateLocationHandler
-	provideRoamingNumHandler    ProvideRoamingNumberHandler
-	cancelLocationHandler       CancelLocationHandler
 	sendRoutingInfoForSMHandler SendRoutingInfoForSMHandler
 	mtForwardSMHandler          MtForwardSMHandler
 	moForwardSMHandler          MoForwardSMHandler
@@ -407,17 +303,6 @@ type Handler struct {
 }
 
 // Operation handler interfaces
-type UpdateLocationHandler interface {
-	HandleUpdateLocation(req *UpdateLocationRequest) (*UpdateLocationResponse, *ErrorCode, error)
-}
-
-type ProvideRoamingNumberHandler interface {
-	HandleProvideRoamingNumber(req *ProvideRoamingNumberRequest) (*ProvideRoamingNumberResponse, *ErrorCode, error)
-}
-
-type CancelLocationHandler interface {
-	HandleCancelLocation(req *CancelLocationRequest) (*CancelLocationResponse, *ErrorCode, error)
-}
 
 // SendRoutingInfoForSMHandler — SRI-for-SM (op 45) inbound. SMSC asks the
 // gateway to resolve MSISDN -> {IMSI, VMSC/SGSN address}. The application
@@ -471,6 +356,17 @@ type Config struct {
 	// the "default" route.
 	USSDRoutes []USSDRoute `yaml:"ussd_routes" json:"ussd_routes"`
 
+	// HLRNumber is the HLR number (E.164 digits) the gateway, as HLR,
+	// returns in updateLocation's result: the VLR addresses the HLR by it
+	// from then on. Empty: the cluster GT, else the node's own GT.
+	HLRNumber string `yaml:"hlr_number" json:"hlr_number"`
+	// HLRAnswerTimeout is how long the gateway waits for the HLR
+	// application's answer to each turn of a location update before it
+	// refuses it with systemFailure. The VLR's timer for the whole location
+	// update is updateLocation's timer m, 15 to 30 s (TS 29.002 §17.1.2).
+	// 1 to 10 s, default 5 s.
+	HLRAnswerTimeout time.Duration `yaml:"hlr_answer_timeout" json:"hlr_answer_timeout"`
+
 	// Performance
 	ChannelBufferSize int           `yaml:"channel_buffer_size" json:"channel_buffer_size"`
 	WorkerPoolSize    int           `yaml:"worker_pool_size" json:"worker_pool_size"`
@@ -490,6 +386,13 @@ const (
 	MinUSSDSessionTimeout     = time.Minute
 	MaxUSSDSessionTimeout     = 10 * time.Minute
 	DefaultUSSDSessionTimeout = 180 * time.Second
+)
+
+// HLR answer timeout bounds and default (Config.HLRAnswerTimeout).
+const (
+	MinHLRAnswerTimeout     = time.Second
+	MaxHLRAnswerTimeout     = 10 * time.Second
+	DefaultHLRAnswerTimeout = 5 * time.Second
 )
 
 // SRIRouting values; see Config.SRIRouting.

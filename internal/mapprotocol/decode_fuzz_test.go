@@ -15,18 +15,25 @@ func FuzzDecoders(f *testing.F) {
 		f.Add(b)
 	}
 	f.Add([]byte{0x30, 0x03, 0x80, 0x01, 0x09})
-	for _, seed := range append(locationSeeds(), routingSeeds()...) {
+	for _, seed := range append(append(locationSeeds(), routingSeeds()...), mobilitySeeds()...) {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, b []byte) {
 		_, _ = decodeTBCD(b)
 		_, _ = decodeAddressString(b)
 		_, _ = decodeIMSI(b)
-		_, _ = decodeUpdateLocationArg(b)
-		_, _ = decodeCancelLocationArg(b)
+		_, _ = DecodeUpdateLocationArg(b)
+		_ = DecodeCancelLocationRes(b)
+		_, _ = DecodeProvideRoamingNumberRes(b)
+		_, _ = DecodeInsertSubscriberDataRes(b)
+		_, _ = decodeNamedBits(b)
+		// The VLR side, run by test peers on what the gateway sends.
+		_, _ = DecodeUpdateLocationRes(b)
+		_, _ = DecodeCancelLocationArg(b)
+		_, _ = DecodeProvideRoamingNumberArg(b)
+		_, _ = DecodeInsertSubscriberDataArg(b)
 		_, _ = DecodeSendRoutingInfoArg(b)
 		_, _ = DecodeSendRoutingInfoRes(b)
-		_, _ = decodeProvideRoamingNumberArg(b)
 		_, _ = DecodeAnyTimeInterrogationRes(b)
 		_, _ = DecodeProvideSubscriberInfoRes(b)
 		_, _ = DecodeAnyTimeInterrogationArg(b)

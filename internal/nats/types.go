@@ -28,6 +28,9 @@ const (
 	SubjectRoutingRequest = ss7client.SubjectRoutingRequest
 	SubjectUSSDStart      = ss7client.SubjectUSSDStart
 	SubjectUSSDCommand    = ss7client.SubjectUSSDCommand
+	SubjectCLRequest      = ss7client.SubjectCancelLocationRequest
+	SubjectPRNRequest     = ss7client.SubjectPRNRequest
+	SubjectISDRequest     = ss7client.SubjectISDRequest
 
 	// Outbound: gateway → application
 	SubjectMOSms           = ss7client.SubjectMOSMS
@@ -38,6 +41,12 @@ const (
 	SubjectRoutingResponse = ss7client.SubjectRoutingResponse
 	SubjectUSSDResponse    = ss7client.SubjectUSSDResponse
 	SubjectUSSDEventPrefix = ss7client.SubjectUSSDEventPrefix
+	SubjectCLResponse      = ss7client.SubjectCancelLocationResponse
+	SubjectPRNResponse     = ss7client.SubjectPRNResponse
+	SubjectISDResponse     = ss7client.SubjectISDResponse
+	// SubjectLocationUpdate carries location update turns as NATS
+	// requests, gateway → HLR application.
+	SubjectLocationUpdate = ss7client.SubjectLocationUpdate
 )
 
 // Server-private subjects: CAP/INAP are bound but not part of the published
@@ -68,10 +77,12 @@ const (
 	MsgTypeMAPPSI     = ss7client.MsgTypeMAPPSI
 	MsgTypeMAPRouting = ss7client.MsgTypeMAPRouting
 	MsgTypeMAPUSSD    = ss7client.MsgTypeMAPUSSD
+	MsgTypeMAPUL      = ss7client.MsgTypeMAPUpdateLocation
+	MsgTypeMAPCL      = ss7client.MsgTypeMAPCancelLocation
+	MsgTypeMAPPRN     = ss7client.MsgTypeMAPProvideRoamingNumber
+	MsgTypeMAPISD     = ss7client.MsgTypeMAPInsertSubscriberData
 
 	// Server-private message types
-	MsgTypeMAPUpdateLocation MessageType = "MAP_UL"
-	MsgTypeMAPCancelLocation MessageType = "MAP_CL"
 
 	MsgTypeCAPInitialDP   MessageType = "CAP_IDP"
 	MsgTypeCAPEventReport MessageType = "CAP_ERB"
@@ -149,6 +160,9 @@ type Handler struct {
 	onRoutingRequest func(*NatsMessage) error
 	onUSSDStart      func(*NatsMessage) error
 	onUSSDCommand    func(*NatsMessage) error
+	onCLRequest      func(*NatsMessage) error
+	onPRNRequest     func(*NatsMessage) error
+	onISDRequest     func(*NatsMessage) error
 	onCAPInitialDP   func(*NatsMessage) error
 	onINAPInitialDP  func(*NatsMessage) error
 
@@ -196,6 +210,10 @@ type Metrics struct {
 	RoutingRequestCount atomic.Uint64
 	USSDStartCount      atomic.Uint64
 	USSDCommandCount    atomic.Uint64
+	CLRequestCount      atomic.Uint64
+	PRNRequestCount     atomic.Uint64
+	ISDRequestCount     atomic.Uint64
+	LocationUpdateTurns atomic.Uint64
 	CAPInitialDPCount   atomic.Uint64
 	INAPInitialDPCount  atomic.Uint64
 

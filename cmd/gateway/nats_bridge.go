@@ -57,6 +57,8 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 	}
 	bridge.ussd = newUSSDSessions(handlers.NATS.NodeID(), mapCfg, handlers.TCAP, handlers.MAP, handlers.NATS,
 		logger.Named("ussd"))
+	bridge.locationUpdates = newLocationUpdates(handlers.NATS.NodeID(), bridge.hlrNumber(), mapCfg,
+		handlers.TCAP, handlers.MAP, handlers.NATS, logger.Named("location-update"))
 
 	handlers.NATS.OnSRIRequest(bridge.onSRIRequest)
 	handlers.NATS.OnMTSmsRequest(bridge.onMTSmsRequest)
@@ -65,13 +67,19 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 	handlers.NATS.OnRoutingRequest(bridge.onRoutingRequest)
 	handlers.NATS.OnUSSDStart(bridge.onUSSDStart)
 	handlers.NATS.OnUSSDCommand(bridge.ussd.command)
+	handlers.NATS.OnCLRequest(bridge.onCLRequest)
+	handlers.NATS.OnPRNRequest(bridge.onPRNRequest)
+	handlers.NATS.OnISDRequest(bridge.onISDRequest)
 	handlers.NATS.OnCAPInitialDP(bridge.onCAPInitialDP)
 	handlers.NATS.OnINAPInitialDP(bridge.onINAPInitialDP)
 
 	handlers.MAP.SetResponseSink(bridge.publishMAPResponse)
 	handlers.MAP.SetErrorSink(bridge.publishMAPError)
 	handlers.TCAP.SetFailureSink(bridge.publishMAPFailure)
-	handlers.TCAP.SetLostSink(bridge.ussd.lost)
+	handlers.TCAP.SetLostSink(func(d *tcap.Dialogue, reason tcap.FailureReason, detail string) {
+		bridge.ussd.lost(d, reason, detail)
+		bridge.locationUpdates.lost(d, reason, detail)
+	})
 
 	// MO-Forward-SM (op 46) inbound: foreign MSC → our gateway. Bridge
 	// implements `mapprotocol.MoForwardSMHandler`, publishing to NATS
@@ -80,6 +88,7 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 	// SMSC takes ownership of delivery from this point).
 	handlers.MAP.SetMoForwardSMHandler(bridge)
 	handlers.MAP.SetUSSDSessionHandler(bridge.ussd)
+	handlers.MAP.SetLocationUpdateHandler(bridge.locationUpdates)
 
 	logger.Info("NATS bridge bound to MAP/TCAP",
 		zap.Strings("subjects", []string{
@@ -90,6 +99,10 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 			natsbridge.SubjectRoutingRequest,
 			natsbridge.SubjectUSSDStart,
 			natsbridge.SubjectUSSDCommand,
+			natsbridge.SubjectCLRequest,
+			natsbridge.SubjectPRNRequest,
+			natsbridge.SubjectISDRequest,
+			natsbridge.SubjectLocationUpdate + " (requests out)",
 			natsbridge.SubjectCAPInitialDP,
 			natsbridge.SubjectINAPInitialDP,
 		}))
@@ -117,6 +130,8 @@ type natsBridge struct {
 	sccpCfg     *sccp.Config
 	logger      *zap.Logger
 	ussd        *ussdSessions
+	// locationUpdates are the location updates this node holds as HLR.
+	locationUpdates *locationUpdates
 }
 
 // onSRIRequest: SMSC asks "where is MSISDN X registered?" → MAP SRI-for-SM.
@@ -277,6 +292,9 @@ func (b *natsBridge) publishMAPResponse(corrID string, op mapprotocol.OperationC
 	case *mapprotocol.SendRoutingInfoResponse:
 		return b.publishRoutingResponse(corrID, r)
 
+	case *mapprotocol.CancelLocationRes, *mapprotocol.ProvideRoamingNumberRes, *mapprotocol.InsertSubscriberDataRes:
+		return b.publishMobilityResponse(corrID, resp)
+
 	case *mapprotocol.MoForwardSMResponse:
 		// MO response from VMSC — not part of the SMSC inbound flow today;
 		// log for trace and treat as success.
@@ -334,6 +352,9 @@ var responseTypeByOp = map[mapprotocol.OperationCode]natsbridge.MessageType{
 	mapprotocol.OpAnyTimeInterrogation:  natsbridge.MsgTypeMAPATI,
 	mapprotocol.OpProvideSubscriberInfo: natsbridge.MsgTypeMAPPSI,
 	mapprotocol.OpSendRoutingInfo:       natsbridge.MsgTypeMAPRouting,
+	mapprotocol.OpCancelLocation:        natsbridge.MsgTypeMAPCL,
+	mapprotocol.OpProvideRoamingNumber:  natsbridge.MsgTypeMAPPRN,
+	mapprotocol.OpInsertSubscriberData:  natsbridge.MsgTypeMAPISD,
 }
 
 func (b *natsBridge) publishFailure(corrID string, op mapprotocol.OperationCode, status string, errCode int32, detail string) {
@@ -624,12 +645,18 @@ func (b *natsBridge) calledForGT(gt string, ssn sccp.SubsystemNumber, pc uint32)
 // PC-based). Empty GT falls back to PC+SSN routing for in-network
 // short-circuit operation.
 func (b *natsBridge) callingSCCP(ssn sccp.SubsystemNumber) *sccp.SccpAddress {
+	return nodeAddress(b.sccpCfg, ssn)
+}
+
+// nodeAddress is this node's SCCP address for subsystem ssn: callingSCCP's,
+// and the responding address of dialogues peers open.
+func nodeAddress(cfg *sccp.Config, ssn sccp.SubsystemNumber) *sccp.SccpAddress {
 	addr := &sccp.SccpAddress{
 		AddressIndicator: sccp.AISSNPresent | sccp.AIPCPresent | sccp.AIRouteOnSSN,
-		PointCode:        b.sccpCfg.LocalPointCode,
+		PointCode:        cfg.LocalPointCode,
 		SubsystemNumber:  ssn,
 	}
-	if gt := b.sccpCfg.BuildLocalGT(); gt != nil {
+	if gt := cfg.BuildLocalGT(); gt != nil {
 		// Route-on-GT tells the peer to answer to the GT, not the PC.
 		addr.AddressIndicator = sccp.AISSNPresent | sccp.AIPCPresent | sccp.AIGTPresent
 		addr.GlobalTitle = gt

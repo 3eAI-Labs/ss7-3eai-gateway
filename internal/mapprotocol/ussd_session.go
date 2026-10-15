@@ -70,7 +70,9 @@ func (h *Handler) handleUSSD(d *tcap.Dialogue, msg *tcap.Message) {
 		id := *comp.InvokeID
 		switch comp.Type {
 		case tcap.CompTypeInvoke:
-			h.ussdInvoke(d, msg, comp)
+			if h.ussdInvoke(d, msg, comp) {
+				return // rejected in an END: the dialogue is over
+			}
 		case tcap.CompTypeReturnResult:
 			var res *USSDArg
 			if len(comp.Parameter) > 0 {
@@ -113,24 +115,22 @@ func (h *Handler) handleUSSD(d *tcap.Dialogue, msg *tcap.Message) {
 // processUnstructuredSS-Request opening the dialogue is served — in the
 // BEGIN, or in the CONTINUE after an empty Begin (TS 29.002 §C.2.1): the
 // gateway is the gsmSCF, which the HLR does not send unstructuredSS-Request
-// or -Notify to.
-func (h *Handler) ussdInvoke(d *tcap.Dialogue, msg *tcap.Message, comp *tcap.Component) {
+// or -Notify to. It reports whether a rejection ended the dialogue.
+func (h *Handler) ussdInvoke(d *tcap.Dialogue, msg *tcap.Message, comp *tcap.Component) bool {
 	op := OperationCode(-1)
 	if comp.OperationCode != nil {
 		op = OperationCode(*comp.OperationCode)
 	}
 	if op != OpProcessUnstructuredSSReq || d.InitiatedLocally() ||
 		(msg.MessageType != tcap.MsgTypeBegin && msg.MessageType != tcap.MsgTypeContinue) {
-		h.ussdReject(d, msg, comp, tcap.InvokeProblemUnrecognizedOperation)
-		return
+		return h.ussdReject(d, comp, tcap.InvokeProblemUnrecognizedOperation)
 	}
 	bumpPerOpCounter(h.metrics, op)
 	arg, err := DecodeUSSDArg(comp.Parameter)
 	if err != nil {
 		h.metrics.Errors.Add(1)
 		h.logger.Warn("MAP processUnstructuredSS-Request decode failed", zap.Error(err), zap.Uint32("tid", localTID(d)))
-		h.ussdReject(d, msg, comp, tcap.InvokeProblemMistypedParameter)
-		return
+		return h.ussdReject(d, comp, tcap.InvokeProblemMistypedParameter)
 	}
 	// The MAP-OpenInfo is in the AARQ that opened the dialogue.
 	var open *MAPOpenInfo
@@ -143,20 +143,22 @@ func (h *Handler) ussdInvoke(d *tcap.Dialogue, msg *tcap.Message, comp *tcap.Com
 		}
 	}
 	if !h.ussd.USSDBegin(d, *comp.InvokeID, arg, open) {
-		h.ussdReject(d, msg, comp, tcap.InvokeProblemUnrecognizedOperation)
+		return h.ussdReject(d, comp, tcap.InvokeProblemUnrecognizedOperation)
 	}
+	return false
 }
 
 // ussdReject rejects an Invoke: in an END when it is all the dialogue has,
-// in a CONTINUE when a session lives in it (Q.774 §3.2.2.2: a Reject does
-// not end the dialogue).
-func (h *Handler) ussdReject(d *tcap.Dialogue, msg *tcap.Message, comp *tcap.Component, problem uint8) {
-	if msg.MessageType == tcap.MsgTypeBegin || !h.ussd.USSDActive(d) {
+// in a CONTINUE when a session lives in it, even in the BEGIN that opened
+// it (Q.774 §3.2.2.2: a Reject does not end the dialogue). It reports
+// whether the dialogue ended.
+func (h *Handler) ussdReject(d *tcap.Dialogue, comp *tcap.Component, problem uint8) bool {
+	if !h.ussd.USSDActive(d) {
 		h.emitReject(d, comp, tcap.ProblemTypeInvoke, problem)
-		return
+		return true
 	}
 	peer := d.PeerTID()
-	if err := h.sendUSSD(d, &tcap.Message{
+	if err := h.sendSession(d, &tcap.Message{
 		MessageType:    tcap.MsgTypeContinue,
 		OriginatingTID: binary.BigEndian.AppendUint32(nil, d.LocalTID),
 		DestinationTID: peer,
@@ -166,6 +168,7 @@ func (h *Handler) ussdReject(d *tcap.Dialogue, msg *tcap.Message, comp *tcap.Com
 	}); err != nil {
 		h.logger.Warn("USSD Reject not sent", zap.Uint32("tid", localTID(d)), zap.Error(err))
 	}
+	return false
 }
 
 // ErrUSSDNoPeerTID: the peer has not answered the dialogue yet, so nothing
@@ -183,7 +186,7 @@ func (h *Handler) USSDInvoke(d *tcap.Dialogue, invokeID int32, op OperationCode,
 		return err
 	}
 	code := int32(op)
-	return h.sendUSSD(d, &tcap.Message{
+	return h.sendSession(d, &tcap.Message{
 		MessageType:    tcap.MsgTypeContinue,
 		OriginatingTID: binary.BigEndian.AppendUint32(nil, d.LocalTID),
 		DestinationTID: d.PeerTID(),
@@ -202,7 +205,7 @@ func (h *Handler) USSDRelease(d *tcap.Dialogue, invokeID int32, dcs byte, str []
 		return err
 	}
 	op := int32(OpProcessUnstructuredSSReq)
-	return h.sendUSSD(d, &tcap.Message{
+	return h.sendSession(d, &tcap.Message{
 		MessageType: tcap.MsgTypeEnd, DestinationTID: d.PeerTID(), Dialogue: d,
 		Components: []*tcap.Component{{Type: tcap.CompTypeReturnResult, InvokeID: &invokeID, OperationCode: &op, Parameter: param}},
 	})
@@ -212,7 +215,7 @@ func (h *Handler) USSDRelease(d *tcap.Dialogue, invokeID int32, dcs byte, str []
 // of processUnstructuredSS-Request.
 func (h *Handler) USSDRejectRequest(d *tcap.Dialogue, invokeID int32, code ErrorCode) error {
 	c := int32(code)
-	return h.sendUSSD(d, &tcap.Message{
+	return h.sendSession(d, &tcap.Message{
 		MessageType: tcap.MsgTypeEnd, DestinationTID: d.PeerTID(), Dialogue: d,
 		Components: []*tcap.Component{{Type: tcap.CompTypeReturnError, InvokeID: &invokeID, ErrorCode: &c}},
 	})
@@ -221,22 +224,23 @@ func (h *Handler) USSDRejectRequest(d *tcap.Dialogue, invokeID int32, code Error
 // USSDClose ends a USSD dialogue with an END without components (a
 // network-initiated session's release).
 func (h *Handler) USSDClose(d *tcap.Dialogue) error {
-	return h.sendUSSD(d, &tcap.Message{MessageType: tcap.MsgTypeEnd, DestinationTID: d.PeerTID(), Dialogue: d})
+	return h.sendSession(d, &tcap.Message{MessageType: tcap.MsgTypeEnd, DestinationTID: d.PeerTID(), Dialogue: d})
 }
 
 // USSDAbort aborts a USSD dialogue (TC-U-ABORT): the gateway gives a
 // session up, at its timeout or on shutdown.
 func (h *Handler) USSDAbort(d *tcap.Dialogue) error {
-	return h.sendUSSD(d, &tcap.Message{MessageType: tcap.MsgTypeAbort, DestinationTID: d.PeerTID(), Dialogue: d})
+	return h.sendSession(d, &tcap.Message{MessageType: tcap.MsgTypeAbort, DestinationTID: d.PeerTID(), Dialogue: d})
 }
 
-// sendUSSD sends msg, whose DestinationTID was read with PeerTID.
-func (h *Handler) sendUSSD(d *tcap.Dialogue, msg *tcap.Message) error {
+// sendSession sends msg in a session dialogue (USSD, location update); its
+// DestinationTID was read with PeerTID.
+func (h *Handler) sendSession(d *tcap.Dialogue, msg *tcap.Message) error {
 	if d == nil || len(msg.DestinationTID) == 0 {
 		return ErrUSSDNoPeerTID
 	}
 	if h.tcapOutbound == nil {
-		return errors.New("ussd: no TCAP outbound channel")
+		return errors.New("map: no TCAP outbound channel")
 	}
 	select {
 	case h.tcapOutbound <- msg:
@@ -244,6 +248,6 @@ func (h *Handler) sendUSSD(d *tcap.Dialogue, msg *tcap.Message) error {
 		return nil
 	default:
 		h.metrics.Errors.Add(1)
-		return errors.New("ussd: TCAP outbound channel full")
+		return errors.New("map: TCAP outbound channel full")
 	}
 }

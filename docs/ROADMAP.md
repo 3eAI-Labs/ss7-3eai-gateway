@@ -44,7 +44,8 @@ An area counts as delivered only with all of these:
 | 0.7.5 | TCAP encoding fix | ITU-T Q.773 encoding done here instead of by a library that wrapped every parameter in an extra SEQUENCE and wrote long lengths in one octet; one outcome per request | released |
 | 0.7.6 | Call routing | SendRoutingInfo (op 22) towards the HLR, basic call interrogation; results segmented with TC-Result-NL reassembled; per-transaction message order | released |
 | 0.7.7 | USSD | processUnstructuredSS-Request (op 59), unstructuredSS-Request (60), unstructuredSS-Notify (61) | released |
-| 0.7.8 | Mobility and subscriber data | UpdateLocation (2), CancelLocation (3), ProvideRoamingNumber (4) — the gateway's role in these, application or network-node emulation, is decided when the area starts | planned |
+| 0.7.8 | Mobility and subscriber data | As HLR, its location management an application: UpdateLocation (2) with InsertSubscriberData (7) in its dialogue, CancelLocation (3), ProvideRoamingNumber (4), stand-alone InsertSubscriberData (7). Fixes the calling address of answers to dialogues peers open, in a cluster | released |
+| 0.7.9 | Authentication | SendAuthenticationInfo (56) as HLR, the vectors from the application; PurgeMS (67) | planned |
 
 ## 0.8.x — CAP
 
@@ -53,6 +54,8 @@ An area counts as delivered only with all of these:
 - Event and charging control: RequestReportBCSMEvent, EventReportBCSM, ApplyCharging and
   ApplyChargingReport — enough for a prepaid call.
 - CAP origination with typed requests, instead of the pre-encoded BER accepted today.
+- CAMEL subscription data (O-CSI and the other CSIs) in the subscriber data the gateway, as HLR,
+  sends a VLR.
 
 ## 0.9.x — INAP
 

@@ -110,6 +110,18 @@ func (h *Handler) SetLostSink(sink func(d *Dialogue, reason FailureReason, detai
 	h.lostSink = sink
 }
 
+// SetRespondingAddress installs how this end of a dialogue a peer opened is
+// addressed: f takes the called address of the peer's BEGIN and returns the
+// calling address of every message this end sends in the dialogue. The
+// peer sends the rest of the dialogue to it, so it can name this node where
+// the BEGIN named a cluster GT or a subscriber's E.214 global title — TS
+// 29.002 §7.3.1: the responding address "is included if … it is different
+// from the destination address". nil (the default) answers from the called
+// address. Set before Start.
+func (h *Handler) SetRespondingAddress(f func(called *sccp.SccpAddress) *sccp.SccpAddress) {
+	h.respondingAddress = f
+}
+
 // EndLocally ends a dialogue at this end without sending anything (Q.771
 // prearranged end): for a dialogue the peer has not answered yet, which an
 // END or ABORT cannot address. A later message from the peer for it is
@@ -495,12 +507,16 @@ func (h *Handler) handleBegin(sccpCtx *sccp.SccpMessage, msg *Message) {
 		userInfo = msg.DialoguePortion.UserInformation
 	}
 
+	local := sccpCtx.CalledAddress
+	if h.respondingAddress != nil && local != nil {
+		local = h.respondingAddress(local)
+	}
 	dialogue := &Dialogue{
 		LocalTID:           localTID,
 		RemoteTID:          msg.OriginatingTID,
 		State:              StateActive,
 		ApplicationContext: appCtx,
-		LocalAddress:       sccpCtx.CalledAddress,
+		LocalAddress:       local,
 		RemoteAddress:      sccpCtx.CallingAddress,
 		CreatedAt:          time.Now(),
 		LastActivity:       time.Now(),
@@ -1025,6 +1041,28 @@ func (h *Handler) deferComponentsIfTooLong(dialogue *Dialogue, begin *Message) e
 	h.logger.Info("Message too long for one unitdata: opening with an empty Begin",
 		zap.Uint32("local_tid", dialogue.LocalTID), zap.Int("octets", len(whole)), zap.Int("limit", limit))
 	return nil
+}
+
+// Fits reports whether msg, sent now in its dialogue, fits one SCCP
+// unitdata between the dialogue's addresses — with the AARE a first answer
+// carries. An application that splits a long operation into several
+// (insertSubscriberData) asks before sending each part.
+func (h *Handler) Fits(msg *Message) (bool, error) {
+	probe := *msg
+	d := msg.Dialogue
+	if d != nil && probe.DialoguePortion == nil && d.dialogueResponsePending.Load() &&
+		(probe.MessageType == MsgTypeContinue || probe.MessageType == MsgTypeEnd) {
+		probe.DialoguePortion = &DialoguePortion{ApplicationContext: d.ApplicationContext}
+	}
+	b, err := h.encodeTCAPMessage(&probe)
+	if err != nil {
+		return false, err
+	}
+	limit := maxUnitdataData
+	if h.maxUserData != nil && d != nil {
+		limit = h.maxUserData(d.RemoteAddress, d.LocalAddress)
+	}
+	return len(b) <= limit, nil
 }
 
 // sendDeferredComponents sends what an empty Begin held back, in the first

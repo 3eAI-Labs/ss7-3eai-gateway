@@ -156,6 +156,20 @@ type Config struct {
 	// gateway ended each USSD dialogue.
 	OnUSSD    USSDCallback
 	OnUSSDEnd func(USSDEnd)
+	// The peer as VLR (mobility.go): OnInsertSubscriberData answers the
+	// gateway's insertSubscriberData, within a location update the peer
+	// started or alone (nil: an empty result); OnLocationUpdateEnd is told
+	// how the gateway ended each location update; OnCancelLocation answers
+	// cancelLocation (0: the result) and OnProvideRoamingNumber
+	// provideRoamingNumber (nil drops it).
+	OnInsertSubscriberData ISDCallback
+	OnLocationUpdateEnd    func(LocationUpdateEnd)
+	OnCancelLocation       func(*mapprotocol.CancelLocationArg) mapprotocol.ErrorCode
+	OnProvideRoamingNumber func(*mapprotocol.ProvideRoamingNumberArg) (*mapprotocol.ProvideRoamingNumberRes, mapprotocol.ErrorCode)
+	// SharedGTPrefixes are the GTs the peer, as SG, load-shares over the
+	// associations: the cluster GT, the HLR's E.214 range. A message to any
+	// other GT goes on the association that GT last came from.
+	SharedGTPrefixes []string
 
 	// OnSRIPreDrop is consulted before OnSRI is invoked. When it returns
 	// true, the peer drops the SRI Invoke silently (no ReturnResult, no
@@ -249,6 +263,8 @@ type Peer struct {
 	// USSD dialogues, by the peer's TID (ussd.go).
 	ussdDialogues sync.Map // uint32 → *ussdDialogue
 	ussdCount     atomic.Uint64
+
+	mobility mobilityState // mobility.go
 }
 
 // Start binds SCTP, builds the M3UA listener, and accepts the first
@@ -465,7 +481,8 @@ func (p *Peer) handleMTP3(conn *wire.Conn, pd *wire.ProtocolData) {
 		p.violate("TCAP message not Q.773: %v", err)
 		return
 	}
-	if p.handleUSSD(conn, pd, sccpMsg, tcapMsg) {
+	p.learnGT(conn, sccpMsg.CallingAddress)
+	if p.handleLocationUpdate(conn, pd, sccpMsg, tcapMsg) || p.handleUSSD(conn, pd, sccpMsg, tcapMsg) {
 		return
 	}
 
@@ -538,6 +555,8 @@ func (p *Peer) handleMTP3(conn *wire.Conn, pd *wire.ProtocolData) {
 			p.handleLocationInvoke(conn, pd, sccpMsg, tcapMsg, otidBytes, invokeID, int32(opCode), paramBytes, otid)
 		case int32(mapprotocol.OpSendRoutingInfo):
 			p.handleRoutingInvoke(conn, pd, sccpMsg, tcapMsg, otidBytes, invokeID, paramBytes, otid)
+		case int32(mapprotocol.OpCancelLocation), int32(mapprotocol.OpProvideRoamingNumber), int32(mapprotocol.OpInsertSubscriberData):
+			p.handleVLRInvoke(conn, pd, sccpMsg, tcapMsg, otidBytes, invokeID, int32(opCode), paramBytes)
 		case int32(mapprotocol.OpSendRoutingInfoForSM):
 			if p.cfg.OnSRIPreDrop != nil && p.cfg.OnSRIPreDrop(otid) {
 				p.sriRequests.Add(1)

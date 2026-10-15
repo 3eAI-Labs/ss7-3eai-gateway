@@ -90,8 +90,8 @@ func TestSliceD_SS7StackConstructionFromExampleConfig(t *testing.T) {
 	for _, ac := range mapApplicationContexts {
 		require.NotNil(t, dispatcher.LookupHandler(ac.OID), "%s should resolve", ac.Name)
 	}
-	require.Nil(t, dispatcher.LookupHandler(tcap.ACMapV3.OID),
-		"networkLocUp is not implemented, so it must not resolve")
+	require.Nil(t, dispatcher.LookupHandler(tcap.ACMapV2.OID),
+		"networkLocUp version 2 is not implemented, so it must not resolve")
 	require.NotNil(t, dispatcher.LookupHandler(tcap.ACCapV2.OID), "CAP v2 should resolve")
 	require.Nil(t, dispatcher.LookupHandler([]int{0, 4, 0, 0, 1, 0, 99, 99}),
 		"unknown AC must not resolve (carrier-grade strict mode)")

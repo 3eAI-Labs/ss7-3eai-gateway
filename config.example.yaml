@@ -46,7 +46,9 @@ m3ua:
 # node terminates locally (TS 23.003 §8: HLR=6, VLR=7, MSC=8, CAP=146,
 # gsmSCF (MAP)=147). Answers come back to the subsystem a request was sent
 # from: 6 for SRI-for-SM and ProvideSubscriberInfo, 8 for MT-ForwardSM, 147
-# for AnyTimeInterrogation.
+# for AnyTimeInterrogation; 6 for the location updates a VLR sends the
+# gateway as HLR and for CancelLocation, ProvideRoamingNumber and
+# InsertSubscriberData.
 #
 # network_variant selects the SS7 variant which dictates SCCP point-code
 # field width on the wire (Q.713 §3.4.1):
@@ -93,9 +95,19 @@ sccp:
   #       keeps routing on GT and point_code is the next relay, normally
   #       the STP, which translates again (Q.714 §2.4);
   #   ssn: N — final translation: route on point_code + SSN N.
-  # Without a matching rule a GT-routed message is not sent (logged as
-  # "no route to destination"). Incoming messages are never relayed.
+  # numbering_plan (optional) limits a rule to GTs of that plan (1 E.164,
+  # 7 E.214). Without a matching rule a GT-routed message is not sent (logged as
+  # "no route to destination"). Incoming messages are never relayed. A rule
+  # naming local_point_code makes a GT range this node's own (Q.714 §2.2.1):
+  # as HLR, the E.214 range of its subscribers' IMSIs (TS 23.003 §3.2), which
+  # VLRs address location updates to.
   gtt_rules:
+    # - pattern: "90539*"              # this HLR's E.214 range (CC+NDC of the MGT)
+    #   numbering_plan: 7              # E.214, required: the E.164 numbers share the digits
+    #   point_code: 0x010101           # = local_point_code
+    #   ssn: 6
+    #   priority: 10
+    #   description: "own subscribers (HLR)"
     - pattern: "*"                     # every GT
       point_code: 0x010102             # the STP (1-1-2)
       description: "default route via STP"
@@ -152,6 +164,14 @@ map:
   ussd_routes: []
   #   - prefix: "*123"
   #     route: balance
+  # Location management with the gateway as HLR (TS 29.002 §8.1): a VLR's
+  # location update goes to the application on map.ul, one decision at a time.
+  # hlr_number: the HLR number in updateLocation's result, which VLRs address
+  # the HLR by afterwards. Empty: the cluster GT, else this node's own GT.
+  hlr_number: ""
+  # hlr_answer_timeout: how long each decision of the application is waited
+  # for (1s..10s); the VLR's timer for the whole location update is 15-30 s.
+  hlr_answer_timeout: 5s
   channel_buffer_size: 10000
   worker_pool_size: 16
   operation_timeout: 10s

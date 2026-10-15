@@ -242,7 +242,7 @@ func (h *Handler) handleIncomingMessage(mtp3Msg *m3ua.MTP3Message) {
 		h.sendUDTS(sccpMsg, CauseUnqualified, mtp3Msg.OPC)
 		return
 	}
-	if !h.addressedToUs(sccpMsg.CalledAddress) {
+	if !h.addressedToUs(sccpMsg, mtp3Msg.DPC) {
 		h.logger.Warn("SCCP message not addressed to this node, refusing (not a relay)",
 			zap.Uint32("cdpa_pc", sccpMsg.CalledAddress.PointCode),
 			zap.String("cdpa_gt", gtDigits(sccpMsg.CalledAddress)))
@@ -330,11 +330,43 @@ func (h *Handler) HandleMTP3SendFailure(mtp3Msg *m3ua.MTP3Message, err error) {
 	h.reportNotDelivered(msg, "not sent: "+err.Error())
 }
 
-// addressedToUs reports whether an inbound called address names this node:
-// our point code, or one of our GTs. Subsystem availability is checked on
-// delivery, so that its failure maps to its own UDTS cause.
-func (h *Handler) addressedToUs(addr *SccpAddress) bool {
-	return addr.PointCode == h.config.LocalPointCode || h.matchesOurGT(addr.GlobalTitle) != gtRoleNone
+// addressedToUs reports whether an inbound message, delivered by MTP to
+// dpc, is for this node (Q.714 §2.2.1, §2.3.1):
+//   - routed on SSN: the receiving node is the destination — MTP delivered
+//     it to our point code — whatever point code the address carries
+//     ("Even if an SPC is present in the called party address parameter,
+//     it shall not be used by SCRC");
+//   - routed on GT: one of our GTs or our point code, or a GT that
+//     translation here sends to our point code. A VLR addresses an HLR by
+//     the E.214 mobile global title of the subscriber's IMSI (TS 23.003
+//     §3.2), which the network may leave to the HLR's node to translate:
+//     a sccp.gtt_rules entry naming sccp.local_point_code accepts those.
+//     Its SSN, if any, replaces the called SSN (a final translation).
+//
+// Subsystem availability is checked on delivery, so that its failure maps
+// to its own UDTS cause.
+func (h *Handler) addressedToUs(msg *SccpMessage, dpc uint32) bool {
+	addr := msg.CalledAddress
+	if addr.PointCode == h.config.LocalPointCode || h.matchesOurGT(addr.GlobalTitle) != gtRoleNone {
+		return true
+	}
+	if !addr.AddressIndicator.RoutesOnGT() {
+		return dpc == h.config.LocalPointCode
+	}
+	if !h.config.GTTEnabled || addr.GlobalTitle == nil || addr.GlobalTitle.Address == "" {
+		return false
+	}
+	dest, err := h.gttEngine.Translate(addr.GlobalTitle)
+	if err != nil || dest.PointCode != h.config.LocalPointCode {
+		return false
+	}
+	if dest.SSN != 0 {
+		final := *addr
+		final.SubsystemNumber = dest.SSN
+		final.AddressIndicator |= AISSNPresent
+		msg.CalledAddress = &final
+	}
+	return true
 }
 
 // routeOutbound decides where a message this node originates goes:
@@ -354,6 +386,9 @@ func (h *Handler) routeOutbound(msg *SccpMessage) error {
 	dpc, err := h.performGTT(msg)
 	if err != nil {
 		return err
+	}
+	if dpc == h.config.LocalPointCode {
+		return h.deliverLocal(msg) // translated to this node (an HLR's own subscribers)
 	}
 	return h.forwardToM3UA(msg, dpc)
 }
@@ -741,6 +776,12 @@ func validateConfig(cfg *Config) error {
 		if err := validateGTTRule(r, cfg.NetworkVariant); err != nil {
 			return fmt.Errorf("gtt_rules[%d]: %w", i, err)
 		}
+		// A rule that makes GTs this node's own would take the network's
+		// E.164 numbers of the same digits too (an MSISDN, a VLR number):
+		// it is limited to a numbering plan, normally E.214.
+		if r.PointCode == cfg.LocalPointCode && r.NumberingPlan == nil {
+			return fmt.Errorf("gtt_rules[%d]: a rule naming local_point_code needs numbering_plan (7 for an HLR's E.214 range)", i)
+		}
 	}
 	// Same digits in both roles defeats sticky response routing — peers
 	// pinning CgPA=local_gt would round-trip to the cluster GT instead.
@@ -780,6 +821,9 @@ func validateGTTRule(r GTTRuleConfig, variant NetworkVariant) error {
 	if r.PointCode == 0 || !variant.ValidPointCode(r.PointCode) {
 		return fmt.Errorf("point_code %d is not a valid %s point code", r.PointCode, variant)
 	}
+	if r.NumberingPlan != nil && *r.NumberingPlan > 15 {
+		return fmt.Errorf("numbering_plan %d is not 0..15", *r.NumberingPlan)
+	}
 	return nil
 }
 
@@ -795,6 +839,10 @@ func gttRules(cfg []GTTRuleConfig) []*GTTRule {
 			Description:  r.Description,
 			Enabled:      true,
 			Destinations: make([]Destination, 1),
+		}
+		if r.NumberingPlan != nil {
+			np := NumberingPlan(*r.NumberingPlan)
+			rule.NumberingPlan = &np
 		}
 		rule.Destinations[0].PointCode = r.PointCode
 		rule.Destinations[0].SSN = SubsystemNumber(r.SSN)

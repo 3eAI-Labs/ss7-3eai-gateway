@@ -215,6 +215,9 @@ config:
     # the DPC, normally the STP: [{pattern: "*", point_code: <STP PC>}].
     # ssn > 0 makes it a final translation (route on point_code + ssn).
     # Empty: GT-routed messages are not sent ("no route to destination").
+    # As HLR: {pattern: "<E.214 CC+NDC>*", numbering_plan: 7, point_code: <local_point_code>,
+    # ssn: 6, priority: 10} makes the subscribers' E.214 range this cluster's own (numbering_plan
+    # is required for a rule naming local_point_code: the E.164 numbers share the digits).
     gtt_rules: []
     gtt_cache_enabled: true
     gtt_cache_ttl: 600s
@@ -245,6 +248,8 @@ config:
     gsmscf_address: ""         # AnyTimeInterrogation gsmSCF-Address; empty = cluster GT, else own GT
     ussd_session_timeout: 180s # USSD: longest wait for the subscriber or the application (1m..10m)
     ussd_routes: []            # USSD: [{prefix: "*123", route: balance}] → map.ussd.event.<route>
+    hlr_number: ""             # as HLR: the number in updateLocation's result; empty = cluster GT, else own GT
+    hlr_answer_timeout: 5s     # as HLR: wait for each decision of the application on map.ul (1s..10s)
     channel_buffer_size: 10000
     worker_pool_size: 16
     operation_timeout: 10s

@@ -158,6 +158,48 @@ once, with one end event: released (by the application or the network), the netw
 aborted, timed out, a TCAP failure, or the node shutting down (sessions are aborted before the
 stack stops).
 
+## Location management, as HLR
+
+The gateway is the MAP side of an HLR whose location management (TS 23.012) is an application:
+the gateway speaks MAP to the VLRs, the application holds the subscribers and decides. SSN 6
+must be in `sccp.local_subsystems`.
+
+- **Location updates.** A VLR opens `networkLocUpContext-v3` with updateLocation, addressed to the
+  E.214 global title of the IMSI (TS 23.003 §3.2). A `sccp.gtt_rules` entry naming
+  `sccp.local_point_code` (with SSN 6) makes that range the gateway's own (see SCCP role). The
+  MAP process in the HLR relays between the VLR and the application, which decides at each step
+  (TS 29.002 figure 19.1.1/13). The gateway asks it on `map.ul`, as a NATS request, one turn at
+  a time:
+  - after the VLR's updateLocation (turn `update_location`);
+  - after each insertSubscriberData the gateway sent (turn `insert_result`).
+  The NATS reply comes back to the node holding the dialogue. Each answer is one of: insert
+  subscriber data, accept (updateLocation's result, with the HLR number: `map.hlr_number`, else
+  the cluster GT, else the node GT), or reject with one of updateLocation's errors.
+- **Subscriber data** goes in insertSubscriberData within the dialogue, without the IMSI
+  (§8.8.1.3). Data that does not fit one SCCP unitdata is split over several, one outstanding at
+  a time: the subscriber's own data first (networkAccessMode may only be in the first), then the
+  service lists — never divided, since some bearer groups go as a pair — and each supplementary
+  service, packed in order. The parts' results go back as one.
+- **Endings and timers.** The application has `map.hlr_answer_timeout` (1–10 s, default 5 s) per
+  turn. No answer in time, no application listening (NATS reports no responder at once), or an
+  answer the gateway cannot carry out refuses the update with systemFailure, and the application
+  gets an `end` turn saying so. Data the gateway cannot send, and the VLR's error to it, go back
+  to the application as an `insert_result` with the failure, for it to decide. The gateway waits for the VLR's answer to subscriber data for
+  timer m's upper limit, 30 s. The VLR's silence, its abort or END, a TCAP timeout or the node
+  shutting down end the update with an `end` turn, which is not answered. An update ends either
+  by the application's accept or reject, carried out, or with exactly one `end` turn. The `end`
+  waits for any turn in flight, so turns come one at a time and an `end` after an answer means
+  the answer was not carried out.
+- **Towards a VLR.** cancelLocation (`map.cl.request`), provideRoamingNumber (`map.prn.request`)
+  and a stand-alone insertSubscriberData (`map.isd.request`, which carries the IMSI) go to the
+  VLR the request names: its number as GT with SSN 7, or a point code. They are sent under
+  `locationCancellationContext-v3`, `roamingNumberEnquiryContext-v3` and
+  `subscriberDataMngtContext-v3`, answered to SSN 6, every outcome on the response subject.
+  A stand-alone insert must fit one message.
+
+All four contexts are used in version 3 only. A VLR that opens `networkLocUpContext-v2` is
+refused with an AARE proposing version 3.
+
 ## Message order
 
 SCCP and TCAP each run a pool of workers. Neither shares one queue among them:
@@ -188,7 +230,15 @@ The gateway is an SCCP end node, not a relay.
   and is never forwarded.
 - An incoming UDTS returns one of our messages: the dialogue that message belonged to is ended at
   once and its caller told the return cause. It is never passed up as data.
-- Global title translation applies only to messages this node originates.
+- Routing follows Q.714 §2.2.1. A message routed on SSN is for this node, whatever point code its
+  called address carries. One routed on GT is for this node when the GT is one of its own, or
+  when translation here gives the node's own point code; the rule's SSN, if any, replaces the
+  called SSN. That is how an HLR's E.214 range is taken: `sccp.gtt_rules` with
+  `point_code: <sccp.local_point_code>, ssn: 6, numbering_plan: 7`. A rule naming the local point
+  code must name a numbering plan, since an E.214 range begins with the digits of the network's
+  own E.164 numbers (TS 23.003 §3.2); without it SRI-for-SM to an MSISDN of the range would be
+  delivered here. A message routed on SSN is ours when MTP delivered it to our point code. Any
+  other GT is refused, not relayed.
 - A peer's segmented XUDT is reassembled before delivery (Q.714 §4.1.1.2): segments are matched by
   calling address, OPC and local reference, wait at most T(reass) = 15 s, and a failure is
   returned in an XUDTS when the sender asked for it.
@@ -203,6 +253,10 @@ Active-active, with no leader and no replicated dialogue state:
 - **Answers to dialogues a node started.** Each node uses its own `sccp.local_global_title` as
   calling address, so the network routes answers back to it. Transaction IDs also carry the node
   number.
+- **Dialogues a peer opened.** The node's answers carry its own GT as calling address too, not
+  the cluster GT or E.214 GT the BEGIN was sent to (TS 29.002 §7.3.1, responding address). The
+  peer sends the rest of the dialogue there, so a dialogue of several exchanges stays on its
+  node: a USSD session, or a location update with insertSubscriberData.
 - **Requests from applications.** They are spread by the NATS queue group. If a node dies, its
   in-flight dialogues get no answer at all: the caller's deadline expires, and its retry lands on
   a surviving node.

@@ -33,7 +33,7 @@ var (
 	moRelayV2 = []int{0, 4, 0, 0, 1, 0, 21, 2}
 )
 
-func startHandshakeHandler(t *testing.T) (*Handler, chan *sccp.SccpMessage, chan *sccp.SccpMessage, *recordingAppHandler) {
+func startHandshakeHandler(t *testing.T, configure ...func(*Handler)) (*Handler, chan *sccp.SccpMessage, chan *sccp.SccpMessage, *recordingAppHandler) {
 	t.Helper()
 	logger := zaptest.NewLogger(t)
 	app := &recordingAppHandler{dialogues: make(chan *Dialogue, 4)}
@@ -48,6 +48,9 @@ func startHandshakeHandler(t *testing.T) (*Handler, chan *sccp.SccpMessage, chan
 		TimerResolution: 100 * time.Millisecond,
 	}, in, out, d, logger)
 	require.NoError(t, err)
+	for _, c := range configure {
+		c(h)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	require.NoError(t, h.Start(ctx))
 	// Stop waits for the workers and the timer manager, so nothing logs
@@ -345,4 +348,58 @@ func TestDispatcher_InitiatorOnlyRoutes(t *testing.T) {
 	ours := &Dialogue{initiatedLocally: true}
 	assert.NoError(t, d.Dispatch(ours, dialogueMsgWithAC(ACShortMsgMTRelayV2.OID)))
 	assert.Nil(t, d.LookupHandler(ACShortMsgMTRelayV2.OID), "never accepted on an incoming BEGIN")
+}
+
+// The peer sends the rest of a dialogue it opened to the calling address of
+// our answers: with a responding address installed, that is this node's
+// address, not the called address of the BEGIN (a cluster GT, or the E.214
+// global title an HLR is addressed by).
+func TestHandshake_RespondingAddress(t *testing.T) {
+	node := &sccp.SccpAddress{PointCode: 1, SubsystemNumber: sccp.SSNMSC,
+		GlobalTitle: &sccp.GlobalTitle{Address: "905900000001"}}
+	var called *sccp.SccpAddress
+	h, in, out, app := startHandshakeHandler(t, func(h *Handler) {
+		h.SetRespondingAddress(func(c *sccp.SccpAddress) *sccp.SccpAddress { called = c; return node })
+	})
+	begin := peerBegin(t, moRelayV3)
+	in <- begin
+	dlg := <-app.dialogues
+	assert.Equal(t, begin.CalledAddress, called, "given the BEGIN's called address")
+	h.handleOutgoingMessage(&Message{MessageType: MsgTypeContinue, OriginatingTID: tid32(dlg.LocalTID),
+		DestinationTID: dlg.RemoteTID, Dialogue: dlg})
+	select {
+	case m := <-out:
+		assert.Equal(t, node, m.CallingAddress)
+		assert.Equal(t, begin.CallingAddress, m.CalledAddress)
+	case <-time.After(2 * time.Second):
+		t.Fatal("nothing sent")
+	}
+}
+
+// Fits counts the AARE a first answer carries, and only that one.
+func TestFits_CountsTheFirstAnswersAARE(t *testing.T) {
+	h, in, _, app := startHandshakeHandler(t, func(h *Handler) {
+		h.SetUserDataLimit(func(_, _ *sccp.SccpAddress) int { return 60 })
+	})
+	in <- peerBegin(t, moRelayV3)
+	dlg := <-app.dialogues
+	msg := func(n int) *Message {
+		return &Message{MessageType: MsgTypeContinue, OriginatingTID: tid32(dlg.LocalTID), DestinationTID: dlg.RemoteTID,
+			Dialogue: dlg, Components: []*Component{{Type: CompTypeInvoke, InvokeID: ptrInt32(1), OperationCode: ptrInt32(7),
+				Parameter: append([]byte{0x30, byte(n)}, make([]byte, n)...)}}}
+	}
+	// A CONTINUE with 22 octets of parameter: 2+6+6 (tag, OTID, DTID),
+	// 2 component portion, 2 invoke, 3 invoke ID, 3 operation code, 22.
+	fits, err := h.Fits(msg(20))
+	require.NoError(t, err)
+	assert.False(t, fits, "with the AARE it is over 60")
+	assert.True(t, dlg.dialogueResponsePending.Load(), "asking does not answer the dialogue")
+
+	h.handleOutgoingMessage(msg(0)) // the first answer carries the AARE
+	fits, err = h.Fits(msg(20))
+	require.NoError(t, err)
+	assert.True(t, fits, "without it, it fits")
+	fits, err = h.Fits(msg(40))
+	require.NoError(t, err)
+	assert.False(t, fits)
 }

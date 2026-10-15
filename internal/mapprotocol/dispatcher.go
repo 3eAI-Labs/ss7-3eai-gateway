@@ -40,6 +40,10 @@ func (h *Handler) HandleTCAPMessage(dialogue *tcap.Dialogue, msg *tcap.Message) 
 		h.handleUSSD(dialogue, msg)
 		return nil
 	}
+	if h.locationUpdate != nil && isLocationUpdateDialogue(dialogue) {
+		h.handleLocationUpdate(dialogue, msg)
+		return nil
+	}
 
 	for _, comp := range msg.Components {
 		if comp == nil {
@@ -224,10 +228,18 @@ func (h *Handler) handleReturnResult(dialogue *tcap.Dialogue, comp *tcap.Compone
 }
 
 // decodeReturnResult dispatches to the per-op response decoder. Returns
-// (nil, nil) for op codes whose response is intentionally empty (e.g.
-// CancelLocation) or for ops without an originated-response decoder yet.
+// (nil, nil) for ops without an originated-response decoder.
 func decodeReturnResult(op OperationCode, param []byte) (any, error) {
 	switch op {
+	case OpCancelLocation:
+		if err := DecodeCancelLocationRes(param); err != nil {
+			return nil, err
+		}
+		return &CancelLocationRes{}, nil
+	case OpProvideRoamingNumber:
+		return DecodeProvideRoamingNumberRes(param)
+	case OpInsertSubscriberData:
+		return DecodeInsertSubscriberDataRes(param)
 	case OpSendRoutingInfoForSM:
 		return decodeSendRoutingInfoForSMRes(param)
 	case OpMtForwardSM:
@@ -260,60 +272,6 @@ func decodeSegmentedResult(op OperationCode, params [][]byte) (any, error) {
 // gateway does not serve returns errUnsupportedOperation.
 func (h *Handler) processInvoke(op OperationCode, param []byte, tid uint32) (respBytes []byte, errCode *ErrorCode, err error) {
 	switch op {
-	case OpUpdateLocation:
-		req, derr := decodeUpdateLocationArg(param)
-		if derr != nil {
-			h.metrics.Errors.Add(1)
-			h.logger.Warn("MAP UpdateLocation decode failed",
-				zap.Error(derr), zap.Uint32("tid", tid))
-			return nil, nil, fmt.Errorf("%w: %v", errCodecDecode, derr)
-		}
-		resp, ec, perr := h.ProcessUpdateLocation(req)
-		if perr != nil || resp == nil {
-			return nil, ec, perr
-		}
-		out, eerr := encodeUpdateLocationRes(resp)
-		if eerr != nil {
-			return nil, nil, eerr
-		}
-		return out, nil, nil
-
-	case OpCancelLocation:
-		req, derr := decodeCancelLocationArg(param)
-		if derr != nil {
-			h.metrics.Errors.Add(1)
-			h.logger.Warn("MAP CancelLocation decode failed",
-				zap.Error(derr), zap.Uint32("tid", tid))
-			return nil, nil, fmt.Errorf("%w: %v", errCodecDecode, derr)
-		}
-		resp, ec, perr := h.ProcessCancelLocation(req)
-		if perr != nil {
-			return nil, ec, perr
-		}
-		out, eerr := encodeCancelLocationRes(resp)
-		if eerr != nil {
-			return nil, nil, eerr
-		}
-		return out, nil, nil
-
-	case OpProvideRoamingNumber:
-		req, derr := decodeProvideRoamingNumberArg(param)
-		if derr != nil {
-			h.metrics.Errors.Add(1)
-			h.logger.Warn("MAP ProvideRoamingNumber decode failed",
-				zap.Error(derr), zap.Uint32("tid", tid))
-			return nil, nil, fmt.Errorf("%w: %v", errCodecDecode, derr)
-		}
-		resp, ec, perr := h.ProcessProvideRoamingNumber(req)
-		if perr != nil || resp == nil {
-			return nil, ec, perr
-		}
-		out, eerr := encodeProvideRoamingNumberRes(resp)
-		if eerr != nil {
-			return nil, nil, eerr
-		}
-		return out, nil, nil
-
 	case OpSendRoutingInfoForSM:
 		req, derr := decodeSendRoutingInfoForSMArg(param)
 		if derr != nil {

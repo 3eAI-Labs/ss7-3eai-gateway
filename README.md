@@ -1,7 +1,8 @@
 # ss7-3eai-gateway
 
 An SS7 signalling gateway that lets applications send and receive SMS, ask where a subscriber
-is, ask how to route a call to them, and run USSD menus, over MAP without speaking SS7 themselves. Applications talk to it over [NATS](https://nats.io); it talks to the
+is, ask how to route a call to them, run USSD menus, and act as the HLR their subscribers
+register with, over MAP without speaking SS7 themselves. Applications talk to it over [NATS](https://nats.io); it talks to the
 signalling network over SIGTRAN (M3UA over SCTP) as an application server process behind a
 signalling gateway (SG) or STP.
 
@@ -14,9 +15,11 @@ signalling gateway (SG) or STP.
   map.psi.request    ───────►│                              │             │          │
   map.routing.request ──────►│                              │             │          │
   map.ussd.start/.command ──►│                              │             │          │
+  map.cl/prn/isd.request ───►│                              │             │          │─► VLR
   map.*.response     ◄───────│                              │             └──────────┘
   map.mo.sms         ◄───────│                              │
-  map.ussd.event.<route> ◄───└──────────────────────────────┘
+  map.ussd.event.<route> ◄───│                              │
+  map.ul (request) ◄────────►└──────────────────────────────┘
 ```
 
 Written in Go. Licensed under the [GNU AGPL v3.0](LICENSE) (only); the
@@ -43,6 +46,10 @@ real SS7 networks.
 | SendRoutingInfo (op 22) | gateway (as GMSC) → HLR | `map.routing.request` → `map.routing.response` | locationInfoRetrievalContext-v3 |
 | processUnstructuredSS-Request (op 59) | HLR → gateway (as gsmSCF) | begin and end on `map.ussd.event.<route>` | networkUnstructuredSsContext-v2 |
 | unstructuredSS-Request / -Notify (ops 60, 61) | gateway (as gsmSCF) → HLR | `map.ussd.start`, `map.ussd.command` → `map.ussd.response` | networkUnstructuredSsContext-v2 |
+| UpdateLocation (op 2), with InsertSubscriberData (op 7) in its dialogue | VLR → gateway (as HLR) | turns on `map.ul`, answered by the application | networkLocUpContext-v3 |
+| CancelLocation (op 3) | gateway (as HLR) → VLR | `map.cl.request` → `map.cl.response` | locationCancellationContext-v3 |
+| ProvideRoamingNumber (op 4) | gateway (as HLR) → VLR | `map.prn.request` → `map.prn.response` | roamingNumberEnquiryContext-v3 |
+| InsertSubscriberData (op 7), alone | gateway (as HLR) → VLR | `map.isd.request` → `map.isd.response` | subscriberDataMngtContext-v3 |
 
 - **Every outcome is answered.** The response subject carries the result, or a failure:
   `REMOTE_ERROR` with the MAP error code (e.g. `absentSubscriberSM` vs `unknownSubscriber`, which
@@ -61,16 +68,28 @@ real SS7 networks.
   IMSI. The application prompts, notifies, and releases or rejects. Text is encoded and decoded
   (GSM 7-bit with its extension table, or UCS2; TS 23.038). Every session ends with exactly one end
   event saying how — released, the network's error, aborted or timed out.
+- **Location management, as HLR.** The application is the HLR's location management; the gateway
+  is its MAP side. A VLR's location update reaches the application one decision at a time on
+  `map.ul`, as NATS request and reply: send subscriber data, accept, or refuse. The
+  circuit-switched profile is typed — MSISDN, category, status, bearer and teleservices, call
+  forwarding, call barring, other supplementary services, operator determined barring, regional
+  subscription, network access mode, access restriction. A profile too long for one message is
+  sent in several insertSubscriberData. The application can also cancel a registration, ask a
+  VLR for a roaming number, and send changed data.
 - **Signalling transport.** M3UA ASP over SCTP (optionally multi-homed), with override or
   loadshare traffic mode. Each message carries its own MTP3 routing label. A lost association is
   re-established automatically, including when the SG is not reachable at start-up.
 - **SCCP.** Connectionless (UDT; protocol class 0 sent, the in-sequence delivery of class 1
   kept on receipt), ITU (14-bit) or ANSI (24-bit) point codes. Called
   addresses route on DPC/SSN or on global title. GT-routed messages are translated by configured
-  rules, usually to the STP, which translates again.
+  rules, usually to the STP, which translates again. A rule naming the gateway's own point code
+  makes a GT range its own: the E.214 range of its subscribers, for an HLR. Such a rule must name
+  the numbering plan (7, E.214), since that range starts with the same digits as the network's
+  E.164 numbers.
 - **Active-active cluster.** Nodes share a NATS queue group and a cluster GT. Each node has its own
-  GT as calling address, so the network returns a dialogue's answers to the node that started it.
-  TCAP transaction IDs carry the node number. No leader election and no shared dialogue state.
+  GT as calling address, in the dialogues it starts and in its answers to those a peer starts, so
+  the network returns the rest of a dialogue to the node that holds it. TCAP transaction IDs carry
+  the node number. No leader election and no shared dialogue state.
 - **Operations.** REST API (JWT), liveness and readiness probes (readiness follows the M3UA
   association), and declarative day-2 actions (`resetPeer`, `drain`, …) through a watched file.
   A Helm chart is included.
@@ -86,8 +105,15 @@ What is planned for each of these is in the [roadmap](docs/ROADMAP.md).
 **Protocol:**
 - Only the operations above. Other MAP operations, and dialogues under other application
   contexts, are refused; an Invoke of an operation the gateway does not serve is rejected
-  (unrecognizedOperation). The gateway only asks AnyTimeInterrogation, ProvideSubscriberInfo and
-  SendRoutingInfo: peers cannot open those contexts with it.
+  (unrecognizedOperation). The gateway only asks AnyTimeInterrogation, ProvideSubscriberInfo,
+  SendRoutingInfo, CancelLocation, ProvideRoamingNumber and stand-alone InsertSubscriberData:
+  peers cannot open those contexts with it.
+- As HLR, the gateway does not serve SendAuthenticationInfo, so a VLR that needs authentication
+  vectors for a subscriber must get them elsewhere; nor PurgeMS, RestoreData, SendIdentification,
+  DeleteSubscriberData or ActivateTraceMode. Location updating is version 3 only (a VLR opening
+  version 2 is refused with an AARE proposing 3). Subscriber data carries no CUG, eMLPP, VBS/VGCS,
+  CAMEL subscription (O-CSI and the other CSIs), GPRS, EPS or LCS data; CAMEL subscription data is
+  planned with CAP. A stand-alone InsertSubscriberData must fit one message.
 - SendRoutingInfo is a basic call interrogation from a GMSC that does not offer CAMEL, OR, CUG,
   pre-paging or a second service (SCUDIF); interrogation for forwarding is not offered. Version 3
   only: there is no fallback to locationInfoRetrieval version 2. A result in TC-Result-NL
@@ -104,8 +130,9 @@ What is planned for each of these is in the [roadmap](docs/ROADMAP.md).
   XUDT, §C.1). LUDT is not supported.
 - ANSI SCCP addresses use the ITU address-indicator layout; this is not verified against
   ANSI T1.112.
-- TCAP messages from peers must use definite lengths; the indefinite form (X.209) is not
-  understood. Operation and error codes must be local values (global OBJECT IDENTIFIER codes are
+- TCAP and MAP messages from peers must use definite lengths in their shortest form: the
+  indefinite form (X.209), and a long-form length where the short form would do (X.690 allows
+  both), are not understood. Operation and error codes must be local values (global OBJECT IDENTIFIER codes are
   not used by MAP).
 - CAP: an incoming InitialDP gets no answer, and CAP origination needs pre-encoded BER. The CAP
   application context names have not been verified. INAP is not supported.
@@ -115,7 +142,15 @@ can locate any subscriber the network will answer for, or learn their IMSI and s
 gateway does not authorise requests; restrict those subjects with NATS permissions, and remember
 that `map.*.request` or `map.>` grants all of them. Response subjects are broadcast, so subscribe
 rights on them show every requester's answers. (The gateway does fix the gsmSCF and GMSC
-addresses itself, so a publisher cannot pass as another gsmSCF or GMSC.)
+addresses itself, so a publisher cannot pass as another gsmSCF or GMSC.) Whoever subscribes to
+`map.ul` answers location updates — it is the HLR — and whoever may publish on `map.cl.request`,
+`map.prn.request` or `map.isd.request` can cancel any subscriber's registration, take a roaming
+number to route their calls, or change their profile in a VLR. As HLR the gateway answers any VLR
+that addresses it; screening (GSMA FS.11: does the VLR's calling GT match its VLR number? is it a
+roaming partner?) is the application's decision, made from the `update_location` turn. Location
+updates are NATS requests: the gateway needs to subscribe to its reply inboxes (`_INBOX.>`), and
+the HLR application needs permission to publish its replies (`allow_responses`). Only the gateway
+may publish on `map.ul`: a forged turn there would be answered with the subscriber's profile.
 
 **Management plane:**
 - **Not implemented on the message path:** the SS7 firewall (`internal/firewall`) and transaction
