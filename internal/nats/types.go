@@ -47,6 +47,10 @@ const (
 	// SubjectLocationUpdate carries location update turns as NATS
 	// requests, gateway → HLR application.
 	SubjectLocationUpdate = ss7client.SubjectLocationUpdate
+	// SubjectAuthentication and SubjectPurge carry sendAuthenticationInfo
+	// and purgeMS as NATS requests, gateway → HLR application.
+	SubjectAuthentication = ss7client.SubjectAuthentication
+	SubjectPurge          = ss7client.SubjectPurge
 )
 
 // Server-private subjects: CAP/INAP are bound but not part of the published
@@ -81,6 +85,8 @@ const (
 	MsgTypeMAPCL      = ss7client.MsgTypeMAPCancelLocation
 	MsgTypeMAPPRN     = ss7client.MsgTypeMAPProvideRoamingNumber
 	MsgTypeMAPISD     = ss7client.MsgTypeMAPInsertSubscriberData
+	MsgTypeMAPSAI     = ss7client.MsgTypeMAPSendAuthenticationInfo
+	MsgTypeMAPPurge   = ss7client.MsgTypeMAPPurgeMS
 
 	// Server-private message types
 
@@ -202,20 +208,22 @@ type Metrics struct {
 	BytesReceived     atomic.Uint64
 
 	// Per-subject counters
-	MTSmsRequestCount   atomic.Uint64
-	MOSmsPublishCount   atomic.Uint64
-	SRIRequestCount     atomic.Uint64
-	ATIRequestCount     atomic.Uint64
-	PSIRequestCount     atomic.Uint64
-	RoutingRequestCount atomic.Uint64
-	USSDStartCount      atomic.Uint64
-	USSDCommandCount    atomic.Uint64
-	CLRequestCount      atomic.Uint64
-	PRNRequestCount     atomic.Uint64
-	ISDRequestCount     atomic.Uint64
-	LocationUpdateTurns atomic.Uint64
-	CAPInitialDPCount   atomic.Uint64
-	INAPInitialDPCount  atomic.Uint64
+	MTSmsRequestCount      atomic.Uint64
+	MOSmsPublishCount      atomic.Uint64
+	SRIRequestCount        atomic.Uint64
+	ATIRequestCount        atomic.Uint64
+	PSIRequestCount        atomic.Uint64
+	RoutingRequestCount    atomic.Uint64
+	USSDStartCount         atomic.Uint64
+	USSDCommandCount       atomic.Uint64
+	CLRequestCount         atomic.Uint64
+	PRNRequestCount        atomic.Uint64
+	ISDRequestCount        atomic.Uint64
+	LocationUpdateTurns    atomic.Uint64
+	AuthenticationRequests atomic.Uint64
+	PurgeRequests          atomic.Uint64
+	CAPInitialDPCount      atomic.Uint64
+	INAPInitialDPCount     atomic.Uint64
 
 	// Errors
 	PublishErrors    atomic.Uint64

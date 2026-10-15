@@ -726,6 +726,28 @@ var ErrNoResponder = errors.New("no application is serving the subject")
 // TCAP workers.
 func (h *Handler) RequestLocationUpdate(ctx context.Context, msg *NatsMessage) (*NatsMessage, error) {
 	h.fillTurn(msg)
+	h.metrics.LocationUpdateTurns.Add(1)
+	return h.request(ctx, SubjectLocationUpdate, msg)
+}
+
+// RequestAuthentication asks the HLR application (the AuC) for the
+// vectors of a sendAuthenticationInfo and waits for its answer until ctx
+// ends. It blocks: call it off the TCAP workers.
+func (h *Handler) RequestAuthentication(ctx context.Context, msg *NatsMessage) (*NatsMessage, error) {
+	h.fill(msg, MsgTypeMAPSAI)
+	h.metrics.AuthenticationRequests.Add(1)
+	return h.request(ctx, SubjectAuthentication, msg)
+}
+
+// RequestPurge asks the HLR application about a purgeMS and waits for its
+// answer until ctx ends. It blocks: call it off the TCAP workers.
+func (h *Handler) RequestPurge(ctx context.Context, msg *NatsMessage) (*NatsMessage, error) {
+	h.fill(msg, MsgTypeMAPPurge)
+	h.metrics.PurgeRequests.Add(1)
+	return h.request(ctx, SubjectPurge, msg)
+}
+
+func (h *Handler) request(ctx context.Context, subject string, msg *NatsMessage) (*NatsMessage, error) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return nil, err
@@ -734,8 +756,7 @@ func (h *Handler) RequestLocationUpdate(ctx context.Context, msg *NatsMessage) (
 	if nc == nil {
 		return nil, ErrNotConnected
 	}
-	h.metrics.LocationUpdateTurns.Add(1)
-	reply, err := nc.RequestWithContext(ctx, SubjectLocationUpdate, data)
+	reply, err := nc.RequestWithContext(ctx, subject, data)
 	if errors.Is(err, nats.ErrNoResponders) {
 		return nil, ErrNoResponder
 	}
@@ -756,9 +777,12 @@ func (h *Handler) PublishLocationUpdateEnd(msg *NatsMessage) error {
 	return h.enqueueOn(SubjectLocationUpdate, msg)
 }
 
-func (h *Handler) fillTurn(msg *NatsMessage) {
+func (h *Handler) fillTurn(msg *NatsMessage) { h.fill(msg, MsgTypeMAPUL) }
+
+// fill fills in the envelope of a message the gateway sends.
+func (h *Handler) fill(msg *NatsMessage, t MessageType) {
 	msg.MessageID = uuid.New().String()
-	msg.MessageType = MsgTypeMAPUL
+	msg.MessageType = t
 	msg.Direction = DirectionOutbound
 	msg.Timestamp = time.Now()
 	msg.NodeID = h.config.NodeID

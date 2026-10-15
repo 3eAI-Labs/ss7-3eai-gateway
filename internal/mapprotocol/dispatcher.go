@@ -44,6 +44,10 @@ func (h *Handler) HandleTCAPMessage(dialogue *tcap.Dialogue, msg *tcap.Message) 
 		h.handleLocationUpdate(dialogue, msg)
 		return nil
 	}
+	if h.hlrRequest != nil && isHLRRequestDialogue(dialogue) {
+		h.handleHLRRequest(dialogue, msg)
+		return nil
+	}
 
 	for _, comp := range msg.Components {
 		if comp == nil {
@@ -454,6 +458,10 @@ func bumpPerOpCounter(m *Metrics, op OperationCode) {
 		m.MtForwardSMCount.Add(1)
 	case OpMoForwardSM:
 		m.MoForwardSMCount.Add(1)
+	case OpSendAuthenticationInfo:
+		m.SendAuthenticationInfoCount.Add(1)
+	case OpPurgeMS:
+		m.PurgeMSCount.Add(1)
 	}
 }
 

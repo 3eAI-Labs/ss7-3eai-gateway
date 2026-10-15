@@ -132,12 +132,18 @@ func (h *Handler) locationUpdateInvoke(d *tcap.Dialogue, msg *tcap.Message, comp
 	return false
 }
 
-// locationUpdateReject rejects an Invoke: in an END when it is all the
-// dialogue has, in a CONTINUE when a location update lives in it — even
-// in the BEGIN that opened it (Q.774 §3.2.2.2: a Reject does not end the
-// dialogue). It reports whether the dialogue ended.
+// locationUpdateReject rejects an Invoke of a location updating dialogue.
+// It reports whether the dialogue ended.
 func (h *Handler) locationUpdateReject(d *tcap.Dialogue, comp *tcap.Component, problem uint8) bool {
-	if !h.locationUpdate.LocationUpdateActive(d) {
+	return h.rejectInvoke(d, comp, problem, h.locationUpdate.LocationUpdateActive(d))
+}
+
+// rejectInvoke rejects an Invoke: in an END when it is all the dialogue
+// has, in a CONTINUE when live, a session served in the dialogue, lives in
+// it — even in the BEGIN that opened it (Q.774 §3.2.2.2: a Reject does not
+// end the dialogue). It reports whether the dialogue ended.
+func (h *Handler) rejectInvoke(d *tcap.Dialogue, comp *tcap.Component, problem uint8, live bool) bool {
+	if !live {
 		h.emitReject(d, comp, tcap.ProblemTypeInvoke, problem)
 		return true
 	}
@@ -149,7 +155,7 @@ func (h *Handler) locationUpdateReject(d *tcap.Dialogue, comp *tcap.Component, p
 		Components: []*tcap.Component{{Type: tcap.CompTypeReject, InvokeID: comp.InvokeID,
 			ProblemCode: &tcap.ProblemCode{Type: tcap.ProblemTypeInvoke, Code: problem}}},
 	}); err != nil {
-		h.logger.Warn("location update Reject not sent", zap.Uint32("tid", localTID(d)), zap.Error(err))
+		h.logger.Warn("Reject not sent", zap.Uint32("tid", localTID(d)), zap.Error(err))
 	}
 	return false
 }

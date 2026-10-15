@@ -362,7 +362,9 @@ func mobilitySeeds() [][]byte {
 	for _, f := range []string{goldenUpdateLocationArg, goldenProvideRoamingNumberArg, goldenInsertSubscriberDataArg,
 		"30 16 A1 03 04 01 21 A3 03 04 01 12 84 03 01 80 00 85 01 02 86 02 05 E0",
 		"A3 15 30 10 04 08 82 06 01 00 00 00 21 F3 04 04 01 02 03 04 0A 01 01",
-		"30 14 04 07 91 09 35 00 90 99 99 05 00 04 07 91 09 35 12 00 00 10"} {
+		"30 14 04 07 91 09 35 00 90 99 99 05 00 04 07 91 09 35 12 00 00 10",
+		goldenSAIArgVLR, goldenSAIArgMMESGSN, goldenSAIResTriplets, goldenSAIResQuintupletEPS, goldenPurgeMSArg,
+		"30 04 80 00 82 00"} {
 		var words []string
 		for _, line := range strings.Split(f, "\n") {
 			for _, w := range strings.Fields(line) {

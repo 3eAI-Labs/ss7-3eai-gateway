@@ -171,6 +171,8 @@ map:
   hlr_number: ""
   # hlr_answer_timeout: how long each decision of the application is waited
   # for (1s..10s); the VLR's timer for the whole location update is 15-30 s.
+  # The same bound applies to the AuC's answer on map.sai (sendAuthenticationInfo)
+  # and to the answer on map.purge (purgeMS).
   hlr_answer_timeout: 5s
   channel_buffer_size: 10000
   worker_pool_size: 16

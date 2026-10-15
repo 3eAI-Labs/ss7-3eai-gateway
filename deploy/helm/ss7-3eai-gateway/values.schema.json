@@ -29,7 +29,12 @@
       {
         "capability": "ss7-map-mobility",
         "subscribes": ["map.cl.request", "map.prn.request", "map.isd.request"],
-        "responds": ["map.cl.response", "map.prn.response", "map.isd.response", "map.ul"]
+        "responds": ["map.cl.response", "map.prn.response", "map.isd.response", "map.ul", "map.purge"]
+      },
+      {
+        "capability": "ss7-map-authentication",
+        "subscribes": [],
+        "responds": ["map.sai"]
       }
     ]
   },
@@ -336,7 +341,7 @@
             },
             "hlr_answer_timeout": {
               "$ref": "#/definitions/duration",
-              "description": "As HLR: how long each decision of the application on map.ul is waited for before the location update is refused with systemFailure (1s..10s; the gateway refuses other values at start-up)"
+              "description": "As HLR: how long each answer of the application on map.ul, map.sai and map.purge is waited for before the request is refused with systemFailure (purgeMS: aborted) (1s..10s; the gateway refuses other values at start-up)"
             },
             "ussd_routes": {
               "type": "array",

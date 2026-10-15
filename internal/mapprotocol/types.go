@@ -289,6 +289,10 @@ type Handler struct {
 	// (mobility_session.go); nil: they are refused.
 	locationUpdate LocationUpdateHandler
 
+	// hlrRequest serves authentication information retrieval and MS
+	// purging dialogues (authentication_session.go); nil: they are refused.
+	hlrRequest HLRRequestHandler
+
 	// Operation handlers
 	sendRoutingInfoForSMHandler SendRoutingInfoForSMHandler
 	mtForwardSMHandler          MtForwardSMHandler
@@ -361,9 +365,10 @@ type Config struct {
 	// from then on. Empty: the cluster GT, else the node's own GT.
 	HLRNumber string `yaml:"hlr_number" json:"hlr_number"`
 	// HLRAnswerTimeout is how long the gateway waits for the HLR
-	// application's answer to each turn of a location update before it
-	// refuses it with systemFailure. The VLR's timer for the whole location
-	// update is updateLocation's timer m, 15 to 30 s (TS 29.002 §17.1.2).
+	// application's answer to each turn of a location update, and to a
+	// sendAuthenticationInfo or purgeMS, before it refuses the request with
+	// systemFailure (purgeMS, which has none: aborts it). The VLR's timer
+	// for each is the operation's timer m, 15 to 30 s (TS 29.002 §17.1.2).
 	// 1 to 10 s, default 5 s.
 	HLRAnswerTimeout time.Duration `yaml:"hlr_answer_timeout" json:"hlr_answer_timeout"`
 
@@ -408,14 +413,16 @@ type Metrics struct {
 	Errors             atomic.Uint64
 
 	// Per-operation counters
-	UpdateLocationCount       atomic.Uint64
-	CancelLocationCount       atomic.Uint64
-	SendRoutingInfoCount      atomic.Uint64
-	ProvideRoamingNumberCount atomic.Uint64
-	AnyTimeInterrogationCount atomic.Uint64
-	SendRoutingInfoForSMCount atomic.Uint64
-	MtForwardSMCount          atomic.Uint64
-	MoForwardSMCount          atomic.Uint64
+	UpdateLocationCount         atomic.Uint64
+	CancelLocationCount         atomic.Uint64
+	SendRoutingInfoCount        atomic.Uint64
+	ProvideRoamingNumberCount   atomic.Uint64
+	AnyTimeInterrogationCount   atomic.Uint64
+	SendRoutingInfoForSMCount   atomic.Uint64
+	MtForwardSMCount            atomic.Uint64
+	MoForwardSMCount            atomic.Uint64
+	SendAuthenticationInfoCount atomic.Uint64
+	PurgeMSCount                atomic.Uint64
 
 	// Error counters
 	UnknownSubscriberErrors atomic.Uint64

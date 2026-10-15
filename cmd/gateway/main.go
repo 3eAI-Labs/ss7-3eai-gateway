@@ -117,9 +117,11 @@ type Handlers struct {
 	API      *api.Handler
 	Drain    *opstrigger.DrainState
 	// USSD holds the node's USSD sessions, LocationUpdates its location
-	// updates as HLR (nil until the NATS bridge is bound).
+	// updates as HLR, HLRRequests its authentication and purging requests
+	// (nil until the NATS bridge is bound).
 	USSD            *ussdSessions
 	LocationUpdates *locationUpdates
+	HLRRequests     *hlrRequests
 }
 
 func initLogger(level string) (*zap.Logger, error) {
@@ -209,8 +211,8 @@ func loadConfig(configFile string) (*viper.Viper, error) {
 // mapApplicationContexts are the MAP contexts a peer may open with the
 // gateway: the three short-message contexts; USSD (the HLR's
 // processUnstructuredSS-Request to the gateway as gsmSCF), which the gateway
-// also opens; location updating (a VLR's updateLocation to the gateway as
-// HLR). A BEGIN under any other context is refused by the dispatcher
+// also opens; location updating, authentication information retrieval and
+// MS purging (a VLR's or SGSN's requests to the gateway as HLR). A BEGIN under any other context is refused by the dispatcher
 // instead of reaching a handler that would answer systemFailure.
 var mapApplicationContexts = []tcap.ApplicationContext{
 	tcap.ACShortMsgGatewayV3,
@@ -218,6 +220,8 @@ var mapApplicationContexts = []tcap.ApplicationContext{
 	tcap.ACShortMsgMTRelayV3,
 	tcap.ACNetworkUnstructuredSsV2,
 	tcap.ACNetworkLocUpV3,
+	tcap.ACInfoRetrievalV3,
+	tcap.ACMSPurgingV3,
 }
 
 var capApplicationContexts = []tcap.ApplicationContext{tcap.ACCapV2, tcap.ACCapV3}
@@ -406,7 +410,7 @@ func initializeHandlers(cfg *viper.Viper, logger *zap.Logger) (*Handlers, error)
 	// goroutines could fire — NATS subscribeAll happens in NATS.Start
 	// downstream.
 	bridge := bindNATSBridge(handlers, mapCfg, sccpCfg, logger)
-	handlers.USSD, handlers.LocationUpdates = bridge.ussd, bridge.locationUpdates
+	handlers.USSD, handlers.LocationUpdates, handlers.HLRRequests = bridge.ussd, bridge.locationUpdates, bridge.hlrRequests
 
 	// ConfigStore will be initialized after NATS is started (in startServices)
 
@@ -636,13 +640,16 @@ func stopServices(ctx context.Context, handlers *Handlers, logger *zap.Logger) e
 	if err := handlers.API.Stop(ctx); err != nil {
 		logger.Error("Failed to stop API", zap.Error(err))
 	}
-	// Open USSD sessions and location updates are aborted while the stack
-	// can still send.
+	// Open USSD sessions, location updates and HLR requests are aborted
+	// while the stack can still send.
 	if handlers.USSD != nil {
 		handlers.USSD.close()
 	}
 	if handlers.LocationUpdates != nil {
 		handlers.LocationUpdates.close()
+	}
+	if handlers.HLRRequests != nil {
+		handlers.HLRRequests.close()
 	}
 	if err := handlers.TCAP.Stop(ctx); err != nil {
 		logger.Error("Failed to stop TCAP", zap.Error(err))

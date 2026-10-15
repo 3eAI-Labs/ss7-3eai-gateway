@@ -196,8 +196,37 @@ must be in `sccp.local_subsystems`.
   `locationCancellationContext-v3`, `roamingNumberEnquiryContext-v3` and
   `subscriberDataMngtContext-v3`, answered to SSN 6, every outcome on the response subject.
   A stand-alone insert must fit one message.
+- **Authentication information.** A VLR or SGSN opens `infoRetrievalContext-v3` with
+  sendAuthenticationInfo, addressed like updateLocation. The node holding the dialogue asks the
+  application (the AuC) on `map.sai`, as a NATS request: the number of vectors wanted, the
+  requesting node type and PLMN, and RAND and AUTS when the subscriber's card asks to
+  re-synchronise the sequence number (TS 33.102 §6.3.5). A request without a node type is
+  passed on without one: the HLR's process tells it from "vlr" (figure 25.5/6). The answer is
+  GSM triplets, UMTS quintuplets or EPS vectors, or one of the operation's errors; no vectors at
+  all is the empty result (§8.5.2.1). How many of each kind: an MME gets EPS vectors only, as
+  many as it asked for; a combined MME/SGSN that many of the kind for immediate use and its
+  additional number of the other; any other node triplets or quintuplets only. No answer in time, no
+  application, or an answer the gateway cannot carry out is systemFailure.
+- **Vectors in parts.** Five quintuplets do not fit one SCCP unitdata. TS 29.002 Annex C
+  recommends MAP segmentation for this result in version 3 (C.3.3) and does not allow
+  TC-Result-NL or the empty Continue for it; SCCP segmentation is "risky". So the gateway sends
+  as many vectors as fit, each part a complete ReturnResultLast, all but the last in a CONTINUE;
+  the VLR asks for the next part with another sendAuthenticationInfo without argument, within
+  timer m (30 s), or ends the dialogue when it has enough; if it rejects a part, the gateway
+  closes the dialogue at once (figure 25.5/6: a notice, then a close). The UE usage type goes in the first
+  part. A request with segmentationProhibited gets what fits one END, and the rest is dropped. The
+  VLR asks for each part at the calling address of the last, the node's own GT, so in a cluster
+  the dialogue stays on its node.
+- **MS purging.** A VLR or SGSN opens `msPurgingContext-v3` with purgeMS. The application, asked
+  on `map.purge`, marks the subscriber purged and says which temporary identities to freeze
+  (the TMSI when the purging VLR is the one registered, likewise the P-TMSI and M-TMSI). purgeMS
+  has no systemFailure: when there is no usable answer in time, the dialogue is aborted and the
+  VLR retries later.
+- **Key material.** The vectors are never logged, and errors about them name the field, not its
+  value.
 
-All four contexts are used in version 3 only. A VLR that opens `networkLocUpContext-v2` is
+All six contexts a VLR opens or the gateway opens towards one are used in version 3 only. A VLR
+that opens version 2 of `networkLocUpContext`, `infoRetrievalContext` or `msPurgingContext` is
 refused with an AARE proposing version 3.
 
 ## Message order

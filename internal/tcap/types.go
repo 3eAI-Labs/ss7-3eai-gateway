@@ -211,6 +211,17 @@ var (
 		OID:  []int{0, 4, 0, 0, 1, 0, 16, 3},
 		Name: "subscriberDataMngtContext-v3",
 	}
+	// Authentication and MS purging with the gateway as HLR, TS 29.002
+	// §17.3.2.15 and §17.3.2.27: a VLR or SGSN opens infoRetrieval
+	// (sendAuthenticationInfo) and msPurging (purgeMS). Version 3 only.
+	ACInfoRetrievalV3 = ApplicationContext{
+		OID:  []int{0, 4, 0, 0, 1, 0, 14, 3},
+		Name: "infoRetrievalContext-v3",
+	}
+	ACMSPurgingV3 = ApplicationContext{
+		OID:  []int{0, 4, 0, 0, 1, 0, 27, 3},
+		Name: "msPurgingContext-v3",
+	}
 	ACCapV2 = ApplicationContext{
 		OID:  []int{0, 4, 0, 0, 1, 0, 50, 1},
 		Name: "cap-ac-gsmSCF-gsmSSF-v2",

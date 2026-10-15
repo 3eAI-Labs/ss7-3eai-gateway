@@ -59,6 +59,8 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 		logger.Named("ussd"))
 	bridge.locationUpdates = newLocationUpdates(handlers.NATS.NodeID(), bridge.hlrNumber(), mapCfg,
 		handlers.TCAP, handlers.MAP, handlers.NATS, logger.Named("location-update"))
+	bridge.hlrRequests = newHLRRequests(handlers.NATS.NodeID(), mapCfg, handlers.TCAP, handlers.MAP, handlers.NATS,
+		logger.Named("hlr-request"))
 
 	handlers.NATS.OnSRIRequest(bridge.onSRIRequest)
 	handlers.NATS.OnMTSmsRequest(bridge.onMTSmsRequest)
@@ -79,6 +81,7 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 	handlers.TCAP.SetLostSink(func(d *tcap.Dialogue, reason tcap.FailureReason, detail string) {
 		bridge.ussd.lost(d, reason, detail)
 		bridge.locationUpdates.lost(d, reason, detail)
+		bridge.hlrRequests.lost(d, reason, detail)
 	})
 
 	// MO-Forward-SM (op 46) inbound: foreign MSC → our gateway. Bridge
@@ -89,6 +92,7 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 	handlers.MAP.SetMoForwardSMHandler(bridge)
 	handlers.MAP.SetUSSDSessionHandler(bridge.ussd)
 	handlers.MAP.SetLocationUpdateHandler(bridge.locationUpdates)
+	handlers.MAP.SetHLRRequestHandler(bridge.hlrRequests)
 
 	logger.Info("NATS bridge bound to MAP/TCAP",
 		zap.Strings("subjects", []string{
@@ -103,6 +107,8 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 			natsbridge.SubjectPRNRequest,
 			natsbridge.SubjectISDRequest,
 			natsbridge.SubjectLocationUpdate + " (requests out)",
+			natsbridge.SubjectAuthentication + " (requests out)",
+			natsbridge.SubjectPurge + " (requests out)",
 			natsbridge.SubjectCAPInitialDP,
 			natsbridge.SubjectINAPInitialDP,
 		}))
@@ -132,6 +138,9 @@ type natsBridge struct {
 	ussd        *ussdSessions
 	// locationUpdates are the location updates this node holds as HLR.
 	locationUpdates *locationUpdates
+	// hlrRequests are the authentication and purging requests this node
+	// answers as HLR.
+	hlrRequests *hlrRequests
 }
 
 // onSRIRequest: SMSC asks "where is MSISDN X registered?" → MAP SRI-for-SM.

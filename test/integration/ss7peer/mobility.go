@@ -93,8 +93,10 @@ func init() {
 // mobilityState is the peer's part for location management.
 type mobilityState struct {
 	dialogues sync.Map // peer TID → *luDialogue
-	count     atomic.Uint64
-	rr        atomic.Uint64 // round robin over the associations
+	// hlrRequests: authentication and purging requests (authentication.go).
+	hlrRequests sync.Map // peer TID → *hrDialogue
+	count       atomic.Uint64
+	rr          atomic.Uint64 // round robin over the associations
 	// gtConn: the association a GT was last seen on as calling address.
 	gtMu   sync.Mutex
 	gtConn map[string]*wire.Conn

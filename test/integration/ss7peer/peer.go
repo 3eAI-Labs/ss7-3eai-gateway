@@ -482,7 +482,8 @@ func (p *Peer) handleMTP3(conn *wire.Conn, pd *wire.ProtocolData) {
 		return
 	}
 	p.learnGT(conn, sccpMsg.CallingAddress)
-	if p.handleLocationUpdate(conn, pd, sccpMsg, tcapMsg) || p.handleUSSD(conn, pd, sccpMsg, tcapMsg) {
+	if p.handleLocationUpdate(conn, pd, sccpMsg, tcapMsg) || p.handleHLRRequest(conn, pd, sccpMsg, tcapMsg) ||
+		p.handleUSSD(conn, pd, sccpMsg, tcapMsg) {
 		return
 	}
 

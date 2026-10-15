@@ -6,6 +6,49 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.9] - 2026-10-15
+
+### Added
+
+- **Authentication and MS purging, as HLR** (TS 29.002 §8.5.2, §8.1.6), with client module
+  v0.6.0. The application is the AuC and the HLR's subscriber records; the gateway is their MAP
+  side.
+  - **SendAuthenticationInfo** (op 56) under `infoRetrievalContext-v3`, from a VLR or SGSN. The
+    node holding the dialogue asks the application on `map.sai`, as a NATS request, with the
+    number of vectors wanted, the requesting node type and PLMN, and the re-synchronisation data
+    (RAND, AUTS) when there is any. The application answers with GSM triplets, UMTS quintuplets
+    or EPS vectors (and the UE usage type when asked), or one of the operation's errors; no
+    vectors is the empty result. No answer within `map.hlr_answer_timeout`, no application
+    (refused at once) or an answer the gateway cannot carry out: systemFailure.
+  - **Vectors in parts.** Vectors that do not fit one message go in several results, as TS 29.002
+    Annex C.3.3 recommends for this operation: each a ReturnResultLast, all but the last in a
+    CONTINUE, the VLR asking for the next within timer m (30 s); a Reject of a part closes the
+    dialogue. Five UMTS quintuplets take three messages. A request with segmentationProhibited
+    gets what fits one END.
+  - Vector counts per kind (§8.5.2.1): an MME gets EPS vectors only; a combined MME/SGSN its
+    requested number of the kind for immediate use and its additional number of the other; any
+    other node triplets or quintuplets only. A missing requesting node type is passed on as
+    absent, not as "vlr".
+  - **PurgeMS** (op 67) under `msPurgingContext-v3`. The application, asked on `map.purge`, marks
+    the subscriber purged and says which of TMSI, P-TMSI and M-TMSI to freeze, or refuses with
+    one of the operation's errors. purgeMS has no systemFailure: without a usable answer in time
+    the dialogue is aborted.
+  - Vectors are never logged. NATS permissions for `map.sai` and `map.purge` are described in the
+    README (Access).
+  - Codecs checked against frames built by hand from the ASN.1, mutation-checked; the decoders of
+    peer input are fuzzed. The strict peer plays the VLR, checking the AARE, that every part is a
+    ReturnResultLast of the request it answers, no more vectors than asked for, and the
+    operations' errors. A three-node cluster test shows each request in parts stays on its node.
+- Chart: capability `ss7-map-authentication` (responds `map.sai`); `ss7-map-mobility` also
+  responds `map.purge`.
+
+### Changed
+
+- A Reject of a second Invoke in the BEGIN of a dialogue the gateway answers is placed by one
+  rule for location updates and the new requests: in a CONTINUE when the dialogue has a request
+  alive, in an END otherwise. In the new dialogues, an Invoke in the peer's END and components
+  after the gateway's own END are dropped, not answered.
+
 ## [0.7.8] - 2026-10-15
 
 ### Added

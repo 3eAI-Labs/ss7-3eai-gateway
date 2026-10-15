@@ -249,7 +249,7 @@ config:
     ussd_session_timeout: 180s # USSD: longest wait for the subscriber or the application (1m..10m)
     ussd_routes: []            # USSD: [{prefix: "*123", route: balance}] → map.ussd.event.<route>
     hlr_number: ""             # as HLR: the number in updateLocation's result; empty = cluster GT, else own GT
-    hlr_answer_timeout: 5s     # as HLR: wait for each decision of the application on map.ul (1s..10s)
+    hlr_answer_timeout: 5s     # as HLR: wait for each answer of the application on map.ul, map.sai, map.purge (1s..10s)
     channel_buffer_size: 10000
     worker_pool_size: 16
     operation_timeout: 10s

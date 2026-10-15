@@ -19,7 +19,8 @@ signalling gateway (SG) or STP.
   map.*.response     ◄───────│                              │             └──────────┘
   map.mo.sms         ◄───────│                              │
   map.ussd.event.<route> ◄───│                              │
-  map.ul (request) ◄────────►└──────────────────────────────┘
+  map.ul (request) ◄────────►│                              │
+  map.sai, map.purge ◄──────►└──────────────────────────────┘
 ```
 
 Written in Go. Licensed under the [GNU AGPL v3.0](LICENSE) (only); the
@@ -50,6 +51,8 @@ real SS7 networks.
 | CancelLocation (op 3) | gateway (as HLR) → VLR | `map.cl.request` → `map.cl.response` | locationCancellationContext-v3 |
 | ProvideRoamingNumber (op 4) | gateway (as HLR) → VLR | `map.prn.request` → `map.prn.response` | roamingNumberEnquiryContext-v3 |
 | InsertSubscriberData (op 7), alone | gateway (as HLR) → VLR | `map.isd.request` → `map.isd.response` | subscriberDataMngtContext-v3 |
+| SendAuthenticationInfo (op 56) | VLR or SGSN → gateway (as HLR) | request on `map.sai`, answered by the application | infoRetrievalContext-v3 |
+| PurgeMS (op 67) | VLR or SGSN → gateway (as HLR) | request on `map.purge`, answered by the application | msPurgingContext-v3 |
 
 - **Every outcome is answered.** The response subject carries the result, or a failure:
   `REMOTE_ERROR` with the MAP error code (e.g. `absentSubscriberSM` vs `unknownSubscriber`, which
@@ -76,6 +79,13 @@ real SS7 networks.
   subscription, network access mode, access restriction. A profile too long for one message is
   sent in several insertSubscriberData. The application can also cancel a registration, ask a
   VLR for a roaming number, and send changed data.
+- **Authentication and purging, as HLR.** A VLR's or SGSN's request for authentication vectors
+  reaches the application, the AuC, on `map.sai`, with the re-synchronisation data when the
+  subscriber's card found the sequence number out of range; it answers with GSM triplets, UMTS
+  quintuplets or EPS vectors, or an error. Vectors that do not fit one message are sent in parts,
+  the VLR asking for each next one (TS 29.002 Annex C.3.3), unless it prohibits segmentation. A
+  VLR's PurgeMS reaches the application on `map.purge`, which marks the subscriber purged and
+  says which temporary identities to freeze.
 - **Signalling transport.** M3UA ASP over SCTP (optionally multi-homed), with override or
   loadshare traffic mode. Each message carries its own MTP3 routing label. A lost association is
   re-established automatically, including when the SG is not reachable at start-up.
@@ -108,10 +118,11 @@ What is planned for each of these is in the [roadmap](docs/ROADMAP.md).
   (unrecognizedOperation). The gateway only asks AnyTimeInterrogation, ProvideSubscriberInfo,
   SendRoutingInfo, CancelLocation, ProvideRoamingNumber and stand-alone InsertSubscriberData:
   peers cannot open those contexts with it.
-- As HLR, the gateway does not serve SendAuthenticationInfo, so a VLR that needs authentication
-  vectors for a subscriber must get them elsewhere; nor PurgeMS, RestoreData, SendIdentification,
-  DeleteSubscriberData or ActivateTraceMode. Location updating is version 3 only (a VLR opening
-  version 2 is refused with an AARE proposing 3). Subscriber data carries no CUG, eMLPP, VBS/VGCS,
+- As HLR, the gateway does not serve RestoreData, SendIdentification, DeleteSubscriberData,
+  ActivateTraceMode, AuthenticationFailureReport or the GPRS location update. Location updating,
+  authentication information retrieval and MS purging are version 3 only (a VLR opening version 2
+  is refused with an AARE proposing 3). A purgeMS's last known location is not passed on, and
+  unknownSubscriber is sent without its diagnostic (e.g. GPRS subscription unknown). Subscriber data carries no CUG, eMLPP, VBS/VGCS,
   CAMEL subscription (O-CSI and the other CSIs), GPRS, EPS or LCS data; CAMEL subscription data is
   planned with CAP. A stand-alone InsertSubscriberData must fit one message.
 - SendRoutingInfo is a basic call interrogation from a GMSC that does not offer CAMEL, OR, CUG,
@@ -151,6 +162,10 @@ roaming partner?) is the application's decision, made from the `update_location`
 updates are NATS requests: the gateway needs to subscribe to its reply inboxes (`_INBOX.>`), and
 the HLR application needs permission to publish its replies (`allow_responses`). Only the gateway
 may publish on `map.ul`: a forged turn there would be answered with the subscriber's profile.
+`map.sai` carries authentication vectors, which are key material (Kc, CK, IK, KASME): only the
+gateway may publish on it and only the AuC subscribe to it, and NATS should run with TLS. The
+gateway does not log vectors. Only the gateway may publish on `map.purge`: a forged request
+would mark a subscriber purged, making them unreachable for calls and short messages.
 
 **Management plane:**
 - **Not implemented on the message path:** the SS7 firewall (`internal/firewall`) and transaction
