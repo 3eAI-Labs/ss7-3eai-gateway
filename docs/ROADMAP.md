@@ -46,6 +46,7 @@ An area counts as delivered only with all of these:
 | 0.7.7 | USSD | processUnstructuredSS-Request (op 59), unstructuredSS-Request (60), unstructuredSS-Notify (61) | released |
 | 0.7.8 | Mobility and subscriber data | As HLR, its location management an application: UpdateLocation (2) with InsertSubscriberData (7) in its dialogue, CancelLocation (3), ProvideRoamingNumber (4), stand-alone InsertSubscriberData (7). Fixes the calling address of answers to dialogues peers open, in a cluster | released |
 | 0.7.9 | Authentication | As HLR: SendAuthenticationInfo (56), the vectors from the application (the AuC), in parts by MAP segmentation when they do not fit one message (TS 29.002 Annex C.3.3); PurgeMS (67) | released |
+| 0.7.10 | Interoperability and robustness fixes | Every BER length form accepted on receipt (indefinite, non-minimal); a message the SCCP layer cannot take ends its dialogue and is reported instead of being dropped silently; roamingNotAllowed with its mandatory parameter, and error causes (unknownSubscriber diagnostic, roaming cause) from the application; USSD proven in a cluster | released |
 
 ## 0.8.x — CAP
 

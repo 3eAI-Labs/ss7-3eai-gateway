@@ -39,7 +39,7 @@ import (
 type hrMAP interface {
 	AuthenticationInfoMessage(d *tcap.Dialogue, invokeID int32, param []byte, more bool) *tcap.Message
 	Send(d *tcap.Dialogue, msg *tcap.Message) error
-	HLRRequestRefuse(d *tcap.Dialogue, invokeID int32, code mapprotocol.ErrorCode) error
+	HLRRequestRefuse(d *tcap.Dialogue, invokeID int32, e mapprotocol.UserError) error
 	PurgeMSAccept(d *tcap.Dialogue, invokeID int32, res *mapprotocol.PurgeMSRes) error
 	Close(d *tcap.Dialogue) error
 	Abort(d *tcap.Dialogue) error
@@ -120,11 +120,11 @@ func (m *hlrRequests) removeLocked(r *hlrRequest) {
 }
 
 // refuseLocked ends r with its operation's error.
-func (m *hlrRequests) refuseLocked(r *hlrRequest, code mapprotocol.ErrorCode, why string) {
+func (m *hlrRequests) refuseLocked(r *hlrRequest, e mapprotocol.UserError, why string) {
 	m.removeLocked(r)
 	m.logger.Info(r.what()+" refused", zap.String("dialogue_id", r.id), zap.String("imsi", r.imsi),
-		zap.Stringer("error", code), zap.String("why", why))
-	if err := m.mapH.HLRRequestRefuse(r.d, r.invokeID, code); err != nil {
+		zap.Stringer("error", e.Code), zap.Stringer("cause", e.Cause), zap.String("why", why))
+	if err := m.mapH.HLRRequestRefuse(r.d, r.invokeID, e); err != nil {
 		m.logger.Warn(r.what()+" refusal not sent", zap.String("dialogue_id", r.id), zap.Error(err))
 	}
 }
@@ -133,7 +133,7 @@ func (m *hlrRequests) refuseLocked(r *hlrRequest, code mapprotocol.ErrorCode, wh
 // with systemFailure; purgeMS, which has no such error, with an abort.
 func (m *hlrRequests) failLocked(r *hlrRequest, why string) {
 	if r.auth != nil {
-		m.refuseLocked(r, mapprotocol.ErrSystemFailure, why)
+		m.refuseLocked(r, mapprotocol.UserError{Code: mapprotocol.ErrSystemFailure}, why)
 		return
 	}
 	m.abortLocked(r, why)
@@ -190,17 +190,20 @@ func (m *hlrRequests) answerAuthenticationLocked(r *hlrRequest, a *ss7client.Aut
 		m.failLocked(r, "the HLR application's answer has no authentication")
 		return
 	}
-	if a.Error != 0 {
-		code := mapprotocol.ErrorCode(a.Error)
-		if !mapprotocol.SendAuthenticationInfoErrors[code] {
-			m.failLocked(r, fmt.Sprintf("the HLR application's error %d is not one sendAuthenticationInfo allows", a.Error))
+	if a.Error != 0 || a.ErrorCause != "" {
+		e, err := userError(a.Error, a.ErrorCause)
+		if err == nil && !mapprotocol.SendAuthenticationInfoErrors[e.Code] {
+			err = fmt.Errorf("error %d is not one sendAuthenticationInfo allows", a.Error)
+		}
+		if err != nil {
+			m.failLocked(r, "the HLR application's "+err.Error())
 			return
 		}
 		why := "the HLR application refused it"
 		if a.Detail != "" {
 			why += ": " + a.Detail
 		}
-		m.refuseLocked(r, code, why)
+		m.refuseLocked(r, e, why)
 		return
 	}
 	res, err := authenticationResMAP(a)
@@ -330,17 +333,20 @@ func (m *hlrRequests) answerPurgeLocked(r *hlrRequest, p *ss7client.Purge) {
 	switch {
 	case p == nil:
 		m.failLocked(r, "the HLR application's answer has no purge")
-	case p.Error != 0:
-		code := mapprotocol.ErrorCode(p.Error)
-		if !mapprotocol.PurgeMSErrors[code] {
-			m.failLocked(r, fmt.Sprintf("the HLR application's error %d is not one purgeMS allows", p.Error))
+	case p.Error != 0 || p.ErrorCause != "":
+		e, err := userError(p.Error, p.ErrorCause)
+		if err == nil && !mapprotocol.PurgeMSErrors[e.Code] {
+			err = fmt.Errorf("error %d is not one purgeMS allows", p.Error)
+		}
+		if err != nil {
+			m.failLocked(r, "the HLR application's "+err.Error())
 			return
 		}
 		why := "the HLR application refused it"
 		if p.Detail != "" {
 			why += ": " + p.Detail
 		}
-		m.refuseLocked(r, code, why)
+		m.refuseLocked(r, e, why)
 	default:
 		m.removeLocked(r)
 		res := &mapprotocol.PurgeMSRes{FreezeTMSI: p.FreezeTMSI, FreezePTMSI: p.FreezePTMSI, FreezeMTMSI: p.FreezeMTMSI}
@@ -478,6 +484,31 @@ func (m *hlrRequests) close() {
 }
 
 // --- wire mapping --------------------------------------------------------------
+
+// errorCauses maps the wire's error causes to MAP's.
+var errorCauses = map[string]mapprotocol.ErrorCause{
+	"":                         mapprotocol.CauseNone,
+	ss7client.CauseIMSIUnknown: mapprotocol.CauseIMSIUnknown,
+	ss7client.CauseGPRSEPSSubscriptionUnknown:  mapprotocol.CauseGPRSEPSSubscriptionUnknown,
+	ss7client.CausePLMNRoamingNotAllowed:       mapprotocol.CausePLMNRoamingNotAllowed,
+	ss7client.CauseOperatorDeterminedBarring:   mapprotocol.CauseOperatorDeterminedBarring,
+	ss7client.CauseSupportedRATTypesNotAllowed: mapprotocol.CauseSupportedRATTypesNotAllowed,
+}
+
+// userError is an application's error and the cause qualifying it, as the
+// MAP error to send; an error when the cause is unknown or does not
+// qualify that error.
+func userError(code int32, cause string) (mapprotocol.UserError, error) {
+	c, ok := errorCauses[cause]
+	if !ok {
+		return mapprotocol.UserError{}, fmt.Errorf("error cause %q is unknown", cause)
+	}
+	e := mapprotocol.UserError{Code: mapprotocol.ErrorCode(code), Cause: c}
+	if _, err := e.Parameter(); err != nil {
+		return mapprotocol.UserError{}, fmt.Errorf("error cause %q does not qualify error %d", cause, code)
+	}
+	return e, nil
+}
 
 // authenticationWire is what a sendAuthenticationInfo carries, for the
 // application.

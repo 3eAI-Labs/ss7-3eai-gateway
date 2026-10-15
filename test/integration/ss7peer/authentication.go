@@ -36,6 +36,8 @@ type HLRRequestOutcome struct {
 	Parts []*mapprotocol.SendAuthenticationInfoRes
 	Purge *mapprotocol.PurgeMSRes
 	Error mapprotocol.ErrorCode
+	// ErrorCause: what the error's parameter qualifies it with.
+	ErrorCause mapprotocol.ErrorCause
 	// Reject: the problem code of a Reject of the request.
 	Reject  *uint8
 	Aborted bool
@@ -247,7 +249,11 @@ func (p *Peer) hrComponent(d *hrDialogue, msg *tcap.Message, c *tcap.Component) 
 		if !allowed[code] {
 			p.violate("%s answered with %s, not one of its errors", d.name, code)
 		}
-		d.out.Error = code
+		cause, err := mapprotocol.DecodeUserErrorCause(code, c.Parameter)
+		if err != nil {
+			p.violate("%s: %s with %v", d.name, code, err)
+		}
+		d.out.Error, d.out.ErrorCause = code, cause
 	case tcap.CompTypeReject:
 		if c.ProblemCode != nil {
 			d.out.Reject = &c.ProblemCode.Code

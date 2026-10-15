@@ -82,8 +82,12 @@ func (n *luNet) UpdateLocationAccept(_ *tcap.Dialogue, id int32, hlr mapprotocol
 	n.record(fmt.Sprintf("accept id=%d %s", id, hlr.Digits))
 	return nil
 }
-func (n *luNet) UpdateLocationRefuse(_ *tcap.Dialogue, id int32, code mapprotocol.ErrorCode) error {
-	n.record(fmt.Sprintf("refuse id=%d %d", id, code))
+func (n *luNet) UpdateLocationRefuse(_ *tcap.Dialogue, id int32, e mapprotocol.UserError) error {
+	if e.Cause != mapprotocol.CauseNone {
+		n.record(fmt.Sprintf("refuse id=%d %d %s", id, e.Code, e.Cause))
+		return nil
+	}
+	n.record(fmt.Sprintf("refuse id=%d %d", id, e.Code))
 	return nil
 }
 func (n *luNet) LocationUpdateAbort(*tcap.Dialogue) error { n.record("abort"); return nil }
@@ -260,6 +264,14 @@ func TestLocationUpdate_Refusals(t *testing.T) {
 	}{
 		"roamingNotAllowed": {func(turn *luTurn) { turn.reply(ss7client.ULReject, nil, ss7client.MAPErrRoamingNotAllowed) },
 			"refuse id=5 8", ""},
+		"roamingNotAllowed, ODB": {func(turn *luTurn) {
+			turn.answer <- luReply{msg: &natsbridge.NatsMessage{LocationUpdate: &ss7client.LocationUpdate{Action: ss7client.ULReject,
+				Error: ss7client.MAPErrRoamingNotAllowed, ErrorCause: ss7client.CauseOperatorDeterminedBarring}}}
+		}, "refuse id=5 8 operatorDeterminedBarring", ""},
+		"a cause of another error": {func(turn *luTurn) {
+			turn.answer <- luReply{msg: &natsbridge.NatsMessage{LocationUpdate: &ss7client.LocationUpdate{Action: ss7client.ULReject,
+				Error: ss7client.MAPErrRoamingNotAllowed, ErrorCause: ss7client.CauseIMSIUnknown}}}
+		}, "refuse id=5 34", ss7client.StatusRejected},
 		"an error updateLocation does not allow": {func(turn *luTurn) { turn.reply(ss7client.ULReject, nil, ss7client.MAPErrCallBarred) },
 			"refuse id=5 34", ss7client.StatusRejected},
 		"an unknown action": {func(turn *luTurn) { turn.reply("release", nil, 0) }, "refuse id=5 34", ss7client.StatusRejected},

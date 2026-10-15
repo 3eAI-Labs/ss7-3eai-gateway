@@ -41,6 +41,9 @@ type USSDInvoke struct {
 	// Open is the gateway's MAP-OpenInfo, with the BEGIN that opened a
 	// network-initiated session (nil after).
 	Open *mapprotocol.MAPOpenInfo
+	// GatewayAddress is the calling GT of the gateway's message with the
+	// invoke: where the peer's answer goes.
+	GatewayAddress string
 }
 
 // USSDReply is how the peer answers an invoke.
@@ -130,7 +133,7 @@ func (p *Peer) ussdBegin(conn *wire.Conn, pd *wire.ProtocolData, sccpMsg *sccp.S
 	}
 	open := p.checkOpenInfo(msg.DialoguePortion)
 	d := &ussdDialogue{
-		peerTID: p.originateTID.Add(1), gwTID: msg.OriginatingTID, conn: conn, pd: pd, sccpReq: sccpMsg,
+		peerTID: p.originateTID.Add(1), gwTID: msg.OriginatingTID, conn: p.connFor(sccpMsg.CallingAddress), pd: pd, sccpReq: sccpMsg,
 		aarePending: aareFor(msg), open: open, outstanding: map[int32]mapprotocol.OperationCode{},
 	}
 	p.ussdDialogues.Store(d.peerTID, d)
@@ -167,7 +170,9 @@ func (p *Peer) checkOpenInfo(dp *tcap.DialoguePortion) *mapprotocol.MAPOpenInfo 
 func (p *Peer) ussdContinue(d *ussdDialogue, conn *wire.Conn, pd *wire.ProtocolData, sccpMsg *sccp.SccpMessage, msg *tcap.Message) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.conn, d.pd, d.sccpReq = conn, pd, sccpMsg
+	// The answer goes where the SG routes the gateway's calling GT: a
+	// node's own GT back to that node, the cluster GT to any node.
+	d.conn, d.pd, d.sccpReq = p.connFor(sccpMsg.CallingAddress), pd, sccpMsg
 	if msg.MessageType == tcap.MsgTypeContinue {
 		switch {
 		case d.gwTID == nil:
@@ -271,7 +276,7 @@ func (p *Peer) ussdInvoke(d *ussdDialogue, msg *tcap.Message, c *tcap.Component)
 	if arg.MSISDN != nil {
 		p.violate("USSD-Arg from the gsmSCF carries an msisdn (TS 29.002 §11.10.2)")
 	}
-	inv := &USSDInvoke{Session: d.peerTID, Op: op, InvokeID: id, Arg: arg}
+	inv := &USSDInvoke{Session: d.peerTID, Op: op, InvokeID: id, Arg: arg, GatewayAddress: gtDigits(d.sccpReq.CallingAddress)}
 	if msg.MessageType == tcap.MsgTypeBegin {
 		inv.Open = d.open
 	}
@@ -333,8 +338,7 @@ func (p *Peer) sendUSSD(d *ussdDialogue, msg *tcap.Message) {
 // by IMSI and the HLR. msisdn, when set, goes in the USSD-Arg. It returns
 // the session (the peer's TID).
 func (p *Peer) StartUSSD(dialled, imsi, msisdn, gatewayGT string) (uint32, error) {
-	conns := p.AcceptedConns()
-	if len(conns) == 0 {
+	if len(p.AcceptedConns()) == 0 {
 		return 0, errors.New("ss7peer: no association")
 	}
 	dcs, str, err := mapprotocol.EncodeUSSDText(dialled)
@@ -364,7 +368,7 @@ func (p *Peer) StartUSSD(dialled, imsi, msisdn, gatewayGT string) (uint32, error
 	// The addresses of a message "from the gateway", so that the replies
 	// sendTCAP builds by swapping them go to the gateway.
 	d := &ussdDialogue{
-		peerTID: p.originateTID.Add(1), mo: true, begin: 1, conn: conns[0],
+		peerTID: p.originateTID.Add(1), mo: true, begin: 1,
 		pd: &wire.ProtocolData{OPC: p.cfg.GatewayPointCode, SI: siSCCP, NI: p.cfg.NetworkIndicator, SLS: 5},
 		sccpReq: &sccp.SccpMessage{
 			ProtocolClass:  sccp.ClassBasicConnectionless,
@@ -373,6 +377,7 @@ func (p *Peer) StartUSSD(dialled, imsi, msisdn, gatewayGT string) (uint32, error
 		},
 		outstanding: map[int32]mapprotocol.OperationCode{},
 	}
+	d.conn = p.connFor(d.sccpReq.CallingAddress) // the SG's choice for gatewayGT
 	p.ussdCount.Add(1)
 	p.ussdDialogues.Store(d.peerTID, d)
 	d.mu.Lock()

@@ -269,6 +269,8 @@ type Handler struct {
 	// ReturnResult / ReturnError responses onto for TCAP delivery.
 	// Installed via SetTCAPOutbound after both handlers are constructed.
 	tcapOutbound chan<- *tcap.Message
+	// notSent is told of a dialogue whose message tcapOutbound could not take.
+	notSent func(d *tcap.Dialogue, reason string)
 
 	// responseSink delivers decoded inbound ReturnResult components to the
 	// composition root (cmd/gateway), which republishes them on NATS using

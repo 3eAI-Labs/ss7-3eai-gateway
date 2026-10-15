@@ -414,6 +414,15 @@ func (h *Handler) send(dialogue *tcap.Dialogue, msg *tcap.Message) {
 		h.metrics.Errors.Add(1)
 		h.logger.Warn("MAP outbound channel full — response dropped",
 			zap.Uint32("tid", localTID(dialogue)))
+		h.reportNotSent(dialogue, "not sent: MAP outbound channel full")
+	}
+}
+
+// reportNotSent tells the not-sent sink of dialogue, whose message the
+// outbound channel could not take.
+func (h *Handler) reportNotSent(dialogue *tcap.Dialogue, reason string) {
+	if h.notSent != nil && dialogue != nil {
+		h.notSent(dialogue, reason)
 	}
 }
 

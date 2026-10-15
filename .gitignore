@@ -72,3 +72,6 @@ grafana_data/
 
 # Build output of `go build ./cmd/gateway` at the repository root
 /gateway
+
+# The binary `go build ./cmd/gateway` writes at the repository root
+/gateway

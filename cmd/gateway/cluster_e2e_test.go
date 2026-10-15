@@ -489,6 +489,7 @@ type clusterNodeSpec struct {
 	nodeIDNumeric int
 	nodeID        string
 	localGT       string
+	configure     func(*viper.Viper) // more configuration; nil none
 }
 
 // clusterNode bundles a running gateway's handlers with the lifecycle
@@ -717,6 +718,9 @@ func buildClusterE2EConfig(
 	v.Set("api.default_admin_user", "admin")
 	v.Set("api.default_admin_password", "e2e-test-admin-password")
 
+	if spec.configure != nil {
+		spec.configure(v)
+	}
 	return v
 }
 

@@ -403,3 +403,24 @@ func TestFits_CountsTheFirstAnswersAARE(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, fits)
 }
+
+// An empty Begin whose continuation never comes is reaped by its timer, and
+// its slot is free again: otherwise MaxDialogues/10 silent peers would have
+// every later empty Begin refused until a restart.
+func TestEmptyBegin_TimeoutFreesTheSlot(t *testing.T) {
+	h, in, out, _ := startHandshakeHandler(t) // MaxDialogues 10: one slot
+	for i, otid := range []uint32{0x01010101, 0x02020202, 0x03030303} {
+		in <- emptyBeginFrom(t, otid)
+		require.Equal(t, MsgTypeContinue, nextSent(t, out).MessageType, "empty Begin %d accepted", i+1)
+		require.Equal(t, int64(1), h.pendingEmptyBegins.Load())
+		h.dialoguesMu.RLock()
+		var tid uint32
+		for k := range h.dialogues {
+			tid = k
+		}
+		h.dialoguesMu.RUnlock()
+		h.handleDialogueTimeout(tid) // the continuation never came
+		nextSent(t, out)             // its ABORT
+		assert.Equal(t, int64(0), h.pendingEmptyBegins.Load(), "the timer frees the slot")
+	}
+}

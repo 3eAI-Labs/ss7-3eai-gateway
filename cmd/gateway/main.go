@@ -380,6 +380,10 @@ func initializeHandlers(cfg *viper.Viper, logger *zap.Logger) (*Handlers, error)
 	// (Slice C wired the channel; this slice activates it).
 	mapHandler.SetTCAPOutbound(tcapHandler.ApplicationOutbound())
 	capHandler.SetTCAPOutbound(tcapHandler.ApplicationOutbound())
+	// A message the channel cannot take ends its dialogue, reported, rather
+	// than vanishing with the dialogue left open until its timer.
+	mapHandler.SetNotSentSink(tcapHandler.DialogueNotSent)
+	capHandler.SetNotSentSink(tcapHandler.DialogueNotSent)
 
 	// Initialize NATS Bridge — must exist before bindNATSBridge so the
 	// inbound callbacks have a Handler to register against (handlers.NATS

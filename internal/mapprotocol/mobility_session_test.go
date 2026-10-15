@@ -151,9 +151,11 @@ func TestLocationUpdateSenders(t *testing.T) {
 	assert.Equal(t, int32(2), *c.OperationCode)
 	assert.Equal(t, []byte{0x30, 0x09, 0x04, 0x07, 0x91, 0x09, 0x35, 0x90, 0x99, 0x99, 0x99}, c.Parameter)
 
-	require.NoError(t, h.UpdateLocationRefuse(d, 5, mapprotocol.ErrRoamingNotAllowed))
-	assert.Equal(t, int32(8), *(<-out).Components[0].ErrorCode)
-	assert.Error(t, h.UpdateLocationRefuse(d, 5, mapprotocol.ErrCallBarred), "callBarred is not one of updateLocation's errors")
+	require.NoError(t, h.UpdateLocationRefuse(d, 5, mapprotocol.UserError{Code: mapprotocol.ErrRoamingNotAllowed}))
+	refusal := (<-out).Components[0]
+	assert.Equal(t, int32(8), *refusal.ErrorCode)
+	assert.Equal(t, []byte{0x30, 0x03, 0x0A, 0x01, 0x00}, refusal.Parameter, "roamingNotAllowed's parameter is mandatory: PLMN not allowed by default")
+	assert.Error(t, h.UpdateLocationRefuse(d, 5, mapprotocol.UserError{Code: mapprotocol.ErrCallBarred}), "callBarred is not one of updateLocation's errors")
 
 	require.NoError(t, h.LocationUpdateAbort(d))
 	assert.Equal(t, tcap.MsgTypeAbort, (<-out).MessageType)

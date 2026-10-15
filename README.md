@@ -121,8 +121,7 @@ What is planned for each of these is in the [roadmap](docs/ROADMAP.md).
 - As HLR, the gateway does not serve RestoreData, SendIdentification, DeleteSubscriberData,
   ActivateTraceMode, AuthenticationFailureReport or the GPRS location update. Location updating,
   authentication information retrieval and MS purging are version 3 only (a VLR opening version 2
-  is refused with an AARE proposing 3). A purgeMS's last known location is not passed on, and
-  unknownSubscriber is sent without its diagnostic (e.g. GPRS subscription unknown). Subscriber data carries no CUG, eMLPP, VBS/VGCS,
+  is refused with an AARE proposing 3). A purgeMS's last known location is not passed on. Subscriber data carries no CUG, eMLPP, VBS/VGCS,
   CAMEL subscription (O-CSI and the other CSIs), GPRS, EPS or LCS data; CAMEL subscription data is
   planned with CAP. A stand-alone InsertSubscriberData must fit one message.
 - SendRoutingInfo is a basic call interrogation from a GMSC that does not offer CAMEL, OR, CUG,

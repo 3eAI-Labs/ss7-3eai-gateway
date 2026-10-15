@@ -64,6 +64,16 @@ func (h *Handler) SetTCAPOutbound(ch chan<- *tcap.Message) {
 	h.tcapOutbound = ch
 }
 
+// SetNotSentSink installs the callback told of a dialogue one of whose
+// messages could not be put on the outbound channel (it was full):
+// typically tcapHandler.DialogueNotSent, which ends the dialogue and tells
+// who waits on it, instead of the message vanishing with the dialogue left
+// open until its timer. It is called under the caller's locks, so it must
+// not block or take them.
+func (h *Handler) SetNotSentSink(sink func(d *tcap.Dialogue, reason string)) {
+	h.notSent = sink
+}
+
 // Start is a no-op kept for lifecycle symmetry with peer protocol handlers.
 // CAP runs synchronously inside the TCAP dispatcher's goroutine — there are
 // no worker pools to spin up.

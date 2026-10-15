@@ -50,9 +50,16 @@ type authHarness struct {
 func startAuthenticationE2E(t *testing.T, auth func(*ss7client.AuthenticationRequest) ss7client.AuthenticationAnswer,
 	purge func(*ss7client.PurgeRequest) ss7client.PurgeAnswer) *authHarness {
 	t.Helper()
+	return startAuthenticationE2EWith(t, func(*ss7peer.Config) {}, auth, purge)
+}
+
+func startAuthenticationE2EWith(t *testing.T, configure func(*ss7peer.Config),
+	auth func(*ss7client.AuthenticationRequest) ss7client.AuthenticationAnswer,
+	purge func(*ss7client.PurgeRequest) ss7client.PurgeAnswer) *authHarness {
+	t.Helper()
 	h := &authHarness{requests: make(chan *ss7client.AuthenticationRequest, 16), purges: make(chan *ss7client.PurgeRequest, 16)}
 	var client *ss7client.Client
-	h.peer, client = startInterrogationE2E(t, func(*ss7peer.Config) {}, mobilityGateway)
+	h.peer, client = startInterrogationE2E(t, configure, mobilityGateway)
 	if auth != nil {
 		sub, err := client.ServeAuthentication("auc", func(_ context.Context, r *ss7client.AuthenticationRequest) ss7client.AuthenticationAnswer {
 			h.requests <- r
@@ -208,6 +215,44 @@ func TestE2E_PurgeMS(t *testing.T) {
 	out, err = h.peer.PurgeMS(requestCtx(t), e2eVLRNumber, &mapprotocol.PurgeMSArg{IMSI: e2eTestIMSI, VLRNumber: &vlr})
 	require.NoError(t, err)
 	assert.True(t, out.Aborted)
+}
+
+// TestE2E_IndefiniteLengths: a VLR whose every constructed element — TCAP
+// message, dialogue portion, component, operation argument — has the
+// indefinite length (Q.773 §4.1.2.3) gets its vectors in parts and its
+// purge answered as one with definite lengths does.
+func TestE2E_IndefiniteLengths(t *testing.T) {
+	h := startAuthenticationE2EWith(t, func(c *ss7peer.Config) { c.IndefiniteLengths = true },
+		func(*ss7client.AuthenticationRequest) ss7client.AuthenticationAnswer {
+			return ss7client.AuthenticationAnswer{Quintuplets: []ss7client.AuthenticationQuintuplet{
+				e2eQuintuplet(1), e2eQuintuplet(2), e2eQuintuplet(3), e2eQuintuplet(4), e2eQuintuplet(5)}}
+		},
+		func(*ss7client.PurgeRequest) ss7client.PurgeAnswer { return ss7client.PurgeAnswer{FreezePTMSI: true} })
+
+	node := mapprotocol.NodeVLR
+	arg := e2eSAIArg(5)
+	arg.RequestingNodeType = &node
+	out, err := h.peer.SendAuthenticationInfo(requestCtx(t), e2eVLRNumber, arg, 0)
+	require.NoError(t, err)
+	r := next(t, h.requests)
+	assert.Equal(t, e2eTestIMSI, r.IMSI)
+	assert.Equal(t, ss7client.NodeVLR, r.Request.RequestingNodeType)
+	require.False(t, out.Aborted)
+	require.Greater(t, len(out.Parts), 1, "the next parts are asked for in CONTINUEs of indefinite length")
+	var got []byte
+	for _, p := range out.Parts {
+		for _, q := range p.Quintuplets {
+			got = append(got, q.RAND[0])
+		}
+	}
+	assert.Equal(t, []byte{1, 2, 3, 4, 5}, got)
+
+	vlr := mapprotocol.AddressString{Nature: 1, NumberPlan: 1, Digits: e2eVLRNumber}
+	purged, err := h.peer.PurgeMS(requestCtx(t), e2eVLRNumber, &mapprotocol.PurgeMSArg{IMSI: e2eTestIMSI, VLRNumber: &vlr})
+	require.NoError(t, err)
+	require.NotNil(t, purged.Purge)
+	assert.Equal(t, &mapprotocol.PurgeMSRes{FreezePTMSI: true}, purged.Purge)
+	assert.Equal(t, e2eVLRNumber, next(t, h.purges).Request.VLRNumber.Digits)
 }
 
 // TestE2E_Cluster_AuthenticationStaysOnItsNode: three nodes share the

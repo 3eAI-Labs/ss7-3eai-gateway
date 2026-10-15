@@ -7,14 +7,20 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/spf13/viper"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zaptest"
 
 	ss7client "github.com/3eAI-Labs/ss7-3eai-gateway-client"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/mapprotocol"
+	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/sccp"
 	"github.com/3eAI-Labs/ss7-3eai-gateway/test/integration/ss7peer"
 )
 
@@ -234,4 +240,145 @@ func TestE2E_USSD_Refusals(t *testing.T) {
 	e = next(t, defaults)
 	require.Equal(t, ss7client.StatusAborted, e.Status)
 	require.Equal(t, begin.SessionID, e.SessionID)
+}
+
+// TestE2E_Cluster_USSDStaysOnItsNode: three nodes share the cluster GT,
+// which the SG load-shares. A USSD session is several exchanges, and the
+// application drives it with commands every node hears: each must reach
+// the node holding the session, and the HLR's answers must too — they go
+// to the calling GT of the gateway's last message, which must be the
+// node's own. Subscriber-initiated sessions arrive at the cluster GT;
+// network-initiated ones are started by whichever node takes the start
+// request.
+func TestE2E_Cluster_USSDStaysOnItsNode(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	natsServer := startEmbeddedNATS(t)
+	defer natsServer.Shutdown()
+
+	var mu sync.Mutex
+	gatewayGTs := map[uint32]map[string]bool{} // session → calling GTs of the gateway's invokes
+	ends := make(chan ss7peer.USSDEnd, 32)
+	peer, err := ss7peer.Start(context.Background(), ss7peer.Config{
+		SCTPAddr: allocLoopbackSCTPPort(t), PointCode: e2ePeerPC, GatewayPointCode: e2eGatewayPC,
+		NetworkIndicator: e2eNetworkIndicator, NetworkVariant: sccp.VariantANSI, Logger: logger.Named("peer"),
+		OnSRI: func(*mapprotocol.SendRoutingInfoForSMRequest, string, string, uint32) (*mapprotocol.SendRoutingInfoForSMResponse, error) {
+			return nil, nil
+		},
+		SharedGTPrefixes: []string{clusterE2EClusterGT},
+		OnUSSD: func(inv *ss7peer.USSDInvoke) ss7peer.USSDReply {
+			mu.Lock()
+			if gatewayGTs[inv.Session] == nil {
+				gatewayGTs[inv.Session] = map[string]bool{}
+			}
+			gatewayGTs[inv.Session][inv.GatewayAddress] = true
+			mu.Unlock()
+			if inv.Op == mapprotocol.OpUnstructuredSSRequest {
+				return ss7peer.USSDReply{Result: ussdText(t, "2")}
+			}
+			return ss7peer.USSDReply{}
+		},
+		OnUSSDEnd: func(e ss7peer.USSDEnd) { ends <- e },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.Empty(t, peer.Violations(), "ss7peer conformance violations") })
+	defer peer.Stop()
+
+	gsmSCF := func(v *viper.Viper) {
+		ussdRoutes(v)
+		v.Set("sccp.local_subsystems", []int{6, 8, 146, 147}) // 147: the gsmSCF USSD is for
+	}
+	nodes := bootClusterNodes(t, []clusterNodeSpec{
+		{nodeIDNumeric: 1, nodeID: "cluster-node-1", localGT: clusterE2ENode1GT, configure: gsmSCF},
+		{nodeIDNumeric: 2, nodeID: "cluster-node-2", localGT: clusterE2ENode2GT, configure: gsmSCF},
+		{nodeIDNumeric: 3, nodeID: "cluster-node-3", localGT: clusterE2ENode3GT, configure: gsmSCF},
+	}, peer.SCTPAddr(), natsServer.ClientURL(), "", logger)
+	defer nodes.stopAll(t)
+	waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, peer.WaitForConns(waitCtx, 3))
+
+	nc, err := nats.Connect(natsServer.ClientURL())
+	require.NoError(t, err)
+	defer nc.Close()
+	client, err := ss7client.New(nc)
+	require.NoError(t, err)
+	defer client.Close()
+
+	const n = 9
+	served := make(chan error, n)
+	_ = ussdEvents(t, client, "balance", func(e *ss7client.USSDEvent) {
+		if e.Action != ss7client.USSDBegin {
+			return
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			a, err := client.USSDRequest(ctx, e.SessionID, ss7client.USSDText{Text: "1=TL 2=USD"})
+			if err == nil && a.Reply.Text != "2" {
+				err = errUnexpected(a.Reply.Text)
+			}
+			if err == nil {
+				err = client.USSDRelease(ctx, e.SessionID, &ss7client.USSDText{Text: "USD: 12.50"})
+			}
+			served <- err
+		}()
+	})
+	require.NoError(t, nc.Flush())
+
+	nodeGTs := map[string]bool{clusterE2ENode1GT: true, clusterE2ENode2GT: true, clusterE2ENode3GT: true}
+	byNode := func(sessions []uint32) map[string]int {
+		t.Helper()
+		mu.Lock()
+		defer mu.Unlock()
+		count := map[string]int{}
+		for _, s := range sessions {
+			gts := gatewayGTs[s]
+			require.Len(t, gts, 1, "session %d: the gateway's invokes came from %v, not one node", s, gts)
+			for gt := range gts {
+				assert.True(t, nodeGTs[gt], "session %d answered from %q, not a node GT", s, gt)
+				count[gt]++
+			}
+		}
+		return count
+	}
+
+	var sessions []uint32
+	for i := 0; i < n; i++ {
+		s, err := peer.StartUSSD("*123#", fmt.Sprintf("2860100000003%02d", i), e2eTestMSISDN, clusterE2EClusterGT)
+		require.NoError(t, err)
+		sessions = append(sessions, s)
+	}
+	for i := 0; i < n; i++ {
+		require.NoError(t, next(t, served))
+		end := next(t, ends)
+		require.False(t, end.Aborted, "session %d aborted: an answer reached a node not holding it", end.Session)
+		assert.Equal(t, "USD: 12.50", ussdDecoded(t, end.Result))
+	}
+	mo := byNode(sessions)
+	t.Logf("subscriber-initiated sessions by node: %v", mo)
+	assert.GreaterOrEqual(t, len(mo), 2, "the SG load-shared the BEGINs over the nodes")
+
+	// Network-initiated: the start request goes to one node of the queue
+	// group; the notify and the release after it must reach that node.
+	const m = 12 // all on one node by chance: 3 × (1/3)^12
+	startedBy := map[string]int{}
+	sessions = nil
+	for i := 0; i < m; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		a, err := client.StartUSSD(ctx, ss7client.USSDStart{MSISDN: e2eTestMSISDN, Route: "billing",
+			Message: ss7client.USSDText{Text: "Balance? 1=yes"}})
+		require.NoError(t, err)
+		require.Equal(t, "2", a.Reply.Text)
+		startedBy[a.NodeID]++
+		_, err = client.USSDNotify(ctx, a.SessionID, ss7client.USSDText{Text: "Bakiye: 5"})
+		require.NoError(t, err, "the notify reached the node holding the session")
+		require.NoError(t, client.USSDRelease(ctx, a.SessionID, nil))
+		cancel()
+		end := next(t, ends)
+		require.False(t, end.Aborted)
+		sessions = append(sessions, end.Session)
+	}
+	t.Logf("network-initiated sessions by node: %v", startedBy)
+	byNode(sessions)
+	assert.GreaterOrEqual(t, len(startedBy), 2, "the start requests were shared over the nodes")
 }

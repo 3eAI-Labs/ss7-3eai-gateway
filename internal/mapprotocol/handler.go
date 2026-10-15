@@ -64,6 +64,16 @@ func (h *Handler) SetTCAPOutbound(ch chan<- *tcap.Message) {
 	h.tcapOutbound = ch
 }
 
+// SetNotSentSink installs the callback told of a dialogue one of whose
+// messages could not be put on the outbound channel (it was full):
+// typically tcapHandler.DialogueNotSent, which ends the dialogue and tells
+// who waits on it, instead of the message vanishing with the dialogue left
+// open until its timer. It is called under the caller's locks, so it must
+// not block or take them.
+func (h *Handler) SetNotSentSink(sink func(d *tcap.Dialogue, reason string)) {
+	h.notSent = sink
+}
+
 // SetResponseSink installs the callback fired when an inbound ReturnResult
 // arrives for an originated dialogue (i.e. one we opened via tcap.Originate).
 // The sink receives the dialogue's NATSCorrelationID, the originating op

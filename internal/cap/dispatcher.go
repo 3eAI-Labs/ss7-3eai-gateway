@@ -190,6 +190,9 @@ func (h *Handler) emitReject(dialogue *tcap.Dialogue, comp *tcap.Component) {
 		h.metrics.Errors.Add(1)
 		h.logger.Warn("CAP outbound channel full — Reject dropped",
 			zap.Uint32("tid", localTID(dialogue)))
+		if h.notSent != nil {
+			h.notSent(dialogue, "not sent: CAP outbound channel full")
+		}
 	}
 }
 

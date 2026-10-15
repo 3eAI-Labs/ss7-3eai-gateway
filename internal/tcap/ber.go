@@ -19,10 +19,10 @@ import (
 // verbatim in both directions: the bytes the MAP codec produces are the
 // bytes on the wire, and the bytes on the wire are what the MAP codec reads.
 //
-// Decoding accepts definite, minimal lengths only (encoding/asn1). Q.773
-// §4.1.2.3 also allows the indefinite form for a constructor, and a
-// lenient receiver would take a non-minimal length; neither is understood
-// here.
+// Decoding accepts every BER length: ParseMessage first rewrites the
+// indefinite form (Q.773 §4.1.2.3) and non-minimal long forms into the
+// definite, minimal lengths encoding/asn1 reads (berlength.go), the
+// component parameters included.
 
 // Tags of the TCAP message types and transaction portion (Q.773 §3.1).
 const (
@@ -294,6 +294,10 @@ func encodeComponent(c *Component) ([]byte, error) {
 
 // ParseMessage decodes a TCAP message (Q.773). It never panics.
 func ParseMessage(data []byte) (*Message, error) {
+	data, err := definiteLengths(data)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidMessage, err)
+	}
 	var outer asn1.RawValue
 	rest, err := asn1.Unmarshal(data, &outer)
 	if err != nil {

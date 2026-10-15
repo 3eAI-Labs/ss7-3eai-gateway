@@ -232,7 +232,6 @@ func TestParseMessageRejects(t *testing.T) {
 		"BEGIN without OTID":       "62 00",
 		"CONTINUE without DTID":    "65 06 48 04 00 00 00 05",
 		"TID of 5 octets":          "64 07 49 05 00 00 00 00 05",
-		"indefinite length":        "62 80 48 04 00 00 00 05 00 00",
 		"invoke without op code":   "62 0D 48 04 00 00 00 05 6C 05 A1 03 02 01 01",
 		"two result parameters":    "64 16 49 04 00 00 00 05 6C 0E A2 0C 02 01 01 30 07 02 01 16 05 00 05 00",
 		"global operation code":    "62 10 48 04 00 00 00 05 6C 08 A1 06 02 01 01 06 01 00",

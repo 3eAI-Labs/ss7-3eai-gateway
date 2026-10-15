@@ -198,18 +198,27 @@ func (h *Handler) AuthenticationInfoMessage(d *tcap.Dialogue, invokeID int32, pa
 
 // HLRRequestRefuse ends an authentication or purging dialogue with a
 // ReturnError of its operation, in an END.
-func (h *Handler) HLRRequestRefuse(d *tcap.Dialogue, invokeID int32, code ErrorCode) error {
+func (h *Handler) HLRRequestRefuse(d *tcap.Dialogue, invokeID int32, e UserError) error {
 	op, allowed := OpPurgeMS, PurgeMSErrors
 	if isAuthenticationDialogue(d) {
 		op, allowed = OpSendAuthenticationInfo, SendAuthenticationInfoErrors
 	}
-	if !allowed[code] {
-		return fmt.Errorf("%s is not an error operation %d allows", code, op)
+	if !allowed[e.Code] {
+		return fmt.Errorf("%s is not an error operation %d allows", e.Code, op)
 	}
-	c := int32(code)
+	return h.sendUserError(d, invokeID, e)
+}
+
+// sendUserError ends d with a ReturnError, its parameter included.
+func (h *Handler) sendUserError(d *tcap.Dialogue, invokeID int32, e UserError) error {
+	param, err := e.Parameter()
+	if err != nil {
+		return err
+	}
+	c := int32(e.Code)
 	return h.sendSession(d, &tcap.Message{
 		MessageType: tcap.MsgTypeEnd, DestinationTID: d.PeerTID(), Dialogue: d,
-		Components: []*tcap.Component{{Type: tcap.CompTypeReturnError, InvokeID: &invokeID, ErrorCode: &c}},
+		Components: []*tcap.Component{{Type: tcap.CompTypeReturnError, InvokeID: &invokeID, ErrorCode: &c, Parameter: param}},
 	})
 }
 

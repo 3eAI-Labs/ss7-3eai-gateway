@@ -457,6 +457,8 @@ type Handler struct {
 	// (Connect, Continue, …) onto for TCAP delivery. Installed via
 	// SetTCAPOutbound after both CAP and TCAP handlers exist.
 	tcapOutbound chan<- *tcap.Message
+	// notSent is told of a dialogue whose message tcapOutbound could not take.
+	notSent func(d *tcap.Dialogue, reason string)
 
 	// Operation handlers
 	initialDPHandler     InitialDPHandler

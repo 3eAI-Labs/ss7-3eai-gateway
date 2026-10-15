@@ -6,6 +6,60 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.10] - 2026-10-15
+
+### Added
+
+- **Error causes**, with client module v0.6.1. An application refusing a sendAuthenticationInfo,
+  purgeMS or location update may qualify the error (TS 29.002 §7.6.1): unknownSubscriber with
+  its diagnostic (IMSI unknown; GPRS or EPS subscription unknown, which TS 29.002 figure 25.5/6
+  names for an SGSN asking for a subscriber without GPRS), roamingNotAllowed with its cause (PLMN
+  roaming not allowed, operator determined barring, supported RAT types not allowed). The cause
+  goes in the error's parameter. An unknown cause, or one that does not qualify the error, is
+  treated as an answer the gateway cannot carry out.
+
+### Fixed
+
+- **An empty Begin that times out frees its slot.** Dialogues opened by a peer's empty Begin
+  (TS 29.002 §C.2.1) may number at most `tcap.max_dialogues`/10 while they wait for the peer's
+  continuation. One whose continuation never came was reaped by its timer without freeing its
+  slot, so after that many silent peers every later empty Begin was refused until a restart
+  (since 0.7.2). Found by review; the timer now frees it like every other way a dialogue ends.
+- **roamingNotAllowed carries its parameter.** Its parameter, `RoamingNotAllowedParam`, is
+  mandatory (TS 29.002 MAP-Errors; unlike most errors' it is not marked optional), and the
+  gateway sent the error without it, as it had since location updates came in 0.7.8. A VLR
+  that checks the parameter could treat the refusal as malformed. It now goes with the
+  application's cause, or with plmnRoamingNotAllowed, the default TS 29.002 §8.1.2.3 names.
+  The test VLR now decodes every error's parameter and reports one that is wrong.
+
+### Tests
+
+- **USSD in a cluster**, end to end: three nodes share the cluster GT. Subscriber-initiated
+  sessions reach whichever node the SG picks, network-initiated ones whichever node takes the
+  start request; the application's commands, which every node hears, and the HLR's answers each
+  reach the node holding the session, and every message of a session comes from that node's
+  own GT. The test peer now routes its USSD messages by the gateway's calling GT, as an SG does,
+  instead of back on the association a message came on, which hid a wrong calling GT.
+
+- **Every BER length form is accepted on receipt** (X.690 §8.1.3, Q.773 §4.1.2.3). A TCAP
+  message whose constructed elements had the indefinite length, or whose lengths took more
+  octets than they need, was refused as unparsable, and the peer's dialogue went unanswered:
+  the decoders, built on Go's `encoding/asn1`, read DER lengths only. Incoming messages are now
+  rewritten into definite, minimal lengths before anything reads them — the operation
+  arguments inside included, so the MAP and CAP decoders see one form — and a transaction's
+  messages reach the same worker whichever form each one uses. The content is unchanged; a
+  definite element whose content is malformed is passed on as it came, for its decoder to
+  answer with a Reject of the component rather than the whole message being dropped.
+  Constructed (segmented) OCTET STRINGs remain unsupported: under an IMPLICIT tag nothing in
+  the encoding marks them as strings. What the gateway sends is unchanged: definite, minimal.
+- **A message the gateway could not queue for sending ends its dialogue, reported.** When the
+  channel from MAP or CAP to TCAP, or from TCAP to SCCP, was full, the message was dropped with
+  a log line, and its dialogue stayed open until `tcap.dialogue_timeout`. The caller then heard
+  `TIMEOUT`, or a USSD, location-update or authentication session waited out its timer.
+  The dialogue is now ended at once and reported as not delivered (`ABORTED`, the reason in
+  `error_message`), the same as a message the network returns in a UDTS. The peer, which got
+  nothing, ends its side at its own timer.
+
 ## [0.7.9] - 2026-10-15
 
 ### Added

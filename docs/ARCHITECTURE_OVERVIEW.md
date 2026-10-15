@@ -71,7 +71,7 @@ Every originated dialogue ends with exactly one publish on its response subject:
 | Reject, or ReturnError without a code | `REMOTE_ERROR` | -3 |
 | No answer within `tcap.dialogue_timeout` | `TIMEOUT` | -1 |
 | TC-ABORT from the peer | `ABORTED` | -2 |
-| Not delivered: no SCCP route, M3UA could not send it, or the network returned it in a UDTS | `ABORTED` | -2 (the reason is in `error_message`) |
+| Not delivered: a queue inside the gateway was full, no SCCP route, M3UA could not send it, or the network returned it in a UDTS | `ABORTED` | -2 (the reason is in `error_message`) |
 | A ReturnResult the gateway cannot decode | `REMOTE_ERROR` | -3 |
 
 A request refused before a dialogue starts — a missing or invalid field, an address the gateway

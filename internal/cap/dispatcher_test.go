@@ -143,3 +143,24 @@ func TestCap_DispatcherStrictRouting(t *testing.T) {
 		t.Fatalf("InitialDPCount = %d, want 0 (cross-context dispatch must not reach handler)", got)
 	}
 }
+
+// A Reject the outbound channel cannot take is reported to the not-sent
+// sink with its dialogue, which TCAP then ends, instead of vanishing.
+func TestCap_RejectNotSent(t *testing.T) {
+	h := newTestHandler(t)
+	h.SetTCAPOutbound(make(chan *tcap.Message)) // nobody reads it: always full
+	var got []*tcap.Dialogue
+	h.SetNotSentSink(func(d *tcap.Dialogue, reason string) {
+		got = append(got, d)
+		if reason != "not sent: CAP outbound channel full" {
+			t.Errorf("reason %q", reason)
+		}
+	})
+	msg := invokeMsg(cap.OpInitialDP, tcap.ACCapV3.OID)
+	msg.Components[0].Parameter = []byte{0x04, 0x00} // not an InitialDPArg
+	dlg := &tcap.Dialogue{LocalTID: 0x02000002, RemoteTID: []byte{1, 2, 3, 4}}
+	_ = h.HandleTCAPMessage(dlg, msg)
+	if len(got) != 1 || got[0] != dlg {
+		t.Fatalf("not-sent sink told of %v, want the dialogue once", got)
+	}
+}

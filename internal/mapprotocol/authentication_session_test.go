@@ -235,10 +235,10 @@ func TestHLRRequestSenders(t *testing.T) {
 	assert.Equal(t, tcap.MsgTypeEnd, last.MessageType)
 	assert.Nil(t, last.OriginatingTID)
 
-	require.NoError(t, h.HLRRequestRefuse(auth, 1, mapprotocol.ErrSystemFailure))
+	require.NoError(t, h.HLRRequestRefuse(auth, 1, mapprotocol.UserError{Code: mapprotocol.ErrSystemFailure}))
 	assert.Equal(t, int32(34), *(<-out).Components[0].ErrorCode)
-	assert.Error(t, h.HLRRequestRefuse(purge, 1, mapprotocol.ErrSystemFailure), "purgeMS has no systemFailure")
-	require.NoError(t, h.HLRRequestRefuse(purge, 1, mapprotocol.ErrUnknownSubscriber))
+	assert.Error(t, h.HLRRequestRefuse(purge, 1, mapprotocol.UserError{Code: mapprotocol.ErrSystemFailure}), "purgeMS has no systemFailure")
+	require.NoError(t, h.HLRRequestRefuse(purge, 1, mapprotocol.UserError{Code: mapprotocol.ErrUnknownSubscriber}))
 	<-out
 
 	require.NoError(t, h.PurgeMSAccept(purge, 7, &mapprotocol.PurgeMSRes{FreezeTMSI: true}))

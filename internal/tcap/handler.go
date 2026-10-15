@@ -415,6 +415,9 @@ func transactionShard(data []byte, workers int) int {
 	if workers <= 1 {
 		return 0
 	}
+	if d, err := definiteLengths(data); err == nil {
+		data = d // a transaction's messages shard alike whatever lengths each carries
+	}
 	var msg asn1.RawValue
 	if _, err := asn1.Unmarshal(data, &msg); err != nil || msg.Class != asn1.ClassApplication {
 		return 0
@@ -750,6 +753,9 @@ func (h *Handler) handleOutgoingMessage(msg *Message) {
 
 	if err := h.sendOnSCCP(payload, called, calling); err != nil {
 		h.logger.Error("Failed to forward TCAP message to SCCP", zap.Error(err))
+		if dlg != nil {
+			h.endUndelivered(dlg, "not sent: "+err.Error())
+		}
 		return
 	}
 	h.updateOutgoingMetrics(msg)
@@ -939,20 +945,43 @@ func (h *Handler) HandleDeliveryFailure(msg *sccp.SccpMessage, reason string) {
 	if err != nil || len(sent.OriginatingTID) < 4 {
 		return // END/ABORT we sent: no dialogue of ours is waiting
 	}
-	localTID := h.decodeTID(sent.OriginatingTID)
-	dialogue := h.getDialogue(localTID)
-	if dialogue == nil {
+	if dialogue := h.getDialogue(h.decodeTID(sent.OriginatingTID)); dialogue != nil {
+		h.endUndelivered(dialogue, reason)
+	}
+}
+
+// DialogueNotSent ends d at this end because a message of it was never
+// handed to TCAP — the application layer found the outbound channel full —
+// and tells who waits on it, as for a message the network did not deliver.
+// The peer, which got nothing, ends its side at its own timer. Safe under
+// any lock of the caller's: the sinks are told on a goroutine of their own.
+func (h *Handler) DialogueNotSent(d *Dialogue, reason string) {
+	if d == nil {
 		return
 	}
-	h.removeDialogue(localTID)
+	select {
+	case <-h.shutdownCh:
+		return // stopping: the dialogue goes with the handler
+	default:
+	}
+	go h.endUndelivered(d, reason)
+}
+
+// endUndelivered ends d, if it is still this node's, because a message of
+// it will not reach the peer: the dialogue goes now rather than at its
+// timer, and the lost sink and the originator's failure sink are told.
+func (h *Handler) endUndelivered(d *Dialogue, reason string) {
+	if !h.removeDialogueIf(d) {
+		return // already ended: by its timer, the peer, or an earlier report
+	}
 	h.metrics.Errors.Add(1)
 	h.logger.Warn("Dialogue ended: message not delivered",
-		zap.Uint32("local_tid", localTID), zap.String("reason", reason))
+		zap.Uint32("local_tid", d.LocalTID), zap.String("reason", reason))
 
 	if h.lostSink != nil {
-		h.lostSink(dialogue, FailureNotDelivered, reason)
+		h.lostSink(d, FailureNotDelivered, reason)
 	}
-	h.reportFailure(dialogue, FailureNotDelivered, reason)
+	h.reportFailure(d, FailureNotDelivered, reason)
 }
 
 // SetVersionFallback enables retrying an originated dialogue under the
@@ -1211,11 +1240,27 @@ func (h *Handler) removeDialogue(localTID uint32) {
 	defer h.dialoguesMu.Unlock()
 
 	if dlg, exists := h.dialogues[localTID]; exists {
-		delete(h.dialogues, localTID)
-		h.metrics.ActiveDialogues.Add(-1)
-		if dlg.awaitingContinuation.Swap(false) {
-			h.pendingEmptyBegins.Add(-1)
-		}
+		h.deleteDialogueLocked(dlg)
+	}
+}
+
+// removeDialogueIf removes d if it is still the dialogue of its TID, and
+// reports whether it did.
+func (h *Handler) removeDialogueIf(d *Dialogue) bool {
+	h.dialoguesMu.Lock()
+	defer h.dialoguesMu.Unlock()
+	if h.dialogues[d.LocalTID] != d {
+		return false
+	}
+	h.deleteDialogueLocked(d)
+	return true
+}
+
+func (h *Handler) deleteDialogueLocked(d *Dialogue) {
+	delete(h.dialogues, d.LocalTID)
+	h.metrics.ActiveDialogues.Add(-1)
+	if d.awaitingContinuation.Swap(false) {
+		h.pendingEmptyBegins.Add(-1)
 	}
 }
 
@@ -1501,8 +1546,7 @@ func (h *Handler) handleDialogueTimeout(localTID uint32) {
 	called := dlg.RemoteAddress
 	calling := dlg.LocalAddress
 
-	delete(h.dialogues, localTID)
-	h.metrics.ActiveDialogues.Add(-1)
+	h.deleteDialogueLocked(dlg) // frees an empty Begin's slot too
 	h.dialoguesMu.Unlock()
 
 	// A dialogue the peer never answered has no transaction to abort.

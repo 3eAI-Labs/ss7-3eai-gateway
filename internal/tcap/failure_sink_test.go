@@ -443,3 +443,75 @@ func TestTransactionShard(t *testing.T) {
 	assert.Equal(t, 0, transactionShard([]byte{0xFF, 0x00}, workers))
 	assert.Equal(t, 0, transactionShard(nil, workers))
 }
+
+// notSentHandler is a running handler whose SCCP channel holds one
+// message, with its failure and lost sinks recorded.
+func notSentHandler(t *testing.T) (*Handler, chan *sccp.SccpMessage, *recordingSink, *recordingSink) {
+	t.Helper()
+	logger := zaptest.NewLogger(t)
+	sccpIn, sccpOut := make(chan *sccp.SccpMessage, 16), make(chan *sccp.SccpMessage, 1)
+	h, err := NewHandler(&Config{
+		NodeID: 1, DialogueTimeout: 30 * time.Second, InvokeTimeout: 30 * time.Second,
+		IdleTimeout: 30 * time.Second, MaxDialogues: 100, MaxComponentsPerMessage: 10,
+		MaxInvokesPerDialogue: 20, ChannelBufferSize: 100, WorkerPoolSize: 1,
+		TimerResolution: 50 * time.Millisecond,
+	}, sccpIn, sccpOut, NewDispatcher(logger), logger)
+	require.NoError(t, err)
+	failed, lost := &recordingSink{}, &recordingSink{}
+	h.SetFailureSink(failed.fn())
+	record := lost.fn()
+	h.SetLostSink(func(d *Dialogue, reason FailureReason, detail string) {
+		record(d.NATSCorrelationID, d.OriginatingOpCode, reason, detail)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, h.Start(ctx))
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		_ = h.Stop(stopCtx)
+		cancel()
+	})
+	return h, sccpOut, failed, lost
+}
+
+// A BEGIN the SCCP channel cannot take ends its dialogue at once, reported
+// as not delivered to the lost sink and the originator, instead of being
+// dropped with the dialogue left to its timer.
+func TestFailureSink_SCCPChannelFull(t *testing.T) {
+	h, sccpOut, failed, lost := notSentHandler(t)
+	sccpOut <- &sccp.SccpMessage{} // the channel is full
+
+	called, calling := sampleAddrs()
+	dlg, err := h.Originate(&ACShortMsgMTRelayV3, called, calling, 44, []byte{0x30, 0x00}, "nats-corr-full")
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool { return len(failed.snapshot()) == 1 }, 2*time.Second, 10*time.Millisecond)
+	c := failed.snapshot()[0]
+	assert.Equal(t, sinkCall{"nats-corr-full", 44, FailureNotDelivered, "not sent: SCCP channel full"}, c)
+	assert.Equal(t, []sinkCall{c}, lost.snapshot())
+	assert.Nil(t, h.getDialogue(dlg.LocalTID), "dialogue removed")
+	assert.Zero(t, h.metrics.ActiveDialogues.Load())
+}
+
+// DialogueNotSent — the application layer could not queue a message — ends
+// the dialogue once, however often it is told.
+func TestFailureSink_DialogueNotSent(t *testing.T) {
+	h, sccpOut, failed, lost := notSentHandler(t)
+	called, calling := sampleAddrs()
+	dlg, err := h.Originate(&ACShortMsgMTRelayV3, called, calling, 44, []byte{0x30, 0x00}, "nats-corr-not-sent")
+	require.NoError(t, err)
+	<-sccpOut // the BEGIN went out
+
+	h.DialogueNotSent(dlg, "not sent: MAP outbound channel full")
+	h.DialogueNotSent(dlg, "again")
+	h.DialogueNotSent(nil, "no dialogue")
+	require.Eventually(t, func() bool { return len(failed.snapshot()) == 1 }, 2*time.Second, 10*time.Millisecond)
+	time.Sleep(50 * time.Millisecond) // a second report would have arrived by now
+	calls := failed.snapshot()
+	require.Len(t, calls, 1)
+	assert.Equal(t, FailureNotDelivered, calls[0].reason)
+	assert.Equal(t, "nats-corr-not-sent", calls[0].corrID)
+	assert.Contains(t, []string{"not sent: MAP outbound channel full", "again"}, calls[0].detail, "whichever report came first")
+	assert.Len(t, lost.snapshot(), 1)
+	assert.Nil(t, h.getDialogue(dlg.LocalTID))
+}

@@ -135,6 +135,11 @@ type Config struct {
 	// silently corrupts addresses (Q.713 §3.4.1).
 	NetworkVariant sccp.NetworkVariant
 
+	// IndefiniteLengths makes the TCAP messages sendTCAP writes use the
+	// indefinite length form for every constructed element, the operation
+	// argument's included (Q.773 §4.1.2.3).
+	IndefiniteLengths bool
+
 	// OnSRI is the callback invoked on every SRI-for-SM Invoke. Required.
 	OnSRI SRICallback
 

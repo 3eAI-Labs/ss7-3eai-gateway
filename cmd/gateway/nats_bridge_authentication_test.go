@@ -76,8 +76,12 @@ func (n *hrNet) Send(_ *tcap.Dialogue, msg *tcap.Message) error {
 	n.record(fmt.Sprintf("result id=%d %s", *msg.Components[0].InvokeID, how))
 	return nil
 }
-func (n *hrNet) HLRRequestRefuse(_ *tcap.Dialogue, id int32, code mapprotocol.ErrorCode) error {
-	n.record(fmt.Sprintf("refuse id=%d %d", id, code))
+func (n *hrNet) HLRRequestRefuse(_ *tcap.Dialogue, id int32, e mapprotocol.UserError) error {
+	if e.Cause != mapprotocol.CauseNone {
+		n.record(fmt.Sprintf("refuse id=%d %d %s", id, e.Code, e.Cause))
+		return nil
+	}
+	n.record(fmt.Sprintf("refuse id=%d %d", id, e.Code))
 	return nil
 }
 func (n *hrNet) PurgeMSAccept(_ *tcap.Dialogue, id int32, res *mapprotocol.PurgeMSRes) error {
@@ -340,7 +344,15 @@ func TestAuthentication_Refusals(t *testing.T) {
 		err    error
 		want   string
 	}{
-		"unknownSubscriber":          {answer: &natsbridge.NatsMessage{Authentication: &ss7client.Authentication{Error: 1}}, want: "refuse id=1 1"},
+		"unknownSubscriber": {answer: &natsbridge.NatsMessage{Authentication: &ss7client.Authentication{Error: 1}}, want: "refuse id=1 1"},
+		"unknownSubscriber, gprs-eps": {answer: &natsbridge.NatsMessage{Authentication: &ss7client.Authentication{Error: 1,
+			ErrorCause: ss7client.CauseGPRSEPSSubscriptionUnknown}}, want: "refuse id=1 1 gprs-eps-SubscriptionUnknown"},
+		"a cause of another error": {answer: &natsbridge.NatsMessage{Authentication: &ss7client.Authentication{Error: 1,
+			ErrorCause: ss7client.CauseOperatorDeterminedBarring}}, want: "refuse id=1 34"},
+		"an unknown cause": {answer: &natsbridge.NatsMessage{Authentication: &ss7client.Authentication{Error: 1,
+			ErrorCause: "imsi"}}, want: "refuse id=1 34"},
+		"a cause without an error": {answer: &natsbridge.NatsMessage{Authentication: &ss7client.Authentication{
+			ErrorCause: ss7client.CauseIMSIUnknown}}, want: "refuse id=1 34"},
 		"an error it does not allow": {answer: &natsbridge.NatsMessage{Authentication: &ss7client.Authentication{Error: 8}}, want: "refuse id=1 34"},
 		"too many vectors": {answer: &natsbridge.NatsMessage{Authentication: &ss7client.Authentication{
 			Triplets: []ss7client.AuthenticationTriplet{triplet(1), triplet(2), triplet(3)}}}, want: "refuse id=1 34"},
@@ -401,6 +413,10 @@ func TestPurge(t *testing.T) {
 	}{
 		"purged, TMSI frozen": {answer: &natsbridge.NatsMessage{Purge: &ss7client.Purge{FreezeTMSI: true}}, want: "purge id=3 tmsi"},
 		"unknownSubscriber":   {answer: &natsbridge.NatsMessage{Purge: &ss7client.Purge{Error: 1}}, want: "refuse id=3 1"},
+		"unknownSubscriber, imsiUnknown": {answer: &natsbridge.NatsMessage{Purge: &ss7client.Purge{Error: 1,
+			ErrorCause: ss7client.CauseIMSIUnknown}}, want: "refuse id=3 1 imsiUnknown"},
+		"a cause of another error": {answer: &natsbridge.NatsMessage{Purge: &ss7client.Purge{Error: 1,
+			ErrorCause: ss7client.CauseSupportedRATTypesNotAllowed}}, want: "abort"},
 		// purgeMS has no systemFailure: what the gateway cannot answer is
 		// aborted.
 		"systemFailure":     {answer: &natsbridge.NatsMessage{Purge: &ss7client.Purge{Error: 34}}, want: "abort"},

@@ -54,6 +54,7 @@ type LocationUpdateEnd struct {
 	Aborted   bool
 	HLRNumber *mapprotocol.AddressString // updateLocation's result
 	Error     mapprotocol.ErrorCode      // or its error
+	Cause     mapprotocol.ErrorCause     // and what its parameter qualifies it with
 	// Inserts are the insertSubscriberData the gateway sent in it.
 	Inserts []*mapprotocol.InsertSubscriberDataArg
 	// GatewayAddresses are the calling GTs of the gateway's messages in it.
@@ -305,7 +306,11 @@ func (p *Peer) luComponent(d *luDialogue, msg *tcap.Message, c *tcap.Component) 
 		if !mapprotocol.UpdateLocationErrors[code] {
 			p.violate("updateLocation answered with %s, not one of its errors", code)
 		}
-		d.end.Error = code
+		cause, err := mapprotocol.DecodeUserErrorCause(code, c.Parameter)
+		if err != nil {
+			p.violate("updateLocation: %s with %v", code, err)
+		}
+		d.end.Error, d.end.Cause = code, cause
 	default:
 		p.violate("location update %v component from the gateway", c.Type)
 	}

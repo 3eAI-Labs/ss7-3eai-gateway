@@ -55,6 +55,9 @@ func tidBytes(v uint32) []byte { return []byte{byte(v >> 24), byte(v >> 16), byt
 // sendTCAP encodes msg and writes it back to the gateway.
 func (p *Peer) sendTCAP(conn *wire.Conn, pd *wire.ProtocolData, sccpReq *sccp.SccpMessage, msg *tcap.Message) {
 	b, err := tcap.EncodeMessage(msg)
+	if err == nil && p.cfg.IndefiniteLengths {
+		b, err = indefiniteLengths(b)
+	}
 	if err != nil {
 		p.logger.Warn("TCAP encode failed", zap.Error(err))
 		return

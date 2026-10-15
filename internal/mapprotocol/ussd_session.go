@@ -248,6 +248,7 @@ func (h *Handler) sendSession(d *tcap.Dialogue, msg *tcap.Message) error {
 		return nil
 	default:
 		h.metrics.Errors.Add(1)
+		h.reportNotSent(d, "not sent: MAP outbound channel full")
 		return errors.New("map: TCAP outbound channel full")
 	}
 }

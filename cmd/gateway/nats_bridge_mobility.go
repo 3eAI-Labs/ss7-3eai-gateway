@@ -55,7 +55,7 @@ type luMAP interface {
 	InsertSubscriberDataMessage(d *tcap.Dialogue, invokeID int32, param []byte) *tcap.Message
 	Send(d *tcap.Dialogue, msg *tcap.Message) error
 	UpdateLocationAccept(d *tcap.Dialogue, invokeID int32, hlrNumber mapprotocol.AddressString) error
-	UpdateLocationRefuse(d *tcap.Dialogue, invokeID int32, code mapprotocol.ErrorCode) error
+	UpdateLocationRefuse(d *tcap.Dialogue, invokeID int32, e mapprotocol.UserError) error
 	LocationUpdateAbort(d *tcap.Dialogue) error
 }
 
@@ -142,11 +142,11 @@ func (m *locationUpdates) removeLocked(lu *locationUpdate) {
 // refuseLocked ends lu with updateLocation's error, as the application
 // asked. It reports whether the error went out; when it did not, the
 // application is told with an end turn.
-func (m *locationUpdates) refuseLocked(lu *locationUpdate, code mapprotocol.ErrorCode, why string) bool {
+func (m *locationUpdates) refuseLocked(lu *locationUpdate, e mapprotocol.UserError, why string) bool {
 	m.removeLocked(lu)
 	m.logger.Info("location update refused", zap.String("dialogue_id", lu.id), zap.String("imsi", lu.imsi),
-		zap.Stringer("error", code), zap.String("why", why))
-	if err := m.mapH.UpdateLocationRefuse(lu.d, lu.ulInvoke, code); err != nil {
+		zap.Stringer("error", e.Code), zap.Stringer("cause", e.Cause), zap.String("why", why))
+	if err := m.mapH.UpdateLocationRefuse(lu.d, lu.ulInvoke, e); err != nil {
 		m.logger.Warn("location update refusal not sent", zap.String("dialogue_id", lu.id), zap.Error(err))
 		m.endLocked(lu, ss7client.StatusAborted, ss7client.ErrCodeAborted, "the refusal could not be sent: "+err.Error())
 		return false
@@ -158,7 +158,7 @@ func (m *locationUpdates) refuseLocked(lu *locationUpdate, code mapprotocol.Erro
 // no answer, or one it cannot carry out — and tells the application with
 // an end turn.
 func (m *locationUpdates) failLocked(lu *locationUpdate, status string, code int32, why string) {
-	if m.refuseLocked(lu, mapprotocol.ErrSystemFailure, why) {
+	if m.refuseLocked(lu, mapprotocol.UserError{Code: mapprotocol.ErrSystemFailure}, why) {
 		m.endLocked(lu, status, code, "refused with systemFailure: "+why)
 	}
 }
@@ -259,16 +259,19 @@ func (m *locationUpdates) answerLocked(lu *locationUpdate, answer *natsbridge.Na
 		}
 		m.logger.Debug("location update accepted", zap.String("dialogue_id", lu.id), zap.String("imsi", lu.imsi))
 	case ss7client.ULReject:
-		code := mapprotocol.ErrorCode(u.Error)
-		if !mapprotocol.UpdateLocationErrors[code] {
-			reject(fmt.Sprintf("the HLR application's error %d is not one updateLocation allows", u.Error))
+		e, err := userError(u.Error, u.ErrorCause)
+		if err == nil && !mapprotocol.UpdateLocationErrors[e.Code] {
+			err = fmt.Errorf("error %d is not one updateLocation allows", u.Error)
+		}
+		if err != nil {
+			reject("the HLR application's " + err.Error())
 			return
 		}
 		why := "the HLR application refused it"
 		if u.Detail != "" {
 			why += ": " + u.Detail
 		}
-		m.refuseLocked(lu, code, why)
+		m.refuseLocked(lu, e, why)
 	case ss7client.ULInsert:
 		m.insertLocked(lu, answer.SubscriberData)
 	default:

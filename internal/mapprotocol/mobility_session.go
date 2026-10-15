@@ -196,15 +196,13 @@ func (h *Handler) UpdateLocationAccept(d *tcap.Dialogue, invokeID int32, hlrNumb
 
 // UpdateLocationRefuse ends a location update with a ReturnError of
 // updateLocation, in an END.
-func (h *Handler) UpdateLocationRefuse(d *tcap.Dialogue, invokeID int32, code ErrorCode) error {
-	if !UpdateLocationErrors[code] {
-		return fmt.Errorf("location update: %s is not an error updateLocation allows", code)
+// roamingNotAllowed carries its cause, which its parameter must (TS
+// 29.002 MAP-Errors: the parameter is not optional).
+func (h *Handler) UpdateLocationRefuse(d *tcap.Dialogue, invokeID int32, e UserError) error {
+	if !UpdateLocationErrors[e.Code] {
+		return fmt.Errorf("location update: %s is not an error updateLocation allows", e.Code)
 	}
-	c := int32(code)
-	return h.sendSession(d, &tcap.Message{
-		MessageType: tcap.MsgTypeEnd, DestinationTID: d.PeerTID(), Dialogue: d,
-		Components: []*tcap.Component{{Type: tcap.CompTypeReturnError, InvokeID: &invokeID, ErrorCode: &c}},
-	})
+	return h.sendUserError(d, invokeID, e)
 }
 
 // LocationUpdateAbort aborts a location updating dialogue (TC-U-ABORT).
