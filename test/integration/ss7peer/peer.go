@@ -151,6 +151,11 @@ type Config struct {
 	OnPSI PSICallback
 	// OnRouting answers SendRoutingInfo (op 22) as an HLR; nil drops it.
 	OnRouting RoutingCallback
+	// OnUSSD answers the gateway's unstructuredSS-Request and -Notify as the
+	// subscriber's HLR (ussd.go); nil drops them. OnUSSDEnd is told how the
+	// gateway ended each USSD dialogue.
+	OnUSSD    USSDCallback
+	OnUSSDEnd func(USSDEnd)
 
 	// OnSRIPreDrop is consulted before OnSRI is invoked. When it returns
 	// true, the peer drops the SRI Invoke silently (no ReturnResult, no
@@ -240,6 +245,10 @@ type Peer struct {
 	emptyBegins   atomic.Uint64
 	segmentRef    atomic.Uint32
 	v2Dialogues   atomic.Uint64
+
+	// USSD dialogues, by the peer's TID (ussd.go).
+	ussdDialogues sync.Map // uint32 → *ussdDialogue
+	ussdCount     atomic.Uint64
 }
 
 // Start binds SCTP, builds the M3UA listener, and accepts the first
@@ -454,6 +463,9 @@ func (p *Peer) handleMTP3(conn *wire.Conn, pd *wire.ProtocolData) {
 	tcapMsg, err := tcap.ParseMessage(sccpMsg.Data)
 	if err != nil {
 		p.violate("TCAP message not Q.773: %v", err)
+		return
+	}
+	if p.handleUSSD(conn, pd, sccpMsg, tcapMsg) {
 		return
 	}
 

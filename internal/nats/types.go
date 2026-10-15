@@ -26,6 +26,8 @@ const (
 	SubjectATIRequest     = ss7client.SubjectATIRequest
 	SubjectPSIRequest     = ss7client.SubjectPSIRequest
 	SubjectRoutingRequest = ss7client.SubjectRoutingRequest
+	SubjectUSSDStart      = ss7client.SubjectUSSDStart
+	SubjectUSSDCommand    = ss7client.SubjectUSSDCommand
 
 	// Outbound: gateway → application
 	SubjectMOSms           = ss7client.SubjectMOSMS
@@ -34,6 +36,8 @@ const (
 	SubjectATIResponse     = ss7client.SubjectATIResponse
 	SubjectPSIResponse     = ss7client.SubjectPSIResponse
 	SubjectRoutingResponse = ss7client.SubjectRoutingResponse
+	SubjectUSSDResponse    = ss7client.SubjectUSSDResponse
+	SubjectUSSDEventPrefix = ss7client.SubjectUSSDEventPrefix
 )
 
 // Server-private subjects: CAP/INAP are bound but not part of the published
@@ -63,6 +67,7 @@ const (
 	MsgTypeMAPATI     = ss7client.MsgTypeMAPATI
 	MsgTypeMAPPSI     = ss7client.MsgTypeMAPPSI
 	MsgTypeMAPRouting = ss7client.MsgTypeMAPRouting
+	MsgTypeMAPUSSD    = ss7client.MsgTypeMAPUSSD
 
 	// Server-private message types
 	MsgTypeMAPUpdateLocation MessageType = "MAP_UL"
@@ -130,8 +135,11 @@ type Handler struct {
 	nc     *nats.Conn
 	logger *zap.Logger
 
-	// Subscriptions
+	// Subscriptions: the intake (request subjects, paused by PauseIntake)
+	// and the session commands, which keep flowing during a drain so the
+	// node's open USSD sessions can finish.
 	subscriptions []*nats.Subscription
+	sessionSubs   []*nats.Subscription
 
 	// Message handlers (callbacks)
 	onMTSmsRequest   func(*NatsMessage) error
@@ -139,12 +147,14 @@ type Handler struct {
 	onATIRequest     func(*NatsMessage) error
 	onPSIRequest     func(*NatsMessage) error
 	onRoutingRequest func(*NatsMessage) error
+	onUSSDStart      func(*NatsMessage) error
+	onUSSDCommand    func(*NatsMessage) error
 	onCAPInitialDP   func(*NatsMessage) error
 	onINAPInitialDP  func(*NatsMessage) error
 
 	// Channels
 	incomingCh chan *NatsMessage
-	outgoingCh chan *NatsMessage
+	outgoingCh chan outgoing
 	errorCh    chan error
 	shutdownCh chan struct{}
 
@@ -155,6 +165,13 @@ type Handler struct {
 	// workerWg tracks worker + publishWorker goroutines so Stop can
 	// drain in-flight messages instead of relying on a fixed sleep.
 	workerWg sync.WaitGroup
+}
+
+// outgoing is a message for the publish worker. subject, when set, is
+// where it goes; otherwise its message type decides.
+type outgoing struct {
+	msg     *NatsMessage
+	subject string
 }
 
 // Metrics tracks NATS bridge statistics
@@ -177,6 +194,8 @@ type Metrics struct {
 	ATIRequestCount     atomic.Uint64
 	PSIRequestCount     atomic.Uint64
 	RoutingRequestCount atomic.Uint64
+	USSDStartCount      atomic.Uint64
+	USSDCommandCount    atomic.Uint64
 	CAPInitialDPCount   atomic.Uint64
 	INAPInitialDPCount  atomic.Uint64
 

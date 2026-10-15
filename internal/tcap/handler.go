@@ -4,6 +4,7 @@
 package tcap
 
 import (
+	"cmp"
 	"context"
 	"encoding/asn1"
 	"encoding/hex"
@@ -102,6 +103,23 @@ func (h *Handler) SetFailureSink(sink FailureSink) {
 	h.failureSink = sink
 }
 
+// SetLostSink installs a sink told of every dialogue TCAP ends on its own —
+// a timeout or a message not delivered — whoever opened it, before the
+// failure sink. It must not block. Set before Start.
+func (h *Handler) SetLostSink(sink func(d *Dialogue, reason FailureReason, detail string)) {
+	h.lostSink = sink
+}
+
+// EndLocally ends a dialogue at this end without sending anything (Q.771
+// prearranged end): for a dialogue the peer has not answered yet, which an
+// END or ABORT cannot address. A later message from the peer for it is
+// answered with an ABORT (unrecognized transaction ID).
+func (h *Handler) EndLocally(d *Dialogue) {
+	if d != nil {
+		h.removeDialogue(d.LocalTID)
+	}
+}
+
 // Start initializes TCAP handler and worker pool.
 func (h *Handler) Start(ctx context.Context) error {
 	h.logger.Info("Starting TCAP handler",
@@ -188,7 +206,45 @@ func (h *Handler) Originate(
 	parameter []byte,
 	natsCorrelationID string,
 ) (*Dialogue, error) {
-	return h.originate(ac, called, calling, opCode, opCode, parameter, natsCorrelationID, false)
+	return h.originate(ac, called, calling, opCode, opCode, parameter, natsCorrelationID, false, OriginateOptions{})
+}
+
+// OriginateOptions are what some dialogues need beyond Originate's.
+type OriginateOptions struct {
+	// UserInformation is the content of the AARQ's user-information [30]
+	// (the EXTERNALs, encoded), e.g. a MAP-OpenInfo.
+	UserInformation []byte
+	// Timeout replaces DialogueTimeout for this dialogue.
+	Timeout time.Duration
+}
+
+// OriginateWith is Originate with options.
+func (h *Handler) OriginateWith(
+	ac *ApplicationContext,
+	called, calling *sccp.SccpAddress,
+	opCode int32,
+	parameter []byte,
+	natsCorrelationID string,
+	opts OriginateOptions,
+) (*Dialogue, error) {
+	return h.originate(ac, called, calling, opCode, opCode, parameter, natsCorrelationID, false, opts)
+}
+
+// SetDialogueTimeout gives a dialogue its own lifetime from now, in place of
+// DialogueTimeout: a USSD session waits for a human.
+func (h *Handler) SetDialogueTimeout(d *Dialogue, timeout time.Duration) {
+	h.dialoguesMu.Lock()
+	defer h.dialoguesMu.Unlock()
+	d.timeout = timeout
+	d.ExpiresAt = time.Now().Add(timeout)
+}
+
+// dialogueTimeout is the lifetime a dialogue's activity renews.
+func (h *Handler) dialogueTimeout(d *Dialogue) time.Duration {
+	if d.timeout > 0 {
+		return d.timeout
+	}
+	return h.config.DialogueTimeout
 }
 
 // originate opens a dialogue. logicalOp is the operation the caller asked
@@ -202,6 +258,7 @@ func (h *Handler) originate(
 	parameter []byte,
 	natsCorrelationID string,
 	isFallback bool,
+	opts OriginateOptions,
 ) (*Dialogue, error) {
 	opCode := wireOp
 	if ac == nil {
@@ -228,9 +285,10 @@ func (h *Handler) originate(
 		OriginatingOpCode:   logicalOp,
 		initiatedLocally:    true,
 		versionFallbackUsed: isFallback,
+		timeout:             opts.Timeout,
 		CreatedAt:           time.Now(),
 		LastActivity:        time.Now(),
-		ExpiresAt:           time.Now().Add(h.config.DialogueTimeout),
+		ExpiresAt:           time.Now().Add(cmp.Or(opts.Timeout, h.config.DialogueTimeout)),
 		PendingInvokes: map[int32]*PendingInvoke{
 			invokeID: {
 				InvokeID:      invokeID,
@@ -253,6 +311,7 @@ func (h *Handler) originate(
 		OriginatingTID: h.encodeTID(localTID),
 		DialoguePortion: &DialoguePortion{
 			ApplicationContext: ac,
+			UserInformation:    opts.UserInformation,
 		},
 		Components: []*Component{{
 			Type:          CompTypeInvoke,
@@ -430,8 +489,10 @@ func (h *Handler) handleBegin(sccpCtx *sccp.SccpMessage, msg *Message) {
 
 	// AC may be absent if BEGIN lacks dialogue portion; dispatch will P-Abort.
 	var appCtx *ApplicationContext
+	var userInfo []byte
 	if msg.DialoguePortion != nil {
 		appCtx = msg.DialoguePortion.ApplicationContext
+		userInfo = msg.DialoguePortion.UserInformation
 	}
 
 	dialogue := &Dialogue{
@@ -445,6 +506,8 @@ func (h *Handler) handleBegin(sccpCtx *sccp.SccpMessage, msg *Message) {
 		LastActivity:       time.Now(),
 		ExpiresAt:          time.Now().Add(h.config.DialogueTimeout),
 		PendingInvokes:     make(map[int32]*PendingInvoke),
+
+		OpeningUserInformation: userInfo,
 	}
 
 	dialogue.dialogueResponsePending.Store(appCtx != nil)
@@ -514,15 +577,18 @@ func (h *Handler) handleContinue(sccpCtx *sccp.SccpMessage, msg *Message) {
 	}
 
 	// The timer manager reads these under dialoguesMu.
+	// The timer manager reads them under dialoguesMu; RemoteTID also under
+	// the dialogue's own lock (PeerTID), for a USSD session's goroutines.
 	h.dialoguesMu.Lock()
 	dialogue.LastActivity = time.Now()
-	dialogue.ExpiresAt = time.Now().Add(h.config.DialogueTimeout)
+	dialogue.ExpiresAt = time.Now().Add(h.dialogueTimeout(dialogue))
+	if len(msg.OriginatingTID) > 0 {
+		dialogue.remoteTIDMu.Lock()
+		dialogue.RemoteTID = msg.OriginatingTID
+		dialogue.remoteTIDMu.Unlock()
+	}
 	h.dialoguesMu.Unlock()
 	dialogue.MessagesReceived.Add(1)
-
-	if len(msg.OriginatingTID) > 0 {
-		dialogue.RemoteTID = msg.OriginatingTID
-	}
 
 	h.logger.Debug("Updated dialogue",
 		zap.Uint32("local_tid", localTID),
@@ -867,6 +933,9 @@ func (h *Handler) HandleDeliveryFailure(msg *sccp.SccpMessage, reason string) {
 	h.logger.Warn("Dialogue ended: message not delivered",
 		zap.Uint32("local_tid", localTID), zap.String("reason", reason))
 
+	if h.lostSink != nil {
+		h.lostSink(dialogue, FailureNotDelivered, reason)
+	}
 	h.reportFailure(dialogue, FailureNotDelivered, reason)
 }
 
@@ -901,7 +970,7 @@ func (h *Handler) retryUnderLowerVersion(dialogue *Dialogue, abort *Message) boo
 	dialogue.invokesMu.RUnlock()
 
 	retry, err := h.originate(ac, dialogue.RemoteAddress, dialogue.LocalAddress,
-		dialogue.OriginatingOpCode, wireOp, parameter, dialogue.NATSCorrelationID, true)
+		dialogue.OriginatingOpCode, wireOp, parameter, dialogue.NATSCorrelationID, true, OriginateOptions{Timeout: dialogue.timeout})
 	if err != nil {
 		h.logger.Warn("Version fallback failed to start", zap.Error(err))
 		return false
@@ -1398,10 +1467,16 @@ func (h *Handler) handleDialogueTimeout(localTID uint32) {
 	h.metrics.ActiveDialogues.Add(-1)
 	h.dialoguesMu.Unlock()
 
-	if err := h.sendMessage(abortMsg, called, calling); err != nil {
-		h.logger.Error("Failed to send timeout Abort",
-			zap.Uint32("local_tid", localTID),
-			zap.Error(err))
+	// A dialogue the peer never answered has no transaction to abort.
+	if len(abortMsg.DestinationTID) > 0 {
+		if err := h.sendMessage(abortMsg, called, calling); err != nil {
+			h.logger.Error("Failed to send timeout Abort",
+				zap.Uint32("local_tid", localTID),
+				zap.Error(err))
+		}
+	}
+	if h.lostSink != nil {
+		h.lostSink(dlg, FailureTimeout, "dialogue timeout")
 	}
 
 	h.reportFailure(dlg, FailureTimeout, "dialogue timeout")

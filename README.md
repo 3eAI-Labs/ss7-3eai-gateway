@@ -1,7 +1,7 @@
 # ss7-3eai-gateway
 
 An SS7 signalling gateway that lets applications send and receive SMS, ask where a subscriber
-is, and ask how to route a call to them, over MAP without speaking SS7 themselves. Applications talk to it over [NATS](https://nats.io); it talks to the
+is, ask how to route a call to them, and run USSD menus, over MAP without speaking SS7 themselves. Applications talk to it over [NATS](https://nats.io); it talks to the
 signalling network over SIGTRAN (M3UA over SCTP) as an application server process behind a
 signalling gateway (SG) or STP.
 
@@ -13,8 +13,10 @@ signalling gateway (SG) or STP.
   map.ati.request    ───────►│                              │             │          │
   map.psi.request    ───────►│                              │             │          │
   map.routing.request ──────►│                              │             │          │
+  map.ussd.start/.command ──►│                              │             │          │
   map.*.response     ◄───────│                              │             └──────────┘
-  map.mo.sms         ◄───────└──────────────────────────────┘
+  map.mo.sms         ◄───────│                              │
+  map.ussd.event.<route> ◄───└──────────────────────────────┘
 ```
 
 Written in Go. Licensed under the [GNU AGPL v3.0](LICENSE) (only); the
@@ -39,6 +41,8 @@ real SS7 networks.
 | AnyTimeInterrogation (op 71) | gateway (as gsmSCF) → HLR | `map.ati.request` → `map.ati.response` | anyTimeInfoEnquiryContext-v3 |
 | ProvideSubscriberInfo (op 70) | gateway (in the HLR's role) → VLR | `map.psi.request` → `map.psi.response` | subscriberInfoEnquiryContext-v3 |
 | SendRoutingInfo (op 22) | gateway (as GMSC) → HLR | `map.routing.request` → `map.routing.response` | locationInfoRetrievalContext-v3 |
+| processUnstructuredSS-Request (op 59) | HLR → gateway (as gsmSCF) | begin and end on `map.ussd.event.<route>` | networkUnstructuredSsContext-v2 |
+| unstructuredSS-Request / -Notify (ops 60, 61) | gateway (as gsmSCF) → HLR | `map.ussd.start`, `map.ussd.command` → `map.ussd.response` | networkUnstructuredSsContext-v2 |
 
 - **Every outcome is answered.** The response subject carries the result, or a failure:
   `REMOTE_ERROR` with the MAP error code (e.g. `absentSubscriberSM` vs `unknownSubscriber`, which
@@ -52,6 +56,11 @@ real SS7 networks.
   number (MSRN) to route the call on, or the forwarded-to number and forwarding options, with the
   serving MSC, number portability status, basic service and active supplementary services. An
   answer the HLR splits into TC-Result-NL segments is reassembled into one.
+- **USSD.** Sessions in both directions: a subscriber dials `*123#` and the begin reaches the
+  application on the route the dialled string selects; or the application starts one by MSISDN or
+  IMSI. The application prompts, notifies, and releases or rejects. Text is encoded and decoded
+  (GSM 7-bit with its extension table, or UCS2; TS 23.038). Every session ends with exactly one end
+  event saying how — released, the network's error, aborted or timed out.
 - **Signalling transport.** M3UA ASP over SCTP (optionally multi-homed), with override or
   loadshare traffic mode. Each message carries its own MTP3 routing label. A lost association is
   re-established automatically, including when the SG is not reachable at start-up.

@@ -36,6 +36,11 @@ func (h *Handler) HandleTCAPMessage(dialogue *tcap.Dialogue, msg *tcap.Message) 
 
 	h.metrics.OperationsReceived.Add(uint64(len(msg.Components)))
 
+	if h.ussd != nil && isUSSDDialogue(dialogue) {
+		h.handleUSSD(dialogue, msg)
+		return nil
+	}
+
 	for _, comp := range msg.Components {
 		if comp == nil {
 			continue

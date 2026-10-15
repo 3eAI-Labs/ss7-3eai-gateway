@@ -243,6 +243,8 @@ config:
     hlr_gt: ""
     hlr_pc: 0x0002             # must fit sccp.network_variant (ITU: 14 bits)
     gsmscf_address: ""         # AnyTimeInterrogation gsmSCF-Address; empty = cluster GT, else own GT
+    ussd_session_timeout: 180s # USSD: longest wait for the subscriber or the application (1m..10m)
+    ussd_routes: []            # USSD: [{prefix: "*123", route: balance}] → map.ussd.event.<route>
     channel_buffer_size: 10000
     worker_pool_size: 16
     operation_timeout: 10s

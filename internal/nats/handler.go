@@ -50,7 +50,7 @@ func NewHandler(config *Config, logger *zap.Logger) (*Handler, error) {
 		config:     config,
 		logger:     logger,
 		incomingCh: make(chan *NatsMessage, config.ChannelBufferSize),
-		outgoingCh: make(chan *NatsMessage, config.ChannelBufferSize),
+		outgoingCh: make(chan outgoing, config.ChannelBufferSize),
 		errorCh:    make(chan error, 10),
 		shutdownCh: make(chan struct{}),
 		metrics:    &Metrics{},
@@ -98,7 +98,7 @@ func (h *Handler) Stop(ctx context.Context) error {
 	close(h.shutdownCh)
 
 	// Unsubscribe from all subjects
-	for _, sub := range h.subscriptions {
+	for _, sub := range append(h.subscriptions, h.sessionSubs...) {
 		if err := sub.Unsubscribe(); err != nil {
 			h.logger.Warn("Failed to unsubscribe", zap.Error(err))
 		}
@@ -228,6 +228,7 @@ func (h *Handler) subscribeAll() error {
 		{SubjectATIRequest, h.handleATIRequest},
 		{SubjectPSIRequest, h.handlePSIRequest},
 		{SubjectRoutingRequest, h.handleRoutingRequest},
+		{SubjectUSSDStart, h.handleUSSDStart},
 		{SubjectCAPInitialDP, h.handleCAPInitialDP},
 		{SubjectINAPInitialDP, h.handleINAPInitialDP},
 	}
@@ -242,6 +243,16 @@ func (h *Handler) subscribeAll() error {
 			zap.String("subject", sub.subject),
 			zap.String("queue_group", h.config.ClusterName))
 	}
+
+	// A USSD session lives on the node holding its dialogue: every node
+	// hears every command and only that one acts (a queue group would hand
+	// most commands to the wrong node).
+	cmd, err := h.nc.Subscribe(SubjectUSSDCommand, h.handleUSSDCommand)
+	if err != nil {
+		return fmt.Errorf("failed to subscribe to %s: %w", SubjectUSSDCommand, err)
+	}
+	h.sessionSubs = append(h.sessionSubs, cmd)
+	h.logger.Info("Subscribed to subject", zap.String("subject", SubjectUSSDCommand))
 
 	// QueueSubscribe only queues the SUB on the client side. Flushing waits for the server's
 	// PONG, so once Start returns the server routes to this node: a request published right after
@@ -282,6 +293,18 @@ func (h *Handler) handlePSIRequest(msg *nats.Msg) {
 func (h *Handler) handleRoutingRequest(msg *nats.Msg) {
 	h.metrics.RoutingRequestCount.Add(1)
 	h.processIncomingMessage(msg, h.onRoutingRequest)
+}
+
+func (h *Handler) handleUSSDStart(msg *nats.Msg) {
+	h.metrics.USSDStartCount.Add(1)
+	h.processIncomingMessage(msg, h.onUSSDStart)
+}
+
+// handleUSSDCommand: a command for a session on another node is not this
+// node's to answer; the bridge's handler returns nil for it.
+func (h *Handler) handleUSSDCommand(msg *nats.Msg) {
+	h.metrics.USSDCommandCount.Add(1)
+	h.processIncomingMessage(msg, h.onUSSDCommand)
 }
 
 func (h *Handler) handleCAPInitialDP(msg *nats.Msg) {
@@ -344,6 +367,8 @@ var responseTypeBySubject = map[string]MessageType{
 	SubjectATIRequest:     MsgTypeMAPATI,
 	SubjectPSIRequest:     MsgTypeMAPPSI,
 	SubjectRoutingRequest: MsgTypeMAPRouting,
+	SubjectUSSDStart:      MsgTypeMAPUSSD,
+	SubjectUSSDCommand:    MsgTypeMAPUSSD,
 }
 
 // publishRejection answers a request refused before a dialogue started —
@@ -399,24 +424,26 @@ func (h *Handler) publishWorker(ctx context.Context) {
 			return
 		case <-ctx.Done():
 			return
-		case msg := <-h.outgoingCh:
-			if err := h.publishMessage(msg); err != nil {
+		case out := <-h.outgoingCh:
+			if err := h.publishMessage(out.msg, out.subject); err != nil {
 				h.logger.Error("Failed to publish message",
 					zap.Error(err),
-					zap.String("message_id", msg.MessageID))
+					zap.String("message_id", out.msg.MessageID))
 			}
 		}
 	}
 }
 
-// publishMessage publishes a message to NATS
-func (h *Handler) publishMessage(msg *NatsMessage) error {
+// publishMessage publishes a message to NATS, on subject or, when that is
+// empty, on its message type's.
+func (h *Handler) publishMessage(msg *NatsMessage, subject string) error {
 	if h.nc == nil || !h.nc.IsConnected() {
 		return ErrNotConnected
 	}
 
-	// Determine subject based on message type
-	subject := h.getSubjectForMessage(msg)
+	if subject == "" {
+		subject = h.getSubjectForMessage(msg)
+	}
 	if subject == "" {
 		return fmt.Errorf("unknown message type: %s", msg.MessageType)
 	}
@@ -466,6 +493,8 @@ func (h *Handler) getSubjectForMessage(msg *NatsMessage) string {
 		return SubjectPSIResponse
 	case MsgTypeMAPRouting:
 		return SubjectRoutingResponse
+	case MsgTypeMAPUSSD:
+		return SubjectUSSDResponse
 	case MsgTypeCAPEventReport:
 		return SubjectCAPEventReport
 	case MsgTypeINAPEventReport:
@@ -490,13 +519,11 @@ func (h *Handler) PublishMOSms(sender, recipient, content string) error {
 		NodeID:      h.config.NodeID,
 	}
 
-	select {
-	case h.outgoingCh <- msg:
-		h.metrics.MOSmsPublishCount.Add(1)
-		return nil
-	default:
-		return fmt.Errorf("outgoing channel full")
+	if err := h.enqueue(msg); err != nil {
+		return err
 	}
+	h.metrics.MOSmsPublishCount.Add(1)
+	return nil
 }
 
 // PublishMOForwardSM publishes an inbound MAP MO-Forward-SM (op 46) to
@@ -539,13 +566,11 @@ func (h *Handler) PublishMOForwardSM(correlationID, mscGT, smscGT, imsi string, 
 		NodeID:        h.config.NodeID,
 	}
 
-	select {
-	case h.outgoingCh <- msg:
-		h.metrics.MOSmsPublishCount.Add(1)
-		return nil
-	default:
-		return fmt.Errorf("outgoing channel full")
+	if err := h.enqueue(msg); err != nil {
+		return err
 	}
+	h.metrics.MOSmsPublishCount.Add(1)
+	return nil
 }
 
 // PublishMTSmsResponse publishes MT SMS response to NATS
@@ -561,12 +586,7 @@ func (h *Handler) PublishMTSmsResponse(correlationID, status string, errorCode i
 		NodeID:        h.config.NodeID,
 	}
 
-	select {
-	case h.outgoingCh <- msg:
-		return nil
-	default:
-		return fmt.Errorf("outgoing channel full")
-	}
+	return h.enqueue(msg)
 }
 
 // PublishSRIResponse publishes SendRoutingInfo response to NATS
@@ -585,12 +605,7 @@ func (h *Handler) PublishSRIResponse(correlationID, msisdn, imsi string, vmscAdd
 		},
 	}
 
-	select {
-	case h.outgoingCh <- msg:
-		return nil
-	default:
-		return fmt.Errorf("outgoing channel full")
-	}
+	return h.enqueue(msg)
 }
 
 // PublishFailure publishes the failure of a request on the response subject
@@ -641,9 +656,44 @@ func (h *Handler) PublishRoutingInfo(correlationID, imsi string, routing *ss7cli
 	})
 }
 
+// PublishUSSDResponse answers a USSD start or command that succeeded.
+func (h *Handler) PublishUSSDResponse(correlationID string, u *ss7client.USSD) error {
+	return h.enqueue(&NatsMessage{
+		MessageID:     uuid.New().String(),
+		CorrelationID: correlationID,
+		MessageType:   MsgTypeMAPUSSD,
+		Direction:     DirectionOutbound,
+		Timestamp:     time.Now(),
+		USSD:          u,
+		NodeID:        h.config.NodeID,
+	})
+}
+
+// PublishUSSDEvent publishes a session's begin or end on its route's
+// subject. msg carries the subscriber and, for an end, the status; the
+// envelope is filled in here.
+func (h *Handler) PublishUSSDEvent(route string, msg *NatsMessage) error {
+	msg.MessageID = uuid.New().String()
+	msg.MessageType = MsgTypeMAPUSSD
+	msg.Direction = DirectionOutbound
+	msg.Timestamp = time.Now()
+	msg.NodeID = h.config.NodeID
+	return h.enqueueOn(SubjectUSSDEventPrefix+route, msg)
+}
+
+// NodeID is this node's identity (nats.node_id).
+func (h *Handler) NodeID() string { return h.config.NodeID }
+
 func (h *Handler) enqueue(msg *NatsMessage) error {
+	return h.enqueueOn("", msg)
+}
+
+// enqueueOn queues msg for subject ("": its message type's). One publish
+// worker takes the queue in order, so a session's messages reach NATS in
+// the order they were queued.
+func (h *Handler) enqueueOn(subject string, msg *NatsMessage) error {
 	select {
-	case h.outgoingCh <- msg:
+	case h.outgoingCh <- outgoing{msg: msg, subject: subject}:
 		return nil
 	default:
 		return fmt.Errorf("outgoing channel full")
@@ -670,6 +720,14 @@ func (h *Handler) OnPSIRequest(handler func(*NatsMessage) error) {
 
 func (h *Handler) OnRoutingRequest(handler func(*NatsMessage) error) {
 	h.onRoutingRequest = handler
+}
+
+func (h *Handler) OnUSSDStart(handler func(*NatsMessage) error) {
+	h.onUSSDStart = handler
+}
+
+func (h *Handler) OnUSSDCommand(handler func(*NatsMessage) error) {
+	h.onUSSDCommand = handler
 }
 
 func (h *Handler) OnCAPInitialDP(handler func(*NatsMessage) error) {

@@ -46,7 +46,7 @@ const (
 // mapHandler so inbound NATS requests originate SS7 dialogues and inbound
 // SS7 responses flow back to NATS. Must be called after MAP, TCAP, and
 // NATS handlers are constructed and started.
-func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *sccp.Config, logger *zap.Logger) {
+func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *sccp.Config, logger *zap.Logger) *natsBridge {
 	bridge := &natsBridge{
 		mapHandler:  handlers.MAP,
 		tcapHandler: handlers.TCAP,
@@ -55,18 +55,23 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 		sccpCfg:     sccpCfg,
 		logger:      logger.Named("nats-bridge"),
 	}
+	bridge.ussd = newUSSDSessions(handlers.NATS.NodeID(), mapCfg, handlers.TCAP, handlers.MAP, handlers.NATS,
+		logger.Named("ussd"))
 
 	handlers.NATS.OnSRIRequest(bridge.onSRIRequest)
 	handlers.NATS.OnMTSmsRequest(bridge.onMTSmsRequest)
 	handlers.NATS.OnATIRequest(bridge.onATIRequest)
 	handlers.NATS.OnPSIRequest(bridge.onPSIRequest)
 	handlers.NATS.OnRoutingRequest(bridge.onRoutingRequest)
+	handlers.NATS.OnUSSDStart(bridge.onUSSDStart)
+	handlers.NATS.OnUSSDCommand(bridge.ussd.command)
 	handlers.NATS.OnCAPInitialDP(bridge.onCAPInitialDP)
 	handlers.NATS.OnINAPInitialDP(bridge.onINAPInitialDP)
 
 	handlers.MAP.SetResponseSink(bridge.publishMAPResponse)
 	handlers.MAP.SetErrorSink(bridge.publishMAPError)
 	handlers.TCAP.SetFailureSink(bridge.publishMAPFailure)
+	handlers.TCAP.SetLostSink(bridge.ussd.lost)
 
 	// MO-Forward-SM (op 46) inbound: foreign MSC → our gateway. Bridge
 	// implements `mapprotocol.MoForwardSMHandler`, publishing to NATS
@@ -74,6 +79,7 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 	// the foreign MSC per TS 29.002 §17.7.4 (success = empty SEQUENCE,
 	// SMSC takes ownership of delivery from this point).
 	handlers.MAP.SetMoForwardSMHandler(bridge)
+	handlers.MAP.SetUSSDSessionHandler(bridge.ussd)
 
 	logger.Info("NATS bridge bound to MAP/TCAP",
 		zap.Strings("subjects", []string{
@@ -82,9 +88,12 @@ func bindNATSBridge(handlers *Handlers, mapCfg *mapprotocol.Config, sccpCfg *scc
 			natsbridge.SubjectATIRequest,
 			natsbridge.SubjectPSIRequest,
 			natsbridge.SubjectRoutingRequest,
+			natsbridge.SubjectUSSDStart,
+			natsbridge.SubjectUSSDCommand,
 			natsbridge.SubjectCAPInitialDP,
 			natsbridge.SubjectINAPInitialDP,
 		}))
+	return bridge
 }
 
 // tcapOriginator is the subset of *tcap.Handler the bridge consumes.
@@ -107,6 +116,7 @@ type natsBridge struct {
 	mapCfg      *mapprotocol.Config
 	sccpCfg     *sccp.Config
 	logger      *zap.Logger
+	ussd        *ussdSessions
 }
 
 // onSRIRequest: SMSC asks "where is MSISDN X registered?" → MAP SRI-for-SM.
@@ -301,6 +311,10 @@ func (b *natsBridge) publishMAPResponse(corrID string, op mapprotocol.OperationC
 // publishMAPResponse.
 func (b *natsBridge) publishMAPFailure(corrID string, opCode int32, reason tcap.FailureReason, detail string) {
 	if corrID == "" {
+		return
+	}
+	if isUSSDOp(mapprotocol.OperationCode(opCode)) {
+		b.ussd.failed(corrID, reason, detail)
 		return
 	}
 	b.logger.Warn("originated dialogue failed",

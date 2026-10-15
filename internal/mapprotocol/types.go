@@ -89,6 +89,8 @@ const (
 	ErrORNotAllowed                ErrorCode = 48
 	ErrATINotAllowed               ErrorCode = 49
 	ErrResourceLimitation          ErrorCode = 51
+	ErrUnknownAlphabet             ErrorCode = 71
+	ErrUSSDBusy                    ErrorCode = 72
 )
 
 // errorCodeNames are the ASN.1 value names of 3GPP TS 29.002 MAP-ErrorCodes.
@@ -125,6 +127,8 @@ var errorCodeNames = map[ErrorCode]string{
 	ErrORNotAllowed:                "or-NotAllowed",
 	ErrATINotAllowed:               "ati-NotAllowed",
 	ErrResourceLimitation:          "resourceLimitation",
+	ErrUnknownAlphabet:             "unknownAlphabet",
+	ErrUSSDBusy:                    "ussd-Busy",
 }
 
 // String returns the MAP-ErrorCodes value name, or "mapError(<n>)" for a code
@@ -171,6 +175,11 @@ const (
 
 // NumberingPlanISDN is ISDN/Telephony (ITU-T E.164), bits 4321 = 0001.
 const NumberingPlanISDN uint8 = 1
+
+// NumberingPlanLandMobile is the land mobile numbering plan (ITU-T E.212),
+// bits 4321 = 0110: an IMSI as an AddressString, e.g. a MAP-OpenInfo
+// destination reference.
+const NumberingPlanLandMobile uint8 = 6
 
 // UpdateLocationRequest (3GPP TS 29.002 - MAP-MS-DataTypes)
 type UpdateLocationRequest struct {
@@ -377,6 +386,10 @@ type Handler struct {
 	// waiting out its deadline. Installed via SetErrorSink.
 	errorSink ErrorSink
 
+	// ussd serves USSD dialogues (ussd_session.go); nil: they are refused
+	// like any other context without a handler.
+	ussd USSDSessionHandler
+
 	// Operation handlers
 	updateLocationHandler       UpdateLocationHandler
 	provideRoamingNumHandler    ProvideRoamingNumberHandler
@@ -448,11 +461,36 @@ type Config struct {
 	// the cluster GT, else the node's own GT.
 	GSMSCFAddress string `yaml:"gsmscf_address" json:"gsmscf_address"`
 
+	// USSDSessionTimeout is the longest a USSD session waits — for the
+	// subscriber's answer, or for the application's next command — before
+	// the gateway ends it: the timer ml of unstructuredSS-Request and -Notify
+	// (TS 29.002 §17.1.2: 1 to 10 minutes). Default 180 s.
+	USSDSessionTimeout time.Duration `yaml:"ussd_session_timeout" json:"ussd_session_timeout"`
+	// USSDRoutes send subscriber-initiated sessions to routes by what the
+	// subscriber dialled: the longest matching prefix wins; no match goes to
+	// the "default" route.
+	USSDRoutes []USSDRoute `yaml:"ussd_routes" json:"ussd_routes"`
+
 	// Performance
 	ChannelBufferSize int           `yaml:"channel_buffer_size" json:"channel_buffer_size"`
 	WorkerPoolSize    int           `yaml:"worker_pool_size" json:"worker_pool_size"`
 	OperationTimeout  time.Duration `yaml:"operation_timeout" json:"operation_timeout"`
 }
+
+// USSDRoute is one entry of Config.USSDRoutes.
+type USSDRoute struct {
+	// Prefix of the dialled string, e.g. "*123".
+	Prefix string `yaml:"prefix" json:"prefix" mapstructure:"prefix"`
+	// Route names the event subject map.ussd.event.<route>.
+	Route string `yaml:"route" json:"route" mapstructure:"route"`
+}
+
+// USSD session timeout bounds and default (Config.USSDSessionTimeout).
+const (
+	MinUSSDSessionTimeout     = time.Minute
+	MaxUSSDSessionTimeout     = 10 * time.Minute
+	DefaultUSSDSessionTimeout = 180 * time.Second
+)
 
 // SRIRouting values; see Config.SRIRouting.
 const (

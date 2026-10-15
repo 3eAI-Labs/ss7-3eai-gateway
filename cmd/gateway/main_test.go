@@ -58,7 +58,9 @@ func TestSliceD_SS7StackConstructionFromExampleConfig(t *testing.T) {
 	require.NoError(t, err, "sccp.NewHandler")
 	require.NotNil(t, sccpH)
 
-	mapH, err := mapprotocol.NewHandler(buildMAPConfig(cfg), logger.Named("map"))
+	mapCfg, err := buildMAPConfig(cfg)
+	require.NoError(t, err, "buildMAPConfig")
+	mapH, err := mapprotocol.NewHandler(mapCfg, logger.Named("map"))
 	require.NoError(t, err, "mapprotocol.NewHandler")
 	require.NotNil(t, mapH)
 

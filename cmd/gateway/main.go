@@ -116,6 +116,9 @@ type Handlers struct {
 	HA       *ha.Handler
 	API      *api.Handler
 	Drain    *opstrigger.DrainState
+	// USSD holds the node's USSD sessions (nil until the NATS bridge is
+	// bound).
+	USSD *ussdSessions
 }
 
 func initLogger(level string) (*zap.Logger, error) {
@@ -202,14 +205,17 @@ func loadConfig(configFile string) (*viper.Viper, error) {
 	return v, nil
 }
 
-// mapApplicationContexts are the MAP contexts the gateway implements: the
-// three short-message contexts. A BEGIN under any other context (location
+// mapApplicationContexts are the MAP contexts a peer may open with the
+// gateway: the three short-message contexts, and USSD (the HLR's
+// processUnstructuredSS-Request to the gateway as gsmSCF), which the gateway
+// also opens. A BEGIN under any other context (location
 // update, …) is refused by the dispatcher instead of reaching a handler that
 // would answer systemFailure.
 var mapApplicationContexts = []tcap.ApplicationContext{
 	tcap.ACShortMsgGatewayV3,
 	tcap.ACShortMsgMORelayV3,
 	tcap.ACShortMsgMTRelayV3,
+	tcap.ACNetworkUnstructuredSsV2,
 }
 
 var capApplicationContexts = []tcap.ApplicationContext{tcap.ACCapV2, tcap.ACCapV3}
@@ -272,7 +278,10 @@ func initializeHandlers(cfg *viper.Viper, logger *zap.Logger) (*Handlers, error)
 	warnHAConfigDrift(sccpCfg, m3uaCfg, logger)
 
 	logger.Info("Initializing MAP handler")
-	mapCfg := buildMAPConfig(cfg)
+	mapCfg, err := buildMAPConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
 	capCfg := buildCAPConfig(cfg)
 	for key, pc := range map[string]uint32{"map.hlr_pc": mapCfg.HLRPointCode, "cap.gsmscf_pc": capCfg.GSMSCFPointCode} {
 		if !sccpCfg.NetworkVariant.ValidPointCode(pc) {
@@ -382,7 +391,7 @@ func initializeHandlers(cfg *viper.Viper, logger *zap.Logger) (*Handlers, error)
 	// startServices) so callbacks are armed before any of the lifecycle
 	// goroutines could fire — NATS subscribeAll happens in NATS.Start
 	// downstream.
-	bindNATSBridge(handlers, mapCfg, sccpCfg, logger)
+	handlers.USSD = bindNATSBridge(handlers, mapCfg, sccpCfg, logger).ussd
 
 	// ConfigStore will be initialized after NATS is started (in startServices)
 
@@ -612,6 +621,10 @@ func stopServices(ctx context.Context, handlers *Handlers, logger *zap.Logger) e
 	if err := handlers.API.Stop(ctx); err != nil {
 		logger.Error("Failed to stop API", zap.Error(err))
 	}
+	// Open USSD sessions are aborted while the stack can still send.
+	if handlers.USSD != nil {
+		handlers.USSD.close()
+	}
 	if err := handlers.TCAP.Stop(ctx); err != nil {
 		logger.Error("Failed to stop TCAP", zap.Error(err))
 	}
@@ -772,17 +785,23 @@ func buildTCAPConfig(cfg *viper.Viper) *tcap.Config {
 	}
 }
 
-func buildMAPConfig(cfg *viper.Viper) *mapprotocol.Config {
-	return &mapprotocol.Config{
-		SRIRouting:        cfg.GetString("map.sri_routing"),
-		HLRAddress:        cfg.GetString("map.hlr_address"),
-		HLRGlobalTitle:    cfg.GetString("map.hlr_gt"),
-		HLRPointCode:      cfg.GetUint32("map.hlr_pc"),
-		GSMSCFAddress:     cfg.GetString("map.gsmscf_address"),
-		ChannelBufferSize: cfg.GetInt("map.channel_buffer_size"),
-		WorkerPoolSize:    cfg.GetInt("map.worker_pool_size"),
-		OperationTimeout:  cfg.GetDuration("map.operation_timeout"),
+func buildMAPConfig(cfg *viper.Viper) (*mapprotocol.Config, error) {
+	var routes []mapprotocol.USSDRoute
+	if err := cfg.UnmarshalKey("map.ussd_routes", &routes); err != nil {
+		return nil, fmt.Errorf("map.ussd_routes: %w", err)
 	}
+	return &mapprotocol.Config{
+		SRIRouting:         cfg.GetString("map.sri_routing"),
+		HLRAddress:         cfg.GetString("map.hlr_address"),
+		HLRGlobalTitle:     cfg.GetString("map.hlr_gt"),
+		HLRPointCode:       cfg.GetUint32("map.hlr_pc"),
+		GSMSCFAddress:      cfg.GetString("map.gsmscf_address"),
+		USSDSessionTimeout: cfg.GetDuration("map.ussd_session_timeout"),
+		USSDRoutes:         routes,
+		ChannelBufferSize:  cfg.GetInt("map.channel_buffer_size"),
+		WorkerPoolSize:     cfg.GetInt("map.worker_pool_size"),
+		OperationTimeout:   cfg.GetDuration("map.operation_timeout"),
+	}, nil
 }
 
 // buildCAPConfig collects cap.* keys. service_keys is a YAML map of

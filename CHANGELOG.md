@@ -6,6 +6,38 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-10-15
+
+### Added
+
+- **USSD** (TS 29.002 §11.9–11.11), with client module v0.4.0, under
+  `networkUnstructuredSsContext-v2` with the gateway as gsmSCF (SSN 147).
+  - Subscriber-initiated: the HLR's processUnstructuredSS-Request (op 59) is published as a begin
+    on `map.ussd.event.<route>`. The route comes from the longest `map.ussd_routes` prefix of the
+    dialled string, else `default`. The subscriber is identified from the MAP-OpenInfo (IMSI or
+    MSISDN) and the argument's MSISDN. The application ends the session with the final text or a
+    MAP error.
+  - Network-initiated: `map.ussd.start` sends unstructuredSS-Request (60) or -Notify (61) to the
+    subscriber's HLR by MSISDN or IMSI, with a MAP-OpenInfo naming the subscriber and the gsmSCF.
+  - Commands on `map.ussd.command` (request, notify, release, reject) are answered on
+    `map.ussd.response` by the node holding the session.
+  - Every session ends once, with one end event: released, the network's error, aborted,
+    `map.ussd_session_timeout` (1–10 min, default 180 s), TCAP failure or node shutdown.
+  - USSD text: GSM 7-bit with the extension table, USSD packing and CR padding, UCS2, and the
+    CBS data coding schemes (TS 23.038).
+  - MAP-OpenInfo codec (TS 29.002 §17.4); MAP errors unknownAlphabet (71) and ussd-Busy (72).
+  - The strict peer plays the HLR in both directions and checks the context, subsystems,
+    MAP-OpenInfo, transaction IDs, AARE and invoke IDs.
+- TCAP: a peer's processUnstructuredSS-Request after an empty Begin (TS 29.002 §C.2.1) is
+  accepted, its MAP-OpenInfo kept from the BEGIN.
+- Helm chart: `map.ussd_session_timeout`, `map.ussd_routes`; capability `ss7-map-ussd`.
+
+### Fixed
+
+- TCAP: a dialogue the peer never answered times out without an attempt to send an ABORT that no
+  transaction ID could address (it used to log an encode failure).
+- TCAP: the peer's transaction ID, set by a CONTINUE, is read safely from other goroutines.
+
 ## [0.7.6] - 2026-10-14
 
 ### Added

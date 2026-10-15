@@ -183,6 +183,12 @@ var (
 		OID:  []int{0, 4, 0, 0, 1, 0, 5, 3},
 		Name: "locationInfoRetrievalContext-v3",
 	}
+	// USSD, TS 29.002 §17.3.2.20: between HLR and gsmSCF either side opens
+	// it. Version 2 only (version 1 is networkFunctionalSs).
+	ACNetworkUnstructuredSsV2 = ApplicationContext{
+		OID:  []int{0, 4, 0, 0, 1, 0, 19, 2},
+		Name: "networkUnstructuredSsContext-v2",
+	}
 	ACCapV2 = ApplicationContext{
 		OID:  []int{0, 4, 0, 0, 1, 0, 50, 1},
 		Name: "cap-ac-gsmSCF-gsmSSF-v2",
@@ -265,8 +271,12 @@ type Message struct {
 
 // Dialogue represents an active TCAP dialogue
 type Dialogue struct {
-	LocalTID           uint32
+	LocalTID uint32
+	// RemoteTID is the peer's transaction ID. A CONTINUE may set it after
+	// the dialogue is shared; code outside the dialogue's TCAP worker reads
+	// it with PeerTID.
 	RemoteTID          []byte
+	remoteTIDMu        sync.Mutex
 	State              DialogueState
 	ApplicationContext *ApplicationContext
 
@@ -311,6 +321,14 @@ type Dialogue struct {
 
 	// initiatedLocally marks a dialogue this node opened (Originate).
 	initiatedLocally bool
+	// OpeningUserInformation is the user-information of the AARQ the peer
+	// opened the dialogue with (its EXTERNALs, encoded), kept for an
+	// operation that arrives in the CONTINUE after an empty Begin. Set
+	// before the dialogue is registered; read-only after.
+	OpeningUserInformation []byte
+	// timeout, when set, replaces DialogueTimeout for this dialogue
+	// (OriginateWith, SetDialogueTimeout). Guarded by Handler.dialoguesMu.
+	timeout time.Duration
 	// versionFallbackUsed marks a dialogue that is already the lower-version
 	// retry of a refused one; it is not retried again.
 	versionFallbackUsed bool
@@ -347,6 +365,16 @@ type Dialogue struct {
 func (d *Dialogue) MarkAnswered() bool {
 	return d.answered.CompareAndSwap(false, true)
 }
+
+// PeerTID is RemoteTID, safe to read from any goroutine.
+func (d *Dialogue) PeerTID() []byte {
+	d.remoteTIDMu.Lock()
+	defer d.remoteTIDMu.Unlock()
+	return d.RemoteTID
+}
+
+// InitiatedLocally reports whether this node opened the dialogue.
+func (d *Dialogue) InitiatedLocally() bool { return d.initiatedLocally }
 
 // DialogueState represents the state of a TCAP dialogue
 type DialogueState uint8
@@ -427,6 +455,9 @@ type Handler struct {
 	// ReturnResult (timeout / inbound ABORT). nil disables — useful in
 	// tests that don't wire the NATS bridge. Installed via SetFailureSink.
 	failureSink FailureSink
+	// lostSink is told of any dialogue TCAP ends on its own (timeout,
+	// non-delivery), whoever opened it.
+	lostSink func(d *Dialogue, reason FailureReason, detail string)
 }
 
 // Config holds TCAP handler configuration

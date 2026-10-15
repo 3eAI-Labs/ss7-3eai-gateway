@@ -142,6 +142,16 @@ map:
   # HLR may screen (TS 29.002 §8.11.1). Empty: the cluster GT, else this
   # node's own GT. Requests cannot set it.
   gsmscf_address: ""
+  # USSD (TS 29.002 §11.9–11.11), with the gateway as gsmSCF; needs SSN 147 in
+  # sccp.local_subsystems. ussd_session_timeout: the longest a session waits —
+  # for the subscriber's answer, or for the application's next command — before
+  # the gateway ends it (timer ml of the operations: 1m..10m).
+  ussd_session_timeout: 180s
+  # ussd_routes: subscriber-initiated sessions go to map.ussd.event.<route> by
+  # the longest prefix of what the subscriber dialled; no match: "default".
+  ussd_routes: []
+  #   - prefix: "*123"
+  #     route: balance
   channel_buffer_size: 10000
   worker_pool_size: 16
   operation_timeout: 10s

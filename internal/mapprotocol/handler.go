@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/3eAI-Labs/ss7-3eai-gateway/internal/tcap"
@@ -380,6 +381,10 @@ func (h *Handler) Errors() <-chan error {
 }
 
 // validateConfig validates MAP configuration
+// ussdRouteName is what a route may be called: one NATS subject token
+// (ss7client's rule).
+var ussdRouteName = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
+
 func validateConfig(cfg *Config) error {
 	switch cfg.SRIRouting {
 	case "":
@@ -391,6 +396,25 @@ func validateConfig(cfg *Config) error {
 		}
 	default:
 		return fmt.Errorf("sri_routing must be %q or %q, got %q", SRIRoutingMSISDN, SRIRoutingHLR, cfg.SRIRouting)
+	}
+	switch t := cfg.USSDSessionTimeout; {
+	case t == 0:
+		cfg.USSDSessionTimeout = DefaultUSSDSessionTimeout
+	case t < MinUSSDSessionTimeout || t > MaxUSSDSessionTimeout:
+		return fmt.Errorf("ussd_session_timeout %s is outside %s..%s (TS 29.002 timer ml)", t, MinUSSDSessionTimeout, MaxUSSDSessionTimeout)
+	}
+	seen := make(map[string]bool, len(cfg.USSDRoutes))
+	for i, r := range cfg.USSDRoutes {
+		if r.Prefix == "" || len(r.Prefix) > 182 {
+			return fmt.Errorf("ussd_routes[%d]: prefix of %d characters, want 1..182", i, len(r.Prefix))
+		}
+		if !ussdRouteName.MatchString(r.Route) {
+			return fmt.Errorf("ussd_routes[%d]: route %q is not 1..32 of [A-Za-z0-9_-]", i, r.Route)
+		}
+		if seen[r.Prefix] {
+			return fmt.Errorf("ussd_routes[%d]: prefix %q listed twice", i, r.Prefix)
+		}
+		seen[r.Prefix] = true
 	}
 	if cfg.ChannelBufferSize == 0 {
 		cfg.ChannelBufferSize = ChannelBufferSize

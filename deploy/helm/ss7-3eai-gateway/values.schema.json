@@ -20,6 +20,11 @@
         "capability": "ss7-map-call-routing",
         "subscribes": ["map.routing.request"],
         "responds": ["map.routing.response"]
+      },
+      {
+        "capability": "ss7-map-ussd",
+        "subscribes": ["map.ussd.start", "map.ussd.command"],
+        "responds": ["map.ussd.response", "map.ussd.event.>"]
       }
     ]
   },
@@ -313,6 +318,21 @@
               "type": "string", "pattern": "^[0-9]*$",
               "description": "gsmSCF-Address (E.164 digits) AnyTimeInterrogation carries for the HLR to screen; empty = the cluster GT, else the node's own GT",
               "x-arinna": { "valueType": "string", "userExposed": true, "mutableAtRuntime": false, "riskClass": "high", "requiresApproval": true }
+            },
+            "ussd_session_timeout": {
+              "$ref": "#/definitions/duration",
+              "description": "USSD: the longest a session waits for the subscriber's answer or the application's next command (TS 29.002 timer ml: 1m..10m; the gateway refuses other values at start-up)"
+            },
+            "ussd_routes": {
+              "type": "array",
+              "description": "USSD: subscriber-initiated sessions go to map.ussd.event.<route> by the longest prefix of the dialled string; no match goes to route default",
+              "items": {
+                "type": "object", "additionalProperties": false, "required": ["prefix", "route"],
+                "properties": {
+                  "prefix": { "type": "string", "minLength": 1, "maxLength": 182 },
+                  "route": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,32}$" }
+                }
+              }
             },
             "channel_buffer_size": { "type": "integer", "minimum": 1 },
             "worker_pool_size": { "type": "integer", "minimum": 1, "x-arinna": { "userExposed": false, "riskClass": "low", "serviceLevelPreset": true } },

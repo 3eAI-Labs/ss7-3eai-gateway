@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
@@ -28,8 +29,9 @@ func startLocationE2E(t *testing.T, onATI ss7peer.ATICallback, onPSI ss7peer.PSI
 }
 
 // startInterrogationE2E boots the strict peer, configured by configure, one
-// gateway through the production boot path, and a client.
-func startInterrogationE2E(t *testing.T, configure func(*ss7peer.Config)) (*ss7peer.Peer, *ss7client.Client) {
+// gateway through the production boot path (its configuration changed by
+// gateway, when given), and a client.
+func startInterrogationE2E(t *testing.T, configure func(*ss7peer.Config), gateway ...func(*viper.Viper)) (*ss7peer.Peer, *ss7client.Client) {
 	t.Helper()
 	logger := zaptest.NewLogger(t)
 	natsServer := startEmbeddedNATS(t)
@@ -53,7 +55,11 @@ func startInterrogationE2E(t *testing.T, configure func(*ss7peer.Config)) (*ss7p
 	t.Cleanup(peer.Stop)
 	t.Cleanup(func() { require.Empty(t, peer.Violations(), "ss7peer conformance violations") })
 
-	handlers, err := initializeHandlers(buildE2EConfig(t, peer.SCTPAddr(), natsServer.ClientURL()), logger.Named("gw"))
+	gwCfg := buildE2EConfig(t, peer.SCTPAddr(), natsServer.ClientURL())
+	for _, f := range gateway {
+		f(gwCfg)
+	}
+	handlers, err := initializeHandlers(gwCfg, logger.Named("gw"))
 	require.NoError(t, err, "initializeHandlers")
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

@@ -129,6 +129,35 @@ Return Result Last in the TC-END (TS 29.002 §C.2.3). The MAP layer holds the se
 dialogue, at most 16 of them and 16 KiB, and confirms once with them merged: a field comes from
 the first segment that has it, and the ss-Lists are joined.
 
+## USSD
+
+USSD (TS 29.002 §11.9–11.11) runs under `networkUnstructuredSsContext-v2`, with the gateway as
+gsmSCF (SSN 147). Unlike the other operations it is a session: one TCAP dialogue stays open while a
+human reads and answers.
+
+- **Subscriber-initiated.** The HLR opens a dialogue with processUnstructuredSS-Request and a
+  MAP-OpenInfo naming the subscriber (IMSI or MSISDN, TS 29.002 table 7.3/2). The gateway decodes
+  the dialled string and publishes a begin on `map.ussd.event.<route>`, the route chosen by the
+  longest `map.ussd_routes` prefix (else `default`). The application answers with requests and
+  notifies, and ends the session with the final text — processUnstructuredSS-Request's result, in
+  the END — or a MAP error.
+- **Network-initiated.** `map.ussd.start` (queue group) sends unstructuredSS-Request or -Notify to
+  the subscriber's HLR, addressed as for SendRoutingInfoForSM, with a MAP-OpenInfo whose
+  destinationReference is the MSISDN or the IMSI (numbering plan E.212) and whose
+  originationReference is the gsmSCF address (`map.gsmscf_address`, else the cluster GT, else
+  the node's GT). The application releases it with a basic END.
+
+A session lives on the node that holds its dialogue. Commands (`map.ussd.command`) go to every
+node; the session ID names the node, and only that one answers. The command subscription stays
+up during a drain so open sessions can finish. A session waits for one thing at a time — the
+answer to the request or notify outstanding, or the application's next command — for at most
+`map.ussd_session_timeout` (timer ml, 1–10 minutes); its TCAP dialogue is given that plus 30 s, so
+the session's own timer decides and ends it with a U-ABORT and an event. Results, errors and
+endings are matched to the invoke outstanding; others are dropped. Every session ends exactly
+once, with one end event: released (by the application or the network), the network's error,
+aborted, timed out, a TCAP failure, or the node shutting down (sessions are aborted before the
+stack stops).
+
 ## Message order
 
 SCCP and TCAP each run a pool of workers. Neither shares one queue among them:
