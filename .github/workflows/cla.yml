@@ -53,8 +53,13 @@ jobs:
           remote-organization-name: '3eAI-Labs'
           remote-repository-name: 'cla-signatures'
           branch: 'main'
-          # Maintainers and bots. Bots cannot accept an agreement at all, so they have to be here.
-          allowlist: leventg,bot*
+          # No allowlist, deliberately. The action (v2.6.1, src/setupClaCheck.ts) applies the
+          # allowlist BEFORE it sets aside commits that are not linked to a GitHub account, and
+          # names such a commit by its git author name (src/graphql.ts), which whoever makes the
+          # commit chooses. Any allowlisted name — an exact login as much as a pattern, and its
+          # pattern match is unanchored — can therefore be claimed by an outside contributor to
+          # skip the agreement. Release snapshots are pushed, not proposed as pull requests, so
+          # maintainers do not need an exemption; a bot pull request fails this check by design.
           custom-notsigned-prcomment: >
             Thank you for the pull request. Before it can be merged, please read the
             [3eAI Labs Contributor Licence Agreement](https://github.com/3eAI-Labs/ss7-3eai-gateway/blob/main/CLA.md)
